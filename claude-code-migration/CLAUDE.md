@@ -11,6 +11,8 @@
 - 가격 산출층: 구체적 추천가 산출
 
 **3단계 하네스 프로토콜**: 기획자 → 생성자 → 평가자 (GAN 구조)
+- 스킬 체인: `clarification` → `plan-crafting` / `milestone-planning` → `run-plan` → `review-work`
+- 모든 구현 작업은 반드시 스프린트 계약서(sprints/sprint-XX-contract.md)를 먼저 읽고 시작한다
 
 ## 기술 스택
 
@@ -21,44 +23,23 @@
 | 배포 | Vercel |
 | 코드관리 | GitHub |
 
-## 현재 진행 상태 (2026-04-01 기준)
+## 현재 진행 상태 (2026-04-10 기준)
 
-### S00-A: 2025년 데이터 Supabase 적재 — 진행 중
+### 일일 운영 모드 — 가동 중
 
-| 테이블 | 목표 | 현재 | 진행률 | 비고 |
-|--------|------|------|--------|------|
-| products | 838 | 838 | **100%** | 완료 |
-| daily_purchase_prices | 65,535 | 25,349 | **39%** | SQL 배치 실행 필요 |
-| daily_selling_prices | 60,486 | 9,587 | **16%** | SQL 배치 실행 필요 |
+매일 반복되는 워크플로:
+1. `/upload` — 오늘자 로우데이터 업로드 (매입상세 + 매출상세 + ★ 플랫폼시트)
+2. `/products` — 전체상품 대시보드에서 판매가 확인·조정·확정
+3. `/learn` — 변경된 품목 중 랜덤 10개로 학습 세션 (AI 추천 vs 실제 비교)
+4. `/learn/history` — 누적 학습 이력 확인
 
-### 즉시 해야 할 작업: 데이터 로딩 완료
-
-`claude-code-migration/` 폴더에 준비된 SQL 배치 파일을 실행하면 됨:
-
-```bash
-# 1. Supabase 연결 문자열 확인 (Supabase Dashboard → Settings → Database → Connection string)
-# 형식: postgresql://postgres.[project-ref]:[password]@aws-0-ap-northeast-2.pooler.supabase.com:6543/postgres
-
-# 2. 매입 데이터 로딩 (188 파일, ON CONFLICT DO NOTHING으로 안전)
-for f in claude-code-migration/p_sql/*.sql; do
-  psql "$DATABASE_URL" -f "$f" 2>/dev/null
-  echo "Done: $f"
-done
-
-# 3. 매출 데이터 로딩 (173 파일, ON CONFLICT DO NOTHING으로 안전)
-for f in claude-code-migration/s_sql/*.sql; do
-  psql "$DATABASE_URL" -f "$f" 2>/dev/null
-  echo "Done: $f"
-done
-
-# 4. 검증
-psql "$DATABASE_URL" -c "SELECT 'products' as t, count(*) FROM products UNION ALL SELECT 'purchases', count(*) FROM daily_purchase_prices UNION ALL SELECT 'sales', count(*) FROM daily_selling_prices;"
-# 기대값: products=838, purchases=65535, sales=60486
-```
-
-> **참고**: SQL 파일들은 모두 ON CONFLICT DO NOTHING 포함이므로 여러 번 실행해도 안전합니다.
-> psql이 없으면 `npm install -g supabase` 후 Supabase MCP를 사용하거나,
-> load_data.sh 스크립트를 참고하세요.
+| 테이블 | 현재 상태 | 비고 |
+|--------|-----------|------|
+| products | 838행 | 상품 마스터 (고정) |
+| daily_purchase_prices | 2026년~ 데이터만 | 일일 업로드로 누적 |
+| daily_selling_prices | 2026년~ 데이터만 | 일일 업로드로 누적 |
+| product_selling_prices | 현재 판매가 | 판매가 조정 시 upsert |
+| learn_sessions / learn_items | 학습 이력 | 학습 세션마다 생성 |
 
 ## 데이터베이스 스키마 (현재 Supabase에 존재)
 
@@ -83,7 +64,7 @@ CREATE TABLE products (
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- 일별 매입가 (목표: 65,535행)
+-- 일별 매입가 (2026년~ 일일 누적)
 CREATE TABLE daily_purchase_prices (
   id SERIAL PRIMARY KEY,
   product_code VARCHAR(6) NOT NULL REFERENCES products(product_code),
@@ -95,7 +76,7 @@ CREATE TABLE daily_purchase_prices (
   UNIQUE(product_code, price_date, purchase_price)
 );
 
--- 일별 매출가 (목표: 60,486행)
+-- 일별 매출가 (2026년~ 일일 누적)
 CREATE TABLE daily_selling_prices (
   id SERIAL PRIMARY KEY,
   product_code VARCHAR(6) NOT NULL REFERENCES products(product_code),
@@ -108,27 +89,25 @@ CREATE TABLE daily_selling_prices (
 );
 ```
 
-## 스프린트 로드맵
+## 로드맵
 
-### 0단계: 백테스트 (현재)
-- **S00-A**: 2025 데이터 Supabase 적재 ← **현재 여기**
-- **S00-B**: 신호 해석층 백테스트 (추세/변곡점/변동성 계산)
-- **S00-C**: 점수화 + 추천가 백테스트 (실제 판매가와 비교)
-- **S00-D**: 품목군별 파라미터 튜닝
+### ✅ 완료
+- DB 스키마 구축 (products, daily_purchase_prices, daily_selling_prices, product_selling_prices 등)
+- 엑셀 업로드 API (매입상세 + 매출상세 + ★ 플랫폼시트 → DB)
+- 전체상품 대시보드 (/products) — 필터, 인라인 수정, 수익률일괄변경 실행
+- AI 추천 엔진 (3층 구조: 신호 해석 → 전략 선택 → 가격 산출)
+- 학습 시스템 (/learn, /learn/history) — AI vs 실제 비교 학습
+- 2025년 데이터 정리 완료 (Supabase에서 삭제, 2026년~ 데이터만 유지)
 
-### 1단계: 기반 구축
-- S01: Supabase DB 테이블 + Next.js 프로젝트
-- S02: 엑셀 업로드 API (천년경영 → DB)
-- S03: 기존 데이터 마이그레이션
+### 🔄 현재 — 일일 운영 + 개선
+- 매일 로우데이터 업로드 → 판매가 조정 → 학습 세션 반복
+- 학습 이력 누적 → AI 추천 정확도 점진적 개선
+- 품목별 패턴이 보이면 aiRecommendation.ts 로직 분기 추가
 
-### 2단계: 분석 엔진
-- S05~S08: 매입가 변동, 7일 동향, 판매량 추이, 추천 판매가 산출
-
-### 3단계: 웹 대시보드
-- S09~S12: 전체상품 뷰, 인라인 수정, 추천가 UI, 상품그룹 동조화
-
-### 4단계: 플랫폼 업로드
-- S13~S16: 식봄/온일장/배민/신선행 업로드 파일 생성
+### 📋 다음 단계
+- 플랫폼 업로드 파일 자동 생성 (식봄/온일장/배민/신선행)
+- 상품그룹 동조화 UI (대표상품 ↔ 소분상품 연동)
+- 학습 이력 기반 AI 파라미터 자동 튜닝 (데이터 충분히 쌓인 후)
 
 ## 핵심 비즈니스 규칙
 
@@ -161,24 +140,81 @@ CREATE TABLE daily_selling_prices (
 ## 파일 구조
 
 ```
-판매가변경영상/
-├── 판매가_자동화_기획서.md              ← 전체 설계 문서 (필독)
+판매가변경영상/                          ← Git 루트 (main / dev 브랜치)
 ├── CLAUDE.md                           ← 이 파일
-├── claude-code-migration/
-│   ├── CLAUDE.md                       ← 이 파일 사본
-│   ├── p_sql/                          ← 매입 INSERT SQL (188 파일, 350행/파일)
-│   ├── s_sql/                          ← 매출 INSERT SQL (173 파일, 350행/파일)
-│   ├── load_data.sh                    ← 데이터 로딩 bash 스크립트
-│   └── .mcp.json                       ← Supabase MCP 설정 (참고용)
-├── sprints/                            ← 스프린트 계약서/평가서 (향후 생성)
-└── src/                                ← Next.js 소스 (향후 생성)
+├── 판매가_자동화_기획서.md              ← 전체 설계 문서 (필독)
+├── .gitignore
+├── claude-code-migration/              ← 마이그레이션 참고자료 (gitignored)
+│   └── load_data.sh
+└── src/                                ← Next.js 프로젝트
+    ├── package.json
+    ├── next.config.ts
+    ├── src/app/                         ← App Router 페이지
+    │   ├── page.tsx                     ← / (대시보드)
+    │   ├── products/page.tsx            ← /products (전체상품)
+    │   ├── upload/page.tsx              ← /upload (데이터 업로드)
+    │   ├── learn/page.tsx               ← /learn (학습)
+    │   ├── learn/history/page.tsx       ← /learn/history (학습 이력)
+    │   ├── platform/page.tsx            ← /platform (플랫폼 업로드)
+    │   └── api/                         ← API 라우트
+    └── src/lib/
+        ├── supabase.ts                  ← Supabase 클라이언트
+        └── aiRecommendation.ts          ← AI 추천 엔진
 ```
 
-## 데이터 원본
+## 데이터 현황
 
-2025년 천년경영 엑셀:
-- 매입상세: 65,535건, 497개 고유 상품코드
-- 매출상세: 60,486건, 672개 고유 상품코드
-- 양쪽 모두 있는 코드: 331개
-- 매출만 있는 코드 (소분/재고판매): 341개
-- 기간: 2025-01-02 ~ 2025-12-31
+- **상품 마스터**: 838개 (products 테이블, 고정)
+- **매입/매출 데이터**: 2026년~ 일일 업로드로 누적 (2025년 데이터는 정리 완료)
+- **데이터 소스**: 천년경영 엑셀 (매입상세 + 매출상세) + ★ 플랫폼시트 (구글시트)
+
+---
+
+## 하네스 프로토콜 — 모든 작업의 필수 워크플로
+
+> **이 프로토콜은 자연어 지시로 인해 작업 범위가 흐트러지는 것을 방지한다.**
+> 형민님의 의도가 구현으로 정확히 전달되려면, 아래 흐름을 반드시 따른다.
+
+### 스킬 체인 (자동 라우팅)
+
+```
+자연어 요청
+    │
+    ▼
+[clarification]  ← 범위가 불명확할 때 항상 먼저
+    │
+    ├── 단순 (S00~S04 수준)
+    │       ▼
+    │   [plan-crafting] → [run-plan] → [review-work]
+    │
+    └── 복잡 (여러 스프린트, 큰 범위)
+            ▼
+        [milestone-planning] → [long-run]
+            └─ 각 마일스톤: plan-crafting → run-plan → review-work
+```
+
+### 역할 매핑
+
+| 하네스 역할 | 스킬 | 이 프로젝트에서의 의미 |
+|-------------|------|----------------------|
+| 기획자 (Planner) | `clarification` + `plan-crafting` | 스프린트 계약서 작성 |
+| 생성자 (Generator) | `run-plan` | 계약서 범위 내 코드 구현 |
+| 평가자 (Evaluator) | `review-work` | 합격 조건 기준 검증 |
+
+### 강제 규칙
+
+1. **계약서 없이 코드 작성 금지** — `sprints/sprint-XX-contract.md` 없으면 먼저 plan-crafting으로 계약서 작성
+2. **범위 초과 작업 금지** — 계약서 밖의 요청이 들어오면 "다음 스프린트에 포함할까요?" 물어보기
+3. **평가자 생략 금지** — run-plan 완료 후 반드시 review-work 실행
+4. **판단 필요 비즈니스 규칙** — 구현하지 않고 형민님에게 질문
+
+### 트리거 예시
+
+| 형민님이 말할 때 | 자동으로 실행되는 스킬 |
+|----------------|----------------------|
+| "S00-B 백테스트 시작하자" | clarification → plan-crafting → run-plan → review-work |
+| "마일스톤으로 나눠줘" | milestone-planning |
+| "스프린트 실행해" / "long run" | long-run |
+| "코드 검토해줘" | review-work |
+| "버그가 있어" / "에러" | systematic-debugging |
+| "정리해줘" / "simplify" | simplify / clean-ai-slop |
