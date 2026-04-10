@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useEffect, useState, useMemo, useCallback, useRef } from "react";
+import { List } from "react-window";
 
 // ── Types ──
 
@@ -278,15 +279,94 @@ const COLUMNS: Column[] = [
     } },
 ];
 
-const COL_GROUPS = [
-  { label: "기본정보", cols: 5, color: "bg-gray-100" },
-  { label: "매입가", cols: 7, color: "bg-blue-50" },
-  { label: "판매가", cols: 3, color: "bg-green-50" },
-  { label: "수익률일괄변경", cols: 2, color: "bg-teal-50" },
-  { label: "Claude 추천", cols: 2, color: "bg-violet-50" },
-  { label: "플랫폼", cols: 3, color: "bg-purple-50" },
-  { label: "매출", cols: 5, color: "bg-amber-50" },
+// ── Column pixel widths (matching tailwind w-XX classes) ──
+const COL_WIDTHS: Record<string, number> = {
+  product_group: 48,
+  product_code: 64,
+  product_name: 176,
+  spec: 96,
+  unit: 48,
+  prev_purchase_price: 64,
+  purchase_price: 64,
+  change_rate: 56,
+  change_amount: 56,
+  purchase_prices_7d: 64,
+  max_price_7d: 56,
+  today_purchase: 56,
+  prev_selling_price: 64,
+  selling_price: 80,
+  margin_rate: 56,
+  target_margin_rate: 56,
+  target_price: 64,
+  recommended_price: 64,
+  recommend_reason: 48,
+  sinsunhang_price: 64,
+  sinsunhang_margin: 56,
+  baemin_price: 64,
+  month_1_qty: 48,
+  month_2_qty: 48,
+  month_3_qty: 48,
+  current_month_qty: 48,
+  prev_3month_pct: 64,
+};
+
+const COL_GROUPS: { label: string; group: string; color: string }[] = [
+  { label: "기본정보", group: "기본", color: "bg-gray-100" },
+  { label: "매입가", group: "매입가", color: "bg-blue-50" },
+  { label: "판매가", group: "판매가", color: "bg-green-50" },
+  { label: "수익률일괄변경", group: "일괄변경", color: "bg-teal-50" },
+  { label: "Claude 추천", group: "추천", color: "bg-violet-50" },
+  { label: "플랫폼", group: "플랫폼", color: "bg-purple-50" },
+  { label: "매출", group: "매출", color: "bg-amber-50" },
 ];
+
+// 그룹별 합산 너비 (px)
+const COL_GROUP_WIDTHS: Record<string, number> = {};
+for (const g of COL_GROUPS) {
+  COL_GROUP_WIDTHS[g.group] = COLUMNS
+    .filter((c) => c.group === g.group)
+    .reduce((sum, c) => sum + (COL_WIDTHS[c.key] || 60), 0);
+}
+
+// ── Virtual scroll constants ──
+const ROW_HEIGHT = 28;
+const MAX_TABLE_HEIGHT = 700;
+const TABLE_MIN_WIDTH = 1600;
+
+// ── Virtual Row (for react-window v2) ──
+interface VirtualRowProps {
+  items: Product[];
+  onPriceSaved: (code: string, price: number) => void;
+  onMarginSaved: (code: string, margin: number) => void;
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function VirtualRow(props: any) {
+  const { index, style, items, onPriceSaved, onMarginSaved } = props as {
+    index: number;
+    style: React.CSSProperties;
+  } & VirtualRowProps;
+  const p = items[index];
+  if (!p) return null;
+  return (
+    <div
+      style={style}
+      className={`flex items-center border-b border-gray-100 hover:bg-blue-50/30 text-xs whitespace-nowrap ${
+        index % 2 === 0 ? "bg-white" : "bg-gray-50/30"
+      } ${p.change_amount !== 0 ? "bg-yellow-50/40" : ""}`}
+    >
+      {COLUMNS.map((col) => (
+        <div
+          key={col.key}
+          className={`flex-shrink-0 px-2 py-1 ${col.align === "right" ? "text-right" : col.align === "center" ? "text-center" : "text-left"}`}
+          style={{ width: COL_WIDTHS[col.key] || 60 }}
+        >
+          {col.render(p, { onPriceSaved, onMarginSaved })}
+        </div>
+      ))}
+    </div>
+  );
+}
 
 // ── Main Page ──
 
@@ -303,6 +383,9 @@ export default function ProductsPage() {
   const [onlyKeyItems, setOnlyKeyItems] = useState(false);
   const [onlyLowMargin, setOnlyLowMargin] = useState(false);
   const [bulkApplying, setBulkApplying] = useState(false);
+
+  const headerRef = useRef<HTMLDivElement>(null);
+  const bodyRef = useRef<HTMLDivElement>(null);
 
   // 검색 디바운스 (300ms)
   useEffect(() => {
@@ -540,57 +623,66 @@ export default function ProductsPage() {
           </button>
         </div>
 
-        {/* 테이블 */}
+        {/* 테이블 (가상 스크롤) */}
         {loading ? (
           <div className="flex items-center justify-center py-20">
             <div className="animate-spin h-8 w-8 border-2 border-blue-500 border-t-transparent rounded-full" />
           </div>
+        ) : filtered.length === 0 ? (
+          <div className="border border-gray-200 rounded-lg bg-white shadow-sm px-4 py-12 text-center text-gray-400 text-sm">
+            {products.length === 0 ? "데이터가 없습니다. RAW DATA를 먼저 업로드해주세요." : "검색 결과가 없습니다."}
+          </div>
         ) : (
-          <div className="overflow-x-auto border border-gray-200 rounded-lg bg-white shadow-sm">
-            <table className="w-full text-xs whitespace-nowrap">
-              <thead>
-                <tr className="border-b border-gray-200">
+          <div className="border border-gray-200 rounded-lg bg-white shadow-sm overflow-hidden">
+            {/* 고정 헤더 (flex 기반, body와 너비 동기화) */}
+            <div className="overflow-x-auto overflow-y-hidden" ref={headerRef} style={{ scrollbarWidth: "none" }}>
+              <div style={{ minWidth: TABLE_MIN_WIDTH }}>
+                {/* 그룹 헤더 */}
+                <div className="flex border-b border-gray-200">
                   {COL_GROUPS.map((g) => (
-                    <th key={g.label} colSpan={g.cols} className={`px-2 py-1 text-center text-[10px] font-medium text-gray-500 ${g.color} border-r border-gray-200 last:border-r-0`}>
+                    <div
+                      key={g.group}
+                      className={`flex-shrink-0 px-2 py-1 text-center text-[10px] font-medium text-gray-500 ${g.color} border-r border-gray-200 last:border-r-0`}
+                      style={{ width: COL_GROUP_WIDTHS[g.group] }}
+                    >
                       {g.label}
-                    </th>
+                    </div>
                   ))}
-                </tr>
-                <tr className="border-b border-gray-300 bg-gray-50">
+                </div>
+                {/* 컬럼 헤더 */}
+                <div className="flex border-b border-gray-300 bg-gray-50">
                   {COLUMNS.map((col) => (
-                    <th
+                    <div
                       key={col.key}
-                      className={`px-2 py-1.5 text-[10px] font-medium text-gray-600 ${col.align === "right" ? "text-right" : col.align === "center" ? "text-center" : "text-left"} ${col.sortable ? "cursor-pointer hover:bg-gray-100 select-none" : ""}`}
+                      className={`flex-shrink-0 px-2 py-1.5 text-[10px] font-medium text-gray-600 ${col.align === "right" ? "text-right" : col.align === "center" ? "text-center" : "text-left"} ${col.sortable ? "cursor-pointer hover:bg-gray-100 select-none" : ""}`}
+                      style={{ width: COL_WIDTHS[col.key] || 60 }}
                       onClick={() => col.sortable && handleSort(col.key as SortKey)}
                     >
                       {col.label}
-                      {sortKey === col.key && <span className="ml-0.5">{sortDir === "asc" ? "\u25B2" : "\u25BC"}</span>}
-                    </th>
+                      {sortKey === col.key && <span className="ml-0.5">{sortDir === "asc" ? "▲" : "▼"}</span>}
+                    </div>
                   ))}
-                </tr>
-              </thead>
-              <tbody>
-                {filtered.map((p, idx) => (
-                  <tr
-                    key={p.product_code}
-                    className={`border-b border-gray-100 hover:bg-blue-50/30 ${idx % 2 === 0 ? "bg-white" : "bg-gray-50/30"} ${p.change_amount !== 0 ? "bg-yellow-50/40" : ""}`}
-                  >
-                    {COLUMNS.map((col) => (
-                      <td key={col.key} className={`px-2 py-1 ${col.width} ${col.align === "right" ? "text-right" : col.align === "center" ? "text-center" : "text-left"}`}>
-                        {col.render(p, { onPriceSaved: handlePriceSaved, onMarginSaved: handleMarginSaved })}
-                      </td>
-                    ))}
-                  </tr>
-                ))}
-                {filtered.length === 0 && (
-                  <tr>
-                    <td colSpan={COLUMNS.length} className="px-4 py-12 text-center text-gray-400 text-sm">
-                      {products.length === 0 ? "데이터가 없습니다. RAW DATA를 먼저 업로드해주세요." : "검색 결과가 없습니다."}
-                    </td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
+                </div>
+              </div>
+            </div>
+            {/* 가상 스크롤 바디 */}
+            <div
+              className="overflow-x-auto"
+              ref={bodyRef}
+              onScroll={(e) => {
+                if (headerRef.current) headerRef.current.scrollLeft = e.currentTarget.scrollLeft;
+              }}
+            >
+              <List
+                defaultHeight={Math.min(filtered.length * ROW_HEIGHT, MAX_TABLE_HEIGHT)}
+                rowCount={filtered.length}
+                rowHeight={ROW_HEIGHT}
+                overscanCount={10}
+                rowComponent={VirtualRow}
+                rowProps={{ items: filtered, onPriceSaved: handlePriceSaved, onMarginSaved: handleMarginSaved }}
+                style={{ height: Math.min(filtered.length * ROW_HEIGHT, MAX_TABLE_HEIGHT), minWidth: TABLE_MIN_WIDTH }}
+              />
+            </div>
           </div>
         )}
       </main>
