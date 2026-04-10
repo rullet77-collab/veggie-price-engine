@@ -42,21 +42,122 @@ export type AiRecOutput = {
 };
 
 // ─────────────────────────────────────────
-// 1. 단기 추세 판정 (8일 창)
+// 1. 단기 추세 판정 (8일 창) — 상세 분석
 // ─────────────────────────────────────────
+type ShortTrendDetail = {
+  label: "상승" | "하락" | "횡보" | "변곡";
+  total_change_pct: number;       // 8일 전체 변동률 (첫날→마지막날)
+  recent_3d_change_pct: number;   // 최근 3일 변동률
+  consecutive_up: number;         // 최근 연속 상승일수
+  consecutive_down: number;       // 최근 연속 하락일수
+  max_price: number;
+  min_price: number;
+  volatility: number;             // 변동성 (일간 변동률의 표준편차)
+  day_count: number;              // 유효 데이터 일수
+  description: string;            // 사람이 읽을 수 있는 8일 분석 요약
+};
+
+function analyzeShortTrend(history: PriceHistory[]): ShortTrendDetail {
+  const valid = history.filter((h) => h.price > 0);
+  const prices = valid.map((h) => h.price);
+  const dates = valid.map((h) => h.date);
+
+  const empty: ShortTrendDetail = {
+    label: "횡보", total_change_pct: 0, recent_3d_change_pct: 0,
+    consecutive_up: 0, consecutive_down: 0,
+    max_price: 0, min_price: 0, volatility: 0, day_count: 0,
+    description: "매입 이력 부족",
+  };
+
+  if (prices.length < 2) return empty;
+
+  const first = prices[0];
+  const last = prices[prices.length - 1];
+  const totalChange = (last - first) / first;
+
+  // 최근 3일 변동률
+  const recent3Start = prices.length >= 3 ? prices[prices.length - 3] : first;
+  const recent3Change = recent3Start > 0 ? (last - recent3Start) / recent3Start : 0;
+
+  // 일간 변동률
+  const dailyChanges: number[] = [];
+  for (let i = 1; i < prices.length; i++) {
+    if (prices[i - 1] > 0) dailyChanges.push((prices[i] - prices[i - 1]) / prices[i - 1]);
+  }
+
+  // 연속 상승/하락 일수 (가장 최근부터 역순)
+  let consUp = 0, consDown = 0;
+  for (let i = dailyChanges.length - 1; i >= 0; i--) {
+    if (dailyChanges[i] > 0) { if (consDown === 0) consUp++; else break; }
+    else if (dailyChanges[i] < 0) { if (consUp === 0) consDown++; else break; }
+    else break; // 동일가
+  }
+
+  // 변동성 (표준편차)
+  const avgChange = dailyChanges.length > 0 ? dailyChanges.reduce((s, d) => s + d, 0) / dailyChanges.length : 0;
+  const variance = dailyChanges.length > 1
+    ? dailyChanges.reduce((s, d) => s + (d - avgChange) ** 2, 0) / (dailyChanges.length - 1)
+    : 0;
+  const volatility = Math.sqrt(variance);
+
+  const maxP = Math.max(...prices);
+  const minP = Math.min(...prices);
+
+  // 추세 판정 (복합 기준)
+  let label: ShortTrendDetail["label"];
+  const ups = dailyChanges.filter((d) => d > 0.001).length;
+  const downs = dailyChanges.filter((d) => d < -0.001).length;
+
+  if (totalChange > 0.03 && ups > downs && consUp >= 2) label = "상승";
+  else if (totalChange < -0.03 && downs > ups && consDown >= 2) label = "하락";
+  else if (consUp >= 2 && consDown === 0 && recent3Change > 0.02) label = "상승";
+  else if (consDown >= 2 && consUp === 0 && recent3Change < -0.02) label = "하락";
+  else if (
+    (dailyChanges.length >= 2 && dailyChanges[dailyChanges.length - 1] > 0.01 && dailyChanges[dailyChanges.length - 2] < -0.01) ||
+    (dailyChanges.length >= 2 && dailyChanges[dailyChanges.length - 1] < -0.01 && dailyChanges[dailyChanges.length - 2] > 0.01)
+  ) label = "변곡";
+  else label = "횡보";
+
+  // 설명 생성
+  const firstDate = dates[0]?.slice(5) || "?";  // MM-DD
+  const lastDate = dates[dates.length - 1]?.slice(5) || "?";
+  const parts: string[] = [];
+
+  parts.push(`${prices.length}일간(${firstDate}~${lastDate}) 매입가 ${first.toLocaleString()}→${last.toLocaleString()}원`);
+
+  if (Math.abs(totalChange) >= 0.005) {
+    parts.push(`전체 ${totalChange > 0 ? "+" : ""}${(totalChange * 100).toFixed(1)}%`);
+  } else {
+    parts.push("보합");
+  }
+
+  if (consUp >= 2) parts.push(`최근 ${consUp}일 연속 상승`);
+  if (consDown >= 2) parts.push(`최근 ${consDown}일 연속 하락`);
+
+  if (maxP !== minP) {
+    parts.push(`최저 ${minP.toLocaleString()} / 최고 ${maxP.toLocaleString()}`);
+  }
+
+  if (volatility > 0.05) parts.push("변동성 높음");
+
+  return {
+    label,
+    total_change_pct: totalChange,
+    recent_3d_change_pct: recent3Change,
+    consecutive_up: consUp,
+    consecutive_down: consDown,
+    max_price: maxP,
+    min_price: minP,
+    volatility,
+    day_count: prices.length,
+    description: parts.join(". "),
+  };
+}
+
+// 호환용 래퍼 (기존 코드에서 사용)
 function detectShortTrend(prices: number[]): "상승" | "하락" | "횡보" | "변곡" {
-  const valid = prices.filter((p) => p > 0);
-  if (valid.length < 3) return "횡보";
-  const recent = valid.slice(-5);
-  const diffs = recent.slice(1).map((p, i) => p - recent[i]);
-  const ups = diffs.filter((d) => d > 0).length;
-  const downs = diffs.filter((d) => d < 0).length;
-  if (ups >= 3 && downs === 0) return "상승";
-  if (downs >= 3 && ups === 0) return "하락";
-  const lastDiff = diffs[diffs.length - 1] || 0;
-  const prevDiff = diffs.length >= 2 ? diffs[diffs.length - 2] : 0;
-  if ((lastDiff > 0 && prevDiff < 0) || (lastDiff < 0 && prevDiff > 0)) return "변곡";
-  return "횡보";
+  const history = prices.map((p, i) => ({ date: `day-${i}`, price: p }));
+  return analyzeShortTrend(history).label;
 }
 
 // ─────────────────────────────────────────
@@ -177,9 +278,9 @@ export function calculateAiRecommendation(input: AiRecInput): AiRecOutput {
   signals.current_margin = currentMargin;
   signals.purchase_change_pct = purchaseChange;
 
-  // 단기 추세
-  const shortPrices = short_history.map((h) => h.price);
-  signals.short_trend = detectShortTrend(shortPrices);
+  // 단기 추세 — 8일 이력 상세 분석
+  const trendDetail = analyzeShortTrend(short_history);
+  signals.short_trend = trendDetail.label;
 
   // 장기 지지선/저항선
   const longPrices = long_history.map((h) => h.price);
@@ -196,57 +297,86 @@ export function calculateAiRecommendation(input: AiRecInput): AiRecOutput {
   signals.sales_change_pct = salesChange;
 
   // ─────────────────────────────────────
-  // 의사결정
+  // 의사결정 (8일 이력 기반)
   // ─────────────────────────────────────
   // ※ targetPrice(수익률일괄변경가)는 "역마진 / 긴급 가격 변경" 상황에만 사용한다.
-  //    일상적인 추천가에서는 사용하지 않고, 사용자 수동 트리거(UI의 '수익률일괄변경 실행'
-  //    버튼)로만 적용한다. 그 외는 매입 변동·추세 기반 점진적 조정을 추천한다.
   const reasons: string[] = [];
   let aiPrice: number;
 
+  // 8일 이력 분석 결과를 첫 번째 reason으로 항상 포함
+  if (trendDetail.day_count >= 2) {
+    reasons.push(trendDetail.description);
+  }
+
+  // 8일 전체 변동률 + 최근 3일 변동률 (2일 비교보다 신뢰도 높음)
+  const totalTrend = trendDetail.total_change_pct;
+  const recent3d = trendDetail.recent_3d_change_pct;
+
   // (A) 역마진 발생 — 긴급 상황: targetPrice 적용
-  //     판매가가 매입가보다 낮아 손실이 나는 경우에 한해서만 일괄변경가 제안
   if (cur > 0 && cur <= pp) {
     aiPrice = targetPrice;
     reasons.push(
       `역마진 발생(판매가 ${cur.toLocaleString()}원 ≤ 매입가 ${pp.toLocaleString()}원) → 수익률일괄변경가 ${targetPrice.toLocaleString()}원 긴급 적용 권장`
     );
   }
-  // (B) 매입 급등 + 상승 추세 — 상승분 100% 반영 (점진적 인상)
-  else if (purchaseChange > 0.05 && signals.short_trend === "상승") {
-    const adjustment = Math.round(pp - prevPP);
-    aiPrice = Math.ceil((prev + adjustment) / 10) * 10;
+  // (B) 8일간 큰 폭 상승 (>5%) + 최근 가속 — 상승분 100% 반영
+  else if (totalTrend > 0.05 && trendDetail.label === "상승" && trendDetail.consecutive_up >= 2) {
+    const basePrice = trendDetail.min_price || prevPP || pp;
+    const adjustment = Math.round(pp - basePrice);
+    const reflectRate = recent3d > 0.03 ? 1.0 : 0.8; // 최근 가속이면 전액, 아니면 80%
+    const applied = Math.round(adjustment * reflectRate);
+    aiPrice = Math.ceil((prev + applied) / 10) * 10;
     reasons.push(
-      `매입가 ${(purchaseChange * 100).toFixed(1)}% 급등 + 단기 상승추세 → 상승분 전액 반영 (+${adjustment.toLocaleString()}원)`
+      `8일간 ${(totalTrend * 100).toFixed(1)}% 상승 + ${trendDetail.consecutive_up}일 연속 상승 → 상승분의 ${Math.round(reflectRate * 100)}% 반영 (+${applied.toLocaleString()}원)`
     );
   }
-  // (C) 매입 상승 (3~5%)
-  else if (purchaseChange > 0.03) {
-    const adjustment = Math.round((pp - prevPP) * 0.7);
-    aiPrice = Math.ceil((prev + adjustment) / 10) * 10;
+  // (C) 완만한 상승 (3~5%) 또는 단기 상승
+  else if (totalTrend > 0.02 || (recent3d > 0.03 && trendDetail.consecutive_up >= 2)) {
+    const changePct = Math.max(totalTrend, recent3d);
+    const reflectRate = trendDetail.consecutive_up >= 3 ? 0.7 : 0.5;
+    const adjustment = Math.round((pp - (prevPP || pp)) * reflectRate);
+    aiPrice = Math.ceil(((prev || cur) + adjustment) / 10) * 10;
+    if (adjustment !== 0) {
+      reasons.push(
+        `상승 추세(${(changePct * 100).toFixed(1)}%) → 상승분의 ${Math.round(reflectRate * 100)}% 반영 (${adjustment > 0 ? "+" : ""}${adjustment.toLocaleString()}원)`
+      );
+    } else {
+      reasons.push(`완만한 상승 추세 → 현재가 유지`);
+    }
+  }
+  // (D) 8일간 큰 폭 하락 (>5%) + 하락 지속 — 하락분 50%만 반영 (마진 확보)
+  else if (totalTrend < -0.05 && trendDetail.label === "하락" && trendDetail.consecutive_down >= 2) {
+    const adjustment = Math.round((pp - (prevPP || pp)) * 0.5);
+    aiPrice = Math.ceil(((prev || cur) + adjustment) / 10) * 10;
     reasons.push(
-      `매입가 ${(purchaseChange * 100).toFixed(1)}% 상승 → 상승분의 70% 반영 (${adjustment}원)`
+      `8일간 ${(Math.abs(totalTrend) * 100).toFixed(1)}% 하락 + ${trendDetail.consecutive_down}일 연속 하락 → 하락분의 50%만 반영 (마진 확보)`
     );
   }
-  // (D) 매입 급락 + 하락추세 — 하락분 50%만 반영 (마진 확보)
-  else if (purchaseChange < -0.05 && signals.short_trend === "하락") {
-    const adjustment = Math.round((pp - prevPP) * 0.5);
-    aiPrice = Math.ceil((prev + adjustment) / 10) * 10;
-    reasons.push(
-      `매입가 ${(Math.abs(purchaseChange) * 100).toFixed(1)}% 하락 + 하락추세 → 하락분의 50%만 반영 (마진 확보)`
-    );
+  // (E) 완만한 하락 (2~5%)
+  else if (totalTrend < -0.02 || (recent3d < -0.03 && trendDetail.consecutive_down >= 2)) {
+    const adjustment = Math.round((pp - (prevPP || pp)) * 0.3);
+    aiPrice = Math.ceil(((prev || cur) + adjustment) / 10) * 10;
+    if (adjustment !== 0) {
+      reasons.push(
+        `하락 추세(${(Math.abs(totalTrend) * 100).toFixed(1)}%) → 하락분의 30%만 반영 (마진 우선)`
+      );
+    } else {
+      reasons.push(`완만한 하락 추세 → 현재가 유지`);
+    }
   }
-  // (E) 변곡점 — 관망
-  else if (signals.short_trend === "변곡") {
+  // (F) 변곡점 — 관망
+  else if (trendDetail.label === "변곡") {
     aiPrice = prev || cur;
     reasons.push(`매입 추세 전환(변곡점) 감지 → 1~2일 관망 권장`);
   }
-  // (F) 기본 — 현재가 유지
+  // (G) 횡보 — 현재가 유지
   else {
     aiPrice = cur;
-    reasons.push(
-      `매입가 변동 ${(purchaseChange * 100).toFixed(1)}% + ${signals.short_trend} → 현재가 유지`
-    );
+    if (trendDetail.day_count >= 3) {
+      reasons.push(`8일간 보합(${(totalTrend * 100).toFixed(1)}%) → 현재가 유지`);
+    } else {
+      reasons.push(`매입 이력 부족 → 현재가 유지`);
+    }
   }
 
   // ─────────────────────────────────────
