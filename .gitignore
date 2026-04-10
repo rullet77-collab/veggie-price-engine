@@ -1,0 +1,70 @@
+# ── 의존성/빌드 산출물 ──
+node_modules/
+.next/
+out/
+build/
+coverage/
+*.tsbuildinfo
+next-env.d.ts
+.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# ── 환경변수/시크릿 (GUIDE 3) ──
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ── OS / 에디터 / 툴 ──
+.DS_Store
+Thumbs.db
+.vercel
+.idea/
+.vscode/
+.claude/
+
+# ── 로그 ──
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+logs/
+*.log
+
+# ── GUIDE 3: 데이터셋 / 대용량 원본 파일 (GitHub 업로드 금지) ──
+# 엑셀/CSV 원본
+*.xlsx
+*.xlsm
+*.xls
+*.csv
+*.tsv
+
+# 비디오/이미지 대용량
+*.mp4
+*.mov
+*.avi
+*.mkv
+
+# AI 모델 / 바이너리
+*.pkl
+*.h5
+*.onnx
+*.pt
+*.bin
+
+# ── 데이터 마이그레이션 대용량 SQL 덤프 (p_sql 188개 / s_sql 173개) ──
+claude-code-migration/p_sql/
+claude-code-migration/s_sql/
+
+# ── 이관 작업용 임시 백업 ──
+_migration_backup/
+*.bak
+
+# ── 외부 참조 프로젝트 (본 프로젝트 소스 아님) ──
+engineering-discipline-main/
