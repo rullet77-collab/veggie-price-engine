@@ -51,8 +51,20 @@ export async function GET(request: Request) {
       return Response.json({ items: [], price_date: priceDate, has_session: false });
     }
 
+    // prev_3month_pct 조회 (product_selling_prices)
+    const itemCodes = items.map((i: { product_code: string }) => i.product_code);
+    const { data: pspData } = await supabase
+      .from("product_selling_prices")
+      .select("product_code,prev_3month_pct")
+      .in("product_code", itemCodes);
+    const pctMap = new Map<string, string | null>();
+    for (const r of pspData || []) pctMap.set(r.product_code, r.prev_3month_pct);
+
     return Response.json({
-      items: items.map(mapItemToApi),
+      items: items.map((item: { product_code: string }) => ({
+        ...mapItemToApi(item),
+        prev_3month_pct: pctMap.get(item.product_code) || null,
+      })),
       price_date: priceDate,
       has_session: true,
     });
@@ -110,10 +122,11 @@ export async function POST() {
     // 4) 판매가 변경이 있는 야채 상품
     type SellingRow = {
       product_code: string; selling_price: number; prev_selling_price: number | null;
+      prev_3month_pct: string | null;
     };
     const sellingData = await fetchAll<SellingRow>(
       "product_selling_prices",
-      "product_code,selling_price,prev_selling_price"
+      "product_code,selling_price,prev_selling_price,prev_3month_pct"
     );
     const sellingMap = new Map<string, SellingRow>();
     for (const s of sellingData) sellingMap.set(s.product_code, s);
@@ -316,8 +329,20 @@ export async function POST() {
 
     if (insertError) throw insertError;
 
+    // prev_3month_pct 조회
+    const pspCodes = (inserted || []).map((i: { product_code: string }) => i.product_code);
+    const { data: pspPost } = await supabase
+      .from("product_selling_prices")
+      .select("product_code,prev_3month_pct")
+      .in("product_code", pspCodes);
+    const pctPostMap = new Map<string, string | null>();
+    for (const r of pspPost || []) pctPostMap.set(r.product_code, r.prev_3month_pct);
+
     return Response.json({
-      items: (inserted || []).map(mapItemToApi),
+      items: (inserted || []).map((item: { product_code: string }) => ({
+        ...mapItemToApi(item),
+        prev_3month_pct: pctPostMap.get(item.product_code) || null,
+      })),
       price_date: priceDate,
       has_session: true,
     });

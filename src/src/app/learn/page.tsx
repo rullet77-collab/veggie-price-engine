@@ -18,6 +18,7 @@ type LearnItem = {
   purchase_history: { date: string; price: number }[];
 
   target_margin_rate: number | null;
+  prev_3month_pct: string | null;
 
   prev_selling_price: number;
   user_price: number;
@@ -125,6 +126,21 @@ function LearnCard({
           {savingStatus === "saved" && (
             <span className="text-[10px] text-green-500">✓ 저장됨</span>
           )}
+          {item.target_margin_rate != null && item.target_margin_rate > 0 && (
+            <div className="text-right">
+              <div className="text-xs text-gray-400">기준수익률</div>
+              <div className="text-sm font-semibold text-teal-600">{item.target_margin_rate}%</div>
+            </div>
+          )}
+          {item.prev_3month_pct && (
+            <div className="text-right">
+              <div className="text-xs text-gray-400">3개월대비</div>
+              <div className={`text-sm font-semibold ${
+                item.prev_3month_pct.includes("▲") || item.prev_3month_pct.includes("+") ? "text-red-600" :
+                item.prev_3month_pct.includes("▼") || item.prev_3month_pct.includes("-") ? "text-blue-600" : "text-gray-500"
+              }`}>{item.prev_3month_pct}</div>
+            </div>
+          )}
           <div className="text-right">
             <div className="text-xs text-gray-400">매입가</div>
             <div className="text-sm">
@@ -167,9 +183,6 @@ function LearnCard({
       <div className="px-5 py-2 border-b border-gray-100 bg-gray-50/50">
         <div className="text-center">
           <span className={`text-xs font-medium ${diffColor}`}>{diffLabel}</span>
-          {item.target_margin_rate && (
-            <span className="text-[10px] text-gray-400 ml-3">목표수익률: {item.target_margin_rate}%</span>
-          )}
         </div>
       </div>
 
