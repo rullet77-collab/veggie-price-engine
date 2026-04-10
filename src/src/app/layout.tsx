@@ -55,6 +55,12 @@ export default function RootLayout({
           >
             플랫폼 업로드
           </Link>
+          <Link
+            href="/learn"
+            className="text-sm text-gray-600 hover:text-gray-900 transition-colors"
+          >
+            학습
+          </Link>
         </nav>
         {children}
       </body>
