@@ -142,6 +142,7 @@ async function main() {
     code: string; name: string; purchase: number; user: number; ai: number;
     diff: number; diffPct: number; userMargin: number; aiMargin: number;
     category: string; sensitivity: string;
+    historyDays: number;  // 8일 이력 일수
   };
   const results: Result[] = [];
 
@@ -187,62 +188,73 @@ async function main() {
       aiMargin,
       category: row.category_name || "",
       sensitivity: priceSensitivity,
+      historyDays: aiInput.short_history.length,
     });
   }
 
   // 분석 출력
-  console.log(`📊 총 ${results.length}개 야채 상품 분석\n`);
+  console.log(`📊 총 ${results.length}개 야채 상품 분석`);
 
-  const exact = results.filter((r) => r.user === r.ai).length;
-  const within100 = results.filter((r) => Math.abs(r.diff) <= 100).length;
-  const within500 = results.filter((r) => Math.abs(r.diff) <= 500).length;
-  const within1000 = results.filter((r) => Math.abs(r.diff) <= 1000).length;
-  const within3pct = results.filter((r) => Math.abs(r.diffPct) <= 3).length;
-  const within5pct = results.filter((r) => Math.abs(r.diffPct) <= 5).length;
-  const within10pct = results.filter((r) => Math.abs(r.diffPct) <= 10).length;
-  const aiHigher = results.filter((r) => r.ai > r.user).length;
-  const aiLower = results.filter((r) => r.ai < r.user).length;
-
-  console.log("=== 일치율 (절대 금액) ===");
-  console.log(`정확히 일치:     ${exact}건 (${((exact / results.length) * 100).toFixed(1)}%)`);
-  console.log(`±100원 이내:     ${within100}건 (${((within100 / results.length) * 100).toFixed(1)}%)`);
-  console.log(`±500원 이내:     ${within500}건 (${((within500 / results.length) * 100).toFixed(1)}%)`);
-  console.log(`±1,000원 이내:   ${within1000}건 (${((within1000 / results.length) * 100).toFixed(1)}%)`);
-
-  console.log("\n=== 일치율 (상대 %) ===");
-  console.log(`±3% 이내:        ${within3pct}건 (${((within3pct / results.length) * 100).toFixed(1)}%)`);
-  console.log(`±5% 이내:        ${within5pct}건 (${((within5pct / results.length) * 100).toFixed(1)}%)`);
-  console.log(`±10% 이내:       ${within10pct}건 (${((within10pct / results.length) * 100).toFixed(1)}%)`);
-
-  console.log("\n=== AI vs 사용자 방향 ===");
-  console.log(`AI가 더 높음:    ${aiHigher}건 (${((aiHigher / results.length) * 100).toFixed(1)}%)`);
-  console.log(`AI가 더 낮음:    ${aiLower}건 (${((aiLower / results.length) * 100).toFixed(1)}%)`);
-  console.log(`동일:            ${exact}건 (${((exact / results.length) * 100).toFixed(1)}%)`);
-
-  // price_sensitivity별 분석
-  console.log("\n=== price_sensitivity별 일치율 (±5%) ===");
-  for (const ps of ["예민", "고정", "일반"]) {
-    const subset = results.filter((r) => r.sensitivity === ps);
-    if (subset.length === 0) continue;
-    const matched = subset.filter((r) => Math.abs(r.diffPct) <= 5).length;
-    console.log(`${ps}: ${matched}/${subset.length}건 일치 (${((matched / subset.length) * 100).toFixed(1)}%)`);
+  // 8일 중 이력 일수 분포
+  const histDist = new Map<number, number>();
+  for (const r of results) histDist.set(r.historyDays, (histDist.get(r.historyDays) || 0) + 1);
+  console.log(`\n=== 매입 이력 분포 (8일 중) ===`);
+  for (let d = 0; d <= 8; d++) {
+    const c = histDist.get(d) || 0;
+    if (c > 0) console.log(`  ${d}일: ${c}건 (${((c / results.length) * 100).toFixed(1)}%)`);
   }
 
-  // 수익률 범위 분석
-  console.log("\n=== 수익률 범위 분석 ===");
-  const avgUserMargin = results.reduce((s, r) => s + r.userMargin, 0) / results.length;
-  const avgAiMargin = results.reduce((s, r) => s + r.aiMargin, 0) / results.length;
-  console.log(`사용자 평균 수익률: ${avgUserMargin.toFixed(1)}%`);
-  console.log(`AI 평균 수익률:     ${avgAiMargin.toFixed(1)}%`);
+  // 5일 이상 이력 있는 품목만 (적정매입가 판단 가능)
+  const reliable = results.filter((r) => r.historyDays >= 5);
+  console.log(`\n=== 🎯 이력 5일+ (적정매입가 판단 가능) — ${reliable.length}건 ===`);
+  printStats(reliable);
 
-  // 차이 큰 케이스 TOP 20
-  const sortedByDiff = [...results].sort((a, b) => Math.abs(b.diffPct) - Math.abs(a.diffPct));
-  console.log("\n=== 차이 큰 케이스 TOP 20 ===");
-  console.log("코드   | 상품명                               | 매입    | 사용자  | AI      | 차이     | 사용자% | AI%");
+  // 전체
+  console.log(`\n\n=== 전체 ${results.length}건 ===`);
+  printStats(results);
+
+  function printStats(arr: Result[]) {
+    if (arr.length === 0) { console.log("  없음"); return; }
+    const exact = arr.filter((r) => r.user === r.ai).length;
+    const within100 = arr.filter((r) => Math.abs(r.diff) <= 100).length;
+    const within500 = arr.filter((r) => Math.abs(r.diff) <= 500).length;
+    const within1000 = arr.filter((r) => Math.abs(r.diff) <= 1000).length;
+    const within3pct = arr.filter((r) => Math.abs(r.diffPct) <= 3).length;
+    const within5pct = arr.filter((r) => Math.abs(r.diffPct) <= 5).length;
+    const within10pct = arr.filter((r) => Math.abs(r.diffPct) <= 10).length;
+    const aiHigher = arr.filter((r) => r.ai > r.user).length;
+    const aiLower = arr.filter((r) => r.ai < r.user).length;
+
+    console.log(`  정확히 일치:  ${exact}건 (${((exact / arr.length) * 100).toFixed(1)}%)`);
+    console.log(`  ±100원:     ${within100}건 (${((within100 / arr.length) * 100).toFixed(1)}%)`);
+    console.log(`  ±500원:     ${within500}건 (${((within500 / arr.length) * 100).toFixed(1)}%)`);
+    console.log(`  ±1,000원:   ${within1000}건 (${((within1000 / arr.length) * 100).toFixed(1)}%)`);
+    console.log(`  ±3%:       ${within3pct}건 (${((within3pct / arr.length) * 100).toFixed(1)}%)`);
+    console.log(`  ±5%:       ${within5pct}건 (${((within5pct / arr.length) * 100).toFixed(1)}%)`);
+    console.log(`  ±10%:      ${within10pct}건 (${((within10pct / arr.length) * 100).toFixed(1)}%)`);
+    console.log(`  AI 더 높음: ${aiHigher}건 (${((aiHigher / arr.length) * 100).toFixed(1)}%) / 더 낮음: ${aiLower}건 (${((aiLower / arr.length) * 100).toFixed(1)}%)`);
+
+    // 민감도별
+    for (const ps of ["예민", "고정", "일반"]) {
+      const subset = arr.filter((r) => r.sensitivity === ps);
+      if (subset.length === 0) continue;
+      const matched = subset.filter((r) => Math.abs(r.diffPct) <= 5).length;
+      console.log(`  ${ps}: ${matched}/${subset.length}건 ±5% 일치 (${((matched / subset.length) * 100).toFixed(1)}%)`);
+    }
+
+    const avgUserM = arr.reduce((s, r) => s + r.userMargin, 0) / arr.length;
+    const avgAiM = arr.reduce((s, r) => s + r.aiMargin, 0) / arr.length;
+    console.log(`  사용자 평균 수익률 ${avgUserM.toFixed(1)}% / AI 평균 수익률 ${avgAiM.toFixed(1)}%`);
+  }
+
+  // 이력 5일+ 품목 중 차이 큰 케이스 TOP 20
+  const sortedByDiff = [...reliable].sort((a, b) => Math.abs(b.diffPct) - Math.abs(a.diffPct));
+  console.log("\n=== 🎯 이력 5일+ 중 차이 큰 케이스 TOP 20 ===");
+  console.log("코드   | 상품명                               | 이력 | 매입    | 사용자  | AI      | 차이     | 사용자% | AI%");
   for (const r of sortedByDiff.slice(0, 20)) {
     const name = r.name.slice(0, 30).padEnd(30);
     console.log(
-      `${r.code} | ${name} | ${r.purchase.toLocaleString().padStart(7)} | ${r.user.toLocaleString().padStart(7)} | ${r.ai.toLocaleString().padStart(7)} | ${(r.diff > 0 ? "+" : "") + r.diff.toLocaleString().padStart(6)} | ${r.userMargin.toFixed(1).padStart(6)}% | ${r.aiMargin.toFixed(1).padStart(6)}%`
+      `${r.code} | ${name} | ${r.historyDays}일  | ${r.purchase.toLocaleString().padStart(7)} | ${r.user.toLocaleString().padStart(7)} | ${r.ai.toLocaleString().padStart(7)} | ${(r.diff > 0 ? "+" : "") + r.diff.toLocaleString().padStart(6)} | ${r.userMargin.toFixed(1).padStart(6)}% | ${r.aiMargin.toFixed(1).padStart(6)}%`
     );
   }
 }

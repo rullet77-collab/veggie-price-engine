@@ -534,7 +534,15 @@ export function calculateAiRecommendation(input: AiRecInput): AiRecOutput {
   const ABNORMAL_THRESHOLD = 0.05;              // 5%p
   const MARGIN_UPPER_PROTECT_K = 0.25;          // 상승 이상치 시 수익률 포기 계수
   const MARGIN_LOWER_PROTECT_RATIO = 0.1;       // 하락 이상치 시 판매가 인하 비율
-  const MARGIN_FLOOR = 0.15;                    // 수익률 하한 15%
+
+  // 민감도별 수익률 하한 — 가격예민은 상향, 고정/일반은 15% 동일
+  const SENSITIVITY_FLOORS: Record<string, number> = {
+    "예민": 0.18,  // 대파/양상추/상추 등 — 실제 운영 수익률 반영
+    "고정": 0.15,  // 콩나물/두부/마늘 등 — 기본 하한 유지
+    "일반": 0.15,  // 야채/수산 기본
+  };
+  const MARGIN_FLOOR = SENSITIVITY_FLOORS[priceSensitivity] ?? 0.15;
+  const MARGIN_FLOOR_PCT = MARGIN_FLOOR * 100;  // 백분율 버전
 
   const purchaseChangeFromBase = basePP > 0 ? (pp - basePP) / basePP : 0;
   let marginDeviation = 0;
@@ -662,22 +670,21 @@ export function calculateAiRecommendation(input: AiRecInput): AiRecOutput {
   if (salesAnalysis.direction === "없음") {
     if (salesAnalysis.prev_total >= 50) {
       // 직전 3개월 50건+ 있었는데 이번에 없음 → 공격적 인하
-      const aggressiveMargin = Math.max(15, targetMargin - 3);
+      const aggressiveMargin = Math.max(MARGIN_FLOOR_PCT, targetMargin - 3);
       const aggressivePrice = Math.ceil(basePP / (1 - aggressiveMargin / 100) / 10) * 10;
       if (aggressivePrice < aiPrice) {
         aiPrice = aggressivePrice;
         reasons.push(
-          `직전 3개월 ${salesAnalysis.prev_total}건 있었으나 최근 없음 → 공격적 인하 (수익률 ${aggressiveMargin.toFixed(1)}%, 기준${targetMargin}% - 3%p)로 매출 회복 시도`
+          `직전 3개월 ${salesAnalysis.prev_total}건 있었으나 최근 없음 → 공격적 인하 (수익률 ${aggressiveMargin.toFixed(1)}%, 기준${targetMargin}% - 3%p, 민감도${priceSensitivity}하한${MARGIN_FLOOR_PCT}%)로 매출 회복 시도`
         );
       }
-    } else if (targetMargin > 15) {
-      // 매출 원래 적음 → 15%부터 시작
-      const floorMargin = 15;
-      const floorPrice = Math.ceil(basePP / (1 - floorMargin / 100) / 10) * 10;
+    } else if (targetMargin > MARGIN_FLOOR_PCT) {
+      // 매출 원래 적음 → 민감도별 하한부터 시작 (예민 18% / 고정 13% / 일반 15%)
+      const floorPrice = Math.ceil(basePP / (1 - MARGIN_FLOOR) / 10) * 10;
       if (floorPrice < aiPrice) {
         aiPrice = floorPrice;
         reasons.push(
-          `비인기 품목 (매출 없음) → 수익률 ${floorMargin}%(최저)로 매출 유도`
+          `비인기 품목 (매출 없음) → 수익률 ${MARGIN_FLOOR_PCT}%(민감도${priceSensitivity} 하한)로 매출 유도`
         );
       }
     }
@@ -686,21 +693,21 @@ export function calculateAiRecommendation(input: AiRecInput): AiRecOutput {
   else if (salesAnalysis.direction === "급감") {
     const changePct = salesAnalysis.change_pct || 0;
     if (purchaseStable) {
-      // 매입 안정 → 기준수익률 최저 15%까지 하향 (매출 하락률에 비례)
+      // 매입 안정 → 기준수익률 민감도별 하한까지 하향 (매출 하락률에 비례)
       const intensity = Math.min(1, Math.abs(changePct));
-      const marginReduction = Math.min(targetMargin - 15, intensity * 5); // 최대 5%p
-      const newMargin = Math.max(15, targetMargin - marginReduction);
+      const marginReduction = Math.min(targetMargin - MARGIN_FLOOR_PCT, intensity * 5); // 최대 5%p
+      const newMargin = Math.max(MARGIN_FLOOR_PCT, targetMargin - marginReduction);
       const newPrice = Math.ceil(basePP / (1 - newMargin / 100) / 10) * 10;
       if (newPrice < aiPrice) {
         aiPrice = newPrice;
         reasons.push(
-          `매출 급감 ▼${(Math.abs(changePct) * 100).toFixed(0)}% + 매입 안정(${layer1.method.split("(")[0]}) → 수익률 ${newMargin.toFixed(1)}%(기준${targetMargin}% - ${marginReduction.toFixed(1)}%p)로 하향`
+          `매출 급감 ▼${(Math.abs(changePct) * 100).toFixed(0)}% + 매입 안정(${layer1.method.split("(")[0]}) → 수익률 ${newMargin.toFixed(1)}%(기준${targetMargin}% - ${marginReduction.toFixed(1)}%p, 민감도${priceSensitivity}하한${MARGIN_FLOOR_PCT}%)로 하향`
         );
       }
     } else {
       // 매입 등락 심함 → 1~2%p만 낮춤 (리스크 방어)
       const marginReduction = Math.abs(changePct) > 0.7 ? 2 : 1;
-      const newMargin = Math.max(15, targetMargin - marginReduction);
+      const newMargin = Math.max(MARGIN_FLOOR_PCT, targetMargin - marginReduction);
       const newPrice = Math.ceil(basePP / (1 - newMargin / 100) / 10) * 10;
       if (newPrice < aiPrice) {
         aiPrice = newPrice;
@@ -712,7 +719,7 @@ export function calculateAiRecommendation(input: AiRecInput): AiRecOutput {
   }
   // (3) 매출 감소 (▼15~50%) — 소폭 인하
   else if (salesAnalysis.direction === "감소") {
-    const newMargin = Math.max(15, targetMargin - 1);
+    const newMargin = Math.max(MARGIN_FLOOR_PCT, targetMargin - 1);
     const newPrice = Math.ceil(basePP / (1 - newMargin / 100) / 10) * 10;
     if (newPrice < aiPrice && purchaseStable) {
       aiPrice = newPrice;
@@ -787,17 +794,16 @@ export function calculateAiRecommendation(input: AiRecInput): AiRecOutput {
     }
   }
 
-  // 최소 마진 하한 (기본 15%) — 오늘 매입가(pp) 기준으로 역마진 방지
-  // ※ 플랫폼 수수료(식봄 6.6% / 배민 5.5~7.7% / 신선행 4.5% / 온일장 5%) 고려 시
-  //    5% 미만은 즉시 역마진이므로 야채/수산 품목은 15% 이상 유지
-  // ※ basePP(적정매입가)가 아닌 pp(오늘 매입가) 기준 — 적정가가 오늘보다 낮을 때
-  //    basePP 기준으로 계산하면 판매가가 오늘 매입가보다 낮아져 역마진 발생
+  // 최소 마진 하한 — 민감도별 차등 적용, 오늘 매입가(pp) 기준 역마진 방지
+  // ※ 예민 18% / 고정 13% / 일반 15%
+  // ※ 플랫폼 수수료(식봄 6.6% / 배민 5.5~7.7% / 신선행 4.5% / 온일장 5%) 고려
+  // ※ basePP가 아닌 pp(오늘 매입가) 기준 — 적정가가 오늘보다 낮을 때 역마진 방지
   const minPrice = Math.ceil(pp / (1 - MARGIN_FLOOR) / 10) * 10;
   if (aiPrice < minPrice && pp > 0) {
     const originalAiPrice = aiPrice;
     aiPrice = minPrice;
     reasons.push(
-      `최소 마진 ${(MARGIN_FLOOR * 100).toFixed(0)}% 하한선 적용 (오늘 매입가 ${pp.toLocaleString()}원 기준, ${originalAiPrice.toLocaleString()}→${aiPrice.toLocaleString()}원)`
+      `최소 마진 ${MARGIN_FLOOR_PCT}% 하한선 적용 (민감도 ${priceSensitivity}, 오늘 매입가 ${pp.toLocaleString()}원 기준, ${originalAiPrice.toLocaleString()}→${aiPrice.toLocaleString()}원)`
     );
   }
 
