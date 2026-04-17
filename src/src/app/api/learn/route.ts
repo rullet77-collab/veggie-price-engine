@@ -110,10 +110,11 @@ export async function POST() {
       product_code: string; product_group: number | null;
       is_key_item: boolean; target_margin_rate: number | null;
       product_type: string | null;
+      price_sensitivity: string | null;
     };
     const allProducts = await fetchAll<ProdRow>(
       "products",
-      "product_code,product_group,is_key_item,target_margin_rate,product_type"
+      "product_code,product_group,is_key_item,target_margin_rate,product_type,price_sensitivity"
     );
     const vegeCodes = new Set(allProducts.filter((p) => p.product_type === "야채").map((p) => p.product_code));
     const productMap = new Map<string, ProdRow>();
@@ -282,6 +283,7 @@ export async function POST() {
       const prevPrice = selling.prev_selling_price || 0;
       const targetMargin = prod?.target_margin_rate ? Number(prod.target_margin_rate) : null;
 
+      const priceSensitivity = (prod?.price_sensitivity as "예민" | "고정" | "일반" | null) || "일반";
       const aiInput: AiRecInput = {
         purchase_price: purchasePrice,
         prev_purchase_price: prevPurchase,
@@ -289,6 +291,7 @@ export async function POST() {
         prev_selling_price: prevPrice,
         target_margin_rate: targetMargin,
         is_key_item: prod?.is_key_item || false,
+        price_sensitivity: priceSensitivity,
         short_history: shortHistory,
         long_history: longHistArr,
         monthly_sales: recentSalesMap.get(row.product_code) || [],

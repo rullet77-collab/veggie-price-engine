@@ -338,21 +338,27 @@ ALTER TABLE products
 - aiRecommendation.ts에 `calculateBasePurchasePrice()` 추가
 - 최빈값/중앙값/가중평균 우선순위로 산출
 
-### 🔄 Phase 2: Layer 3 이상치 로직 — 현재
+### ✅ Phase 2: Layer 3 이상치 로직 — 완료
 - 이상치 판정 (수익률 변동폭 ≥ 5%p)
 - 하락 이상치: 판매가 × (1 - 매입하락률 × 0.1)
 - 상승 이상치: k=0.25로 수익률 조정
 - 플랫폼 수수료 고려 역마진 방지
 - 수익률 하한 15% (공산품은 13%)
 
-### 📋 Phase 3: Layer 2 매출량 판정 강화
-- 매출 건수 기준선(10/25/50/100) 적용
-- 매출 반응 관찰 로직 (점진 조정)
+### ✅ Phase 4: price_sensitivity 컬럼 — 완료 (Phase 3보다 먼저 진행)
+- DB 마이그레이션: `ALTER TABLE products ADD COLUMN price_sensitivity VARCHAR(10) DEFAULT '일반'`
+- 초기 태깅 결과: 예민 122개 / 고정 97개 / 일반 619개 (총 838개)
+- AiRecInput 타입에 추가, API에서 조회 후 전달
+- 매출 ▲15%+ 시 분기:
+  - 예민 → 수익률 +0.5%p 점진 상향
+  - 고정 → 기존 판매가 유지
+  - 일반 → 매입 상승 중일 때만 인상 여력 언급
 
-### 📋 Phase 4: price_sensitivity 컬럼 추가
-- DB 마이그레이션
-- 초기 수동 태깅 (가격예민 9종 / 가격고정 9종)
-- Layer 2에서 참조
+### 🔄 Phase 3: Layer 2 매출량 판정 강화 — 현재
+- 매출 건수 기준선(10/25/50/100) 적용
+- 매출 ▼하락 시 매입 안정/등락 분기 (15%까지 하향 vs 1~2%p만)
+- 매출 없는 품목 두 전략 분기 (공격적 인하 vs 15% 유지)
+- 매출 반응 관찰 로직 (점진 조정)
 
 ### 📋 Phase 5: Layer 4 그룹 교차 검증
 - 그룹 멤버 매입가 조회 + 교차 검증 로직
@@ -402,3 +408,4 @@ ALTER TABLE products
 | 2026-04-17 | 플랫폼 수수료 제약 반영 |
 | 2026-04-17 | 가격 조정 단위 명시 |
 | 2026-04-17 | price_sensitivity 컬럼 스키마 정의 |
+| 2026-04-17 | Phase 4 구현 완료: price_sensitivity 컬럼 + 매출 상승 시 분기 로직 |

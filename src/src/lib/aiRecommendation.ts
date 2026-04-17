@@ -9,6 +9,8 @@
 
 export type PriceHistory = { date: string; price: number };
 
+export type PriceSensitivity = "예민" | "고정" | "일반";
+
 export type AiRecInput = {
   purchase_price: number;
   prev_purchase_price: number;
@@ -16,6 +18,7 @@ export type AiRecInput = {
   prev_selling_price: number;
   target_margin_rate: number | null;
   is_key_item: boolean;
+  price_sensitivity?: PriceSensitivity; // 가격 민감도 (Phase 4 신규)
 
   short_history: PriceHistory[]; // 8일
   long_history: PriceHistory[]; // 60일 (선택)
@@ -373,6 +376,7 @@ export function calculateAiRecommendation(input: AiRecInput): AiRecOutput {
     prev_selling_price: prev,
     target_margin_rate: targetM,
     is_key_item: isKey,
+    price_sensitivity: priceSensitivity = "일반",
     short_history,
     long_history,
     monthly_sales,
@@ -591,16 +595,34 @@ export function calculateAiRecommendation(input: AiRecInput): AiRecOutput {
       );
     }
   }
-  // 매출량 급증 + 매입 상승 — 가격 인상 여력
-  else if (
-    salesTrend === "상승" &&
-    salesChange !== null &&
-    salesChange > 0.2 &&
-    purchaseChange > 0
-  ) {
-    reasons.push(
-      `매출 호조 + 매입 상승 → 인상 여력 있음`
-    );
+  // 매출량 ▲15% 이상 증가 — 가격예민/고정/일반별 차등 대응
+  else if (salesTrend === "상승" && salesChange !== null && salesChange > 0.15) {
+    if (priceSensitivity === "예민") {
+      // 가격예민: 수익률 점진 상향 (+0.5%p)
+      const boostedMargin = targetMargin + 0.5;
+      const boostedPrice = Math.ceil(basePP / (1 - boostedMargin / 100) / 10) * 10;
+      if (boostedPrice > aiPrice) {
+        aiPrice = boostedPrice;
+        reasons.push(
+          `매출 ▲${(salesChange * 100).toFixed(0)}% + 가격예민 품목 → 수익률 점진 상향(+0.5%p) 적용 ${boostedMargin.toFixed(1)}%`
+        );
+      }
+    } else if (priceSensitivity === "고정") {
+      // 가격고정: 건드리지 않고 유지 (기존판매가 그대로)
+      if (prev > 0 && Math.abs((aiPrice - prev) / prev) > 0.02) {
+        reasons.push(
+          `매출 ▲${(salesChange * 100).toFixed(0)}% + 가격고정 품목 → 건드리지 않고 유지 (${prev.toLocaleString()}원)`
+        );
+        aiPrice = prev;
+      }
+    } else {
+      // 일반: 매입 상승 중일 때만 인상 여력 언급
+      if (purchaseChange > 0) {
+        reasons.push(
+          `매출 호조 ▲${(salesChange * 100).toFixed(0)}% + 매입 상승 → 인상 여력 있음`
+        );
+      }
+    }
   }
 
   // 지지선 근접 — 과도한 인하 방지
