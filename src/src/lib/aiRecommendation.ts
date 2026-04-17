@@ -787,13 +787,18 @@ export function calculateAiRecommendation(input: AiRecInput): AiRecOutput {
     }
   }
 
-  // 최소 마진 하한 (기본 15%, 이상치 반응 시 이미 적용됨)
+  // 최소 마진 하한 (기본 15%) — 오늘 매입가(pp) 기준으로 역마진 방지
   // ※ 플랫폼 수수료(식봄 6.6% / 배민 5.5~7.7% / 신선행 4.5% / 온일장 5%) 고려 시
   //    5% 미만은 즉시 역마진이므로 야채/수산 품목은 15% 이상 유지
-  const minPrice = Math.ceil(basePP / (1 - MARGIN_FLOOR) / 10) * 10;
-  if (aiPrice < minPrice && basePP > 0) {
+  // ※ basePP(적정매입가)가 아닌 pp(오늘 매입가) 기준 — 적정가가 오늘보다 낮을 때
+  //    basePP 기준으로 계산하면 판매가가 오늘 매입가보다 낮아져 역마진 발생
+  const minPrice = Math.ceil(pp / (1 - MARGIN_FLOOR) / 10) * 10;
+  if (aiPrice < minPrice && pp > 0) {
+    const originalAiPrice = aiPrice;
     aiPrice = minPrice;
-    reasons.push(`최소 마진 ${(MARGIN_FLOOR * 100).toFixed(0)}% 하한선 적용 (플랫폼 수수료 고려)`);
+    reasons.push(
+      `최소 마진 ${(MARGIN_FLOOR * 100).toFixed(0)}% 하한선 적용 (오늘 매입가 ${pp.toLocaleString()}원 기준, ${originalAiPrice.toLocaleString()}→${aiPrice.toLocaleString()}원)`
+    );
   }
 
   return {
