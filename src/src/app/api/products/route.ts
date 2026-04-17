@@ -1,4 +1,5 @@
 import { supabase } from "@/lib/supabase";
+import { calculateAiRecommendation, type AiRecInput } from "@/lib/aiRecommendation";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 async function fetchAll<T>(table: string, select: string, filters?: (q: any) => any): Promise<T[]> {
@@ -16,6 +17,28 @@ async function fetchAll<T>(table: string, select: string, filters?: (q: any) => 
     from += PAGE;
   }
   return all;
+}
+
+// AI reason 문자열에서 UI용 짧은 태그 추출
+function extractShortReason(reason: string): string {
+  if (reason.includes("역마진")) return "역마진";
+  if (reason.includes("이상치-상승")) return "상승이상";
+  if (reason.includes("이상치-하락")) return "하락이상";
+  if (reason.includes("매출 급감")) return "매출↓";
+  if (reason.includes("공격적 인하")) return "공격인하";
+  if (reason.includes("비인기 품목")) return "비인기";
+  if (reason.includes("8일간") && reason.includes("상승") && reason.includes("연속")) return "매입↑↑";
+  if (reason.includes("8일간") && reason.includes("하락") && reason.includes("연속")) return "매입↓↓";
+  if (reason.includes("상승 추세")) return "매입↑";
+  if (reason.includes("하락 추세")) return "매입↓";
+  if (reason.includes("변곡점")) return "변곡";
+  if (reason.includes("매출 ▲") && reason.includes("가격예민")) return "매출↑예민";
+  if (reason.includes("매출 ▲") && reason.includes("가격고정")) return "매출↑고정";
+  if (reason.includes("매출 ▲")) return "매출↑";
+  if (reason.includes("주요 경쟁품목")) return "경쟁가드";
+  if (reason.includes("하한선")) return "하한";
+  if (reason.includes("보합") || reason.includes("매입 이력 부족")) return "유지";
+  return "기본";
 }
 
 export async function GET(request: Request) {
@@ -55,10 +78,11 @@ export async function GET(request: Request) {
       product_code: string; product_group: number | null;
       is_key_item: boolean; target_margin_rate: number | null;
       is_event_item: boolean; product_type: string | null;
+      price_sensitivity: string | null;
     };
     const productsData = await fetchAll<ProdRow>(
       "products",
-      "product_code,product_group,is_key_item,target_margin_rate,is_event_item,product_type"
+      "product_code,product_group,is_key_item,target_margin_rate,is_event_item,product_type,price_sensitivity"
     );
     const productMap = new Map<string, ProdRow>();
     for (const p of productsData) productMap.set(p.product_code, p);
@@ -76,32 +100,81 @@ export async function GET(request: Request) {
     const sellingMap = new Map<string, SellingRow>();
     for (const s of sellingData) sellingMap.set(s.product_code, s);
 
-    // 5) 7일 매입가
+    // 5) 매입가 이력 — 7일(UI용) + 8일(Layer 1) + 60일(Layer 1 장기)
     const sevenDaysAgo = new Date(priceDate);
     sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+    const eightDaysAgo = new Date(priceDate);
+    eightDaysAgo.setDate(eightDaysAgo.getDate() - 8);
+    const sixtyDaysAgo = new Date(priceDate);
+    sixtyDaysAgo.setDate(sixtyDaysAgo.getDate() - 60);
+
     type PurchRow = { product_code: string; price_date: string; purchase_price: number };
-    const purchaseHistory = await fetchAll<PurchRow>(
+    const purchaseHistory60 = await fetchAll<PurchRow>(
       "daily_purchase_prices",
       "product_code,price_date,purchase_price",
-      (q) => q.gte("price_date", sevenDaysAgo.toISOString().slice(0, 10)).lte("price_date", priceDate).order("price_date", { ascending: true })
+      (q) => q.gte("price_date", sixtyDaysAgo.toISOString().slice(0, 10)).lte("price_date", priceDate).order("price_date", { ascending: true })
     );
-    const purchaseMap = new Map<string, { prices: number[]; todayPrice: number | null }>();
-    for (const ph of purchaseHistory) {
-      if (!purchaseMap.has(ph.product_code)) purchaseMap.set(ph.product_code, { prices: [], todayPrice: null });
-      const entry = purchaseMap.get(ph.product_code)!;
-      entry.prices.push(ph.purchase_price);
-      if (ph.price_date === priceDate) entry.todayPrice = ph.purchase_price;
+
+    const purchaseMap = new Map<string, { prices: number[]; todayPrice: number | null }>();     // 7일 (UI)
+    const shortHistoryMap = new Map<string, { date: string; price: number }[]>();                 // 8일 (Layer 1)
+    const longHistoryMap = new Map<string, { date: string; price: number }[]>();                  // 60일 (Layer 1 장기)
+    const sevenDaysAgoStr = sevenDaysAgo.toISOString().slice(0, 10);
+    const eightDaysAgoStr = eightDaysAgo.toISOString().slice(0, 10);
+
+    for (const ph of purchaseHistory60) {
+      const entry = { date: ph.price_date, price: ph.purchase_price };
+
+      if (!longHistoryMap.has(ph.product_code)) longHistoryMap.set(ph.product_code, []);
+      longHistoryMap.get(ph.product_code)!.push(entry);
+
+      if (ph.price_date >= eightDaysAgoStr) {
+        if (!shortHistoryMap.has(ph.product_code)) shortHistoryMap.set(ph.product_code, []);
+        shortHistoryMap.get(ph.product_code)!.push(entry);
+      }
+
+      if (ph.price_date >= sevenDaysAgoStr) {
+        if (!purchaseMap.has(ph.product_code)) purchaseMap.set(ph.product_code, { prices: [], todayPrice: null });
+        const u = purchaseMap.get(ph.product_code)!;
+        u.prices.push(ph.purchase_price);
+        if (ph.price_date === priceDate) u.todayPrice = ph.purchase_price;
+      }
     }
 
-    // 6) 월별매출수량
+    // 6) 월별 매출 — 현재월(UI) + 최근 3개월(Layer 2) + 직전 3개월(Layer 2)
     const monthStr = priceDate.slice(0, 7) + "-01";
-    type SalesQtyRow = { product_code: string; quantity: number };
+    const priceDateObj = new Date(priceDate);
+    const recentMonthStart = new Date(priceDateObj.getFullYear(), priceDateObj.getMonth() - 2, 1);
+    const prevMonthStart = new Date(priceDateObj.getFullYear(), priceDateObj.getMonth() - 5, 1);
+    const prevMonthEnd = new Date(priceDateObj.getFullYear(), priceDateObj.getMonth() - 2, 1);
+
+    type SalesQtyRow = { product_code: string; sale_month: string; quantity: number; source: string | null };
     const monthlySales = await fetchAll<SalesQtyRow>(
-      "monthly_sales_quantity", "product_code,quantity",
-      (q) => q.eq("sale_month", monthStr)
+      "monthly_sales_quantity", "product_code,sale_month,quantity,source",
+      (q) => q.gte("sale_month", prevMonthStart.toISOString().slice(0, 10))
     );
-    const salesQtyMap = new Map<string, number>();
-    for (const ms of monthlySales) salesQtyMap.set(ms.product_code, ms.quantity);
+
+    const salesQtyMap = new Map<string, number>();  // 현재월 UI용
+    const recentSalesMap = new Map<string, { sale_month: string; quantity: number }[]>();
+    const prevSalesMap = new Map<string, { sale_month: string; quantity: number }[]>();
+    const recentStartStr = recentMonthStart.toISOString().slice(0, 10);
+    const prevStartStr = prevMonthStart.toISOString().slice(0, 10);
+    const prevEndStr = prevMonthEnd.toISOString().slice(0, 10);
+
+    for (const ms of monthlySales) {
+      if (ms.source && ms.source !== "전체") continue;
+      const entry = { sale_month: ms.sale_month, quantity: ms.quantity || 0 };
+
+      if (ms.sale_month === monthStr) {
+        salesQtyMap.set(ms.product_code, ms.quantity);
+      }
+      if (ms.sale_month >= recentStartStr) {
+        if (!recentSalesMap.has(ms.product_code)) recentSalesMap.set(ms.product_code, []);
+        recentSalesMap.get(ms.product_code)!.push(entry);
+      } else if (ms.sale_month >= prevStartStr && ms.sale_month < prevEndStr) {
+        if (!prevSalesMap.has(ms.product_code)) prevSalesMap.set(ms.product_code, []);
+        prevSalesMap.get(ms.product_code)!.push(entry);
+      }
+    }
 
     // 7) 결과 조합
     let results = mgmtData.map((row) => {
@@ -151,44 +224,27 @@ export async function GET(request: Request) {
       // 야채/공산 구분
       const productType = prod?.product_type || "공산";
 
-      // Claude 추천판매가
+      // Claude 추천판매가 — Phase 1~4 통합 로직 사용 (학습 세션과 동일)
       let recommendedPrice: number | null = null;
       let recommendReason = "";
       if (purchasePrice > 0 && platformSellingPrice > 0) {
-        const effMargin = targetMargin ? targetMargin / 100 : 0.20;
-        const basePrice = Math.ceil(purchasePrice / (1 - effMargin) / 10) * 10;
-
-        if (changeAmount > 0) {
-          const adjusted = Math.ceil((platformSellingPrice + changeAmount) / 10) * 10;
-          recommendedPrice = Math.max(adjusted, basePrice);
-          recommendReason = "매입↑";
-        } else if (changeAmount < 0 && prices7d.length >= 3) {
-          const recent3 = prices7d.slice(-3);
-          if (recent3[recent3.length - 1] - recent3[0] < 0) {
-            const adjusted = Math.ceil((platformSellingPrice + Math.floor(changeAmount * 0.5)) / 10) * 10;
-            recommendedPrice = Math.max(adjusted, basePrice);
-            recommendReason = "하락추세";
-          } else {
-            recommendedPrice = platformSellingPrice;
-            recommendReason = "관망";
-          }
-        } else if (changeAmount < 0) {
-          recommendedPrice = platformSellingPrice;
-          recommendReason = "유지";
-        } else {
-          if (marginRate < 0.10 && marginRate > 0) {
-            recommendedPrice = basePrice;
-            recommendReason = "저수익";
-          } else {
-            recommendedPrice = platformSellingPrice;
-            recommendReason = "유지";
-          }
-        }
-        const minPrice = Math.ceil(purchasePrice * 1.05 / 10) * 10;
-        if (recommendedPrice && recommendedPrice < minPrice) {
-          recommendedPrice = minPrice;
-          recommendReason = "최소마진";
-        }
+        const aiInput: AiRecInput = {
+          purchase_price: purchasePrice,
+          prev_purchase_price: prevPurchase,
+          current_selling_price: platformSellingPrice,
+          prev_selling_price: prevPlatformSellingPrice || 0,
+          target_margin_rate: targetMargin,
+          is_key_item: prod?.is_key_item || false,
+          price_sensitivity: (prod?.price_sensitivity as "예민" | "고정" | "일반" | null) || "일반",
+          short_history: shortHistoryMap.get(row.product_code) || [],
+          long_history: longHistoryMap.get(row.product_code) || [],
+          monthly_sales: recentSalesMap.get(row.product_code) || [],
+          prev_monthly_sales: prevSalesMap.get(row.product_code) || [],
+          group_trend: null, // Phase 5에서 구현
+        };
+        const ai = calculateAiRecommendation(aiInput);
+        recommendedPrice = ai.ai_price;
+        recommendReason = extractShortReason(ai.ai_reason);
       }
       const recommendedMargin = recommendedPrice && purchasePrice > 0
         ? 1 - purchasePrice / recommendedPrice : null;
