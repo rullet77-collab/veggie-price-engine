@@ -293,6 +293,83 @@ function calculateBasePurchasePrice(
 }
 
 // ─────────────────────────────────────────
+// Layer 2: 매출량 판정 (Phase 3)
+// ─────────────────────────────────────────
+type SalesTier = "비인기" | "보통" | "인기" | "주력" | "없음";
+
+type SalesAnalysis = {
+  tier: SalesTier;
+  monthly_avg: number;        // 월평균 건수
+  recent_total: number;       // 최근 3개월 총합
+  prev_total: number;         // 직전 3개월 총합
+  change_pct: number | null;  // 전기대비 변화율
+  direction: "급감" | "감소" | "안정" | "증가" | "호조" | "없음";
+  recommendation: string;     // 기본 대응 전략
+};
+
+function analyzeSales(
+  recent: { sale_month: string; quantity: number }[],
+  previous: { sale_month: string; quantity: number }[]
+): SalesAnalysis {
+  const recentTotal = recent.reduce((s, r) => s + (r.quantity || 0), 0);
+  const prevTotal = previous.reduce((s, r) => s + (r.quantity || 0), 0);
+  const monthCount = Math.max(recent.length, 1);
+  const monthlyAvg = recentTotal / monthCount;
+
+  // Tier 판정 (월평균 건수 기준)
+  let tier: SalesTier;
+  if (recentTotal === 0) tier = "없음";
+  else if (monthlyAvg < 10) tier = "비인기";
+  else if (monthlyAvg < 50) tier = "보통";
+  else if (monthlyAvg < 100) tier = "인기";
+  else tier = "주력";
+
+  // 변화율 계산
+  let changePct: number | null = null;
+  if (prevTotal > 0) changePct = (recentTotal - prevTotal) / prevTotal;
+
+  // 방향 판정
+  let direction: SalesAnalysis["direction"];
+  if (recentTotal === 0) direction = "없음";
+  else if (changePct === null) direction = "안정"; // 이전 데이터 없으면 기본값
+  else if (changePct < -0.5) direction = "급감";
+  else if (changePct < -0.15) direction = "감소";
+  else if (changePct <= 0.15) direction = "안정";
+  else if (changePct <= 0.5) direction = "증가";
+  else direction = "호조";
+
+  // 기본 대응 전략
+  let recommendation: string;
+  switch (direction) {
+    case "급감": recommendation = "가격 인하로 매출 촉진 필요"; break;
+    case "감소": recommendation = "소폭 인하 검토"; break;
+    case "안정": recommendation = "현 수준 유지"; break;
+    case "증가": recommendation = "유지/소폭 인상 여력"; break;
+    case "호조": recommendation = "인상 여력 있음"; break;
+    case "없음":
+      recommendation = prevTotal >= 50
+        ? "기존 매출처 있음, 공격적 인하로 회복 시도"
+        : "비인기 품목, 수익률 낮춰 매출 유도";
+      break;
+  }
+
+  return {
+    tier,
+    monthly_avg: monthlyAvg,
+    recent_total: recentTotal,
+    prev_total: prevTotal,
+    change_pct: changePct,
+    direction,
+    recommendation,
+  };
+}
+
+// 매입 안정성 판정 (Layer 1의 method 문자열 기반)
+function isPurchaseStable(method: string): boolean {
+  return method.includes("최빈값") || method.includes("중앙값") || method.includes("박스권");
+}
+
+// ─────────────────────────────────────────
 // 2. 지지선/저항선 추출 (60일 창, 피벗 클러스터)
 // ─────────────────────────────────────────
 function extractSupport(longPrices: number[], currentPrice: number): { support: number | null; resistance: number | null } {
@@ -547,30 +624,22 @@ export function calculateAiRecommendation(input: AiRecInput): AiRecOutput {
   }
 
   // ─────────────────────────────────────
-  // 매출량 분석 (항상 표시)
+  // Layer 2: 매출량 분석 (Phase 3 강화)
   // ─────────────────────────────────────
-  const recentTotal = monthly_sales.reduce((s, r) => s + (r.quantity || 0), 0);
-  const prevTotal = prev_monthly_sales.reduce((s, r) => s + (r.quantity || 0), 0);
+  const salesAnalysis = analyzeSales(monthly_sales, prev_monthly_sales);
+  const purchaseStable = isPurchaseStable(layer1.method);
 
-  if (recentTotal === 0 && prevTotal === 0) {
-    reasons.push(`[매출 판정] 매출 이력 없음 → 시장 침투가 필요한 품목`);
-  } else if (recentTotal === 0 && prevTotal > 0) {
-    reasons.push(`[매출 판정] 최근 3개월 매출 없음 (이전 ${prevTotal.toLocaleString()}건) → 매출 회복 필요`);
-  } else if (prevTotal === 0 && recentTotal > 0) {
-    reasons.push(`[매출 판정] 최근 3개월 ${recentTotal.toLocaleString()}건 (신규 매출 발생)`);
-  } else if (salesChange !== null) {
-    const changeDir = salesChange > 0 ? "▲" : salesChange < 0 ? "▼" : "";
-    const absPct = Math.abs(salesChange * 100).toFixed(0);
-    let salesComment = "";
-    if (salesChange < -0.5) salesComment = "매출 급감 → 가격 인하로 매출 촉진 필요";
-    else if (salesChange < -0.2) salesComment = "매출 감소세 → 인하 검토";
-    else if (salesChange < -0.05) salesComment = "매출 소폭 감소";
-    else if (salesChange <= 0.05) salesComment = "매출 안정";
-    else if (salesChange <= 0.2) salesComment = "매출 소폭 증가";
-    else salesComment = "매출 호조 → 가격 유지/인상 여력";
-    reasons.push(`[매출 판정] 최근 ${recentTotal.toLocaleString()}건 (전기대비 ${changeDir}${absPct}%). ${salesComment}`);
-  } else {
-    reasons.push(`[매출 판정] 최근 3개월 ${recentTotal.toLocaleString()}건`);
+  // 매출 판정 reason (tier + 변화 + 대응 전략)
+  {
+    const changeStr = salesAnalysis.change_pct === null
+      ? "신규"
+      : (salesAnalysis.change_pct >= 0 ? "▲" : "▼") + Math.abs(salesAnalysis.change_pct * 100).toFixed(0) + "%";
+    const monthlyStr = salesAnalysis.tier === "없음"
+      ? "매출 없음"
+      : `월평균 ${salesAnalysis.monthly_avg.toFixed(1)}건`;
+    reasons.push(
+      `[매출 판정] 최근 3개월 ${salesAnalysis.recent_total.toLocaleString()}건 (${monthlyStr}, ${salesAnalysis.tier}, 전기대비 ${changeStr}) → ${salesAnalysis.recommendation}`
+    );
   }
 
   // ─────────────────────────────────────
@@ -585,18 +654,76 @@ export function calculateAiRecommendation(input: AiRecInput): AiRecOutput {
     );
   }
 
-  // 매출량 급락 — 가격 인하 유도
-  if (salesTrend === "하락" && salesChange !== null && salesChange < -0.2) {
-    const reducedPrice = Math.ceil((aiPrice * 0.97) / 10) * 10;
-    if (reducedPrice > basePP / 0.9) {
-      aiPrice = reducedPrice;
+  // ─────────────────────────────────────
+  // Layer 2 매출 기반 가격 조정 (Phase 3)
+  // ─────────────────────────────────────
+
+  // (1) 매출 없음 — 두 전략 분기
+  if (salesAnalysis.direction === "없음") {
+    if (salesAnalysis.prev_total >= 50) {
+      // 직전 3개월 50건+ 있었는데 이번에 없음 → 공격적 인하
+      const aggressiveMargin = Math.max(15, targetMargin - 3);
+      const aggressivePrice = Math.ceil(basePP / (1 - aggressiveMargin / 100) / 10) * 10;
+      if (aggressivePrice < aiPrice) {
+        aiPrice = aggressivePrice;
+        reasons.push(
+          `직전 3개월 ${salesAnalysis.prev_total}건 있었으나 최근 없음 → 공격적 인하 (수익률 ${aggressiveMargin.toFixed(1)}%, 기준${targetMargin}% - 3%p)로 매출 회복 시도`
+        );
+      }
+    } else if (targetMargin > 15) {
+      // 매출 원래 적음 → 15%부터 시작
+      const floorMargin = 15;
+      const floorPrice = Math.ceil(basePP / (1 - floorMargin / 100) / 10) * 10;
+      if (floorPrice < aiPrice) {
+        aiPrice = floorPrice;
+        reasons.push(
+          `비인기 품목 (매출 없음) → 수익률 ${floorMargin}%(최저)로 매출 유도`
+        );
+      }
+    }
+  }
+  // (2) 매출 급감 (▼50% 이상) — 매입 안정성 기반 분기
+  else if (salesAnalysis.direction === "급감") {
+    const changePct = salesAnalysis.change_pct || 0;
+    if (purchaseStable) {
+      // 매입 안정 → 기준수익률 최저 15%까지 하향 (매출 하락률에 비례)
+      const intensity = Math.min(1, Math.abs(changePct));
+      const marginReduction = Math.min(targetMargin - 15, intensity * 5); // 최대 5%p
+      const newMargin = Math.max(15, targetMargin - marginReduction);
+      const newPrice = Math.ceil(basePP / (1 - newMargin / 100) / 10) * 10;
+      if (newPrice < aiPrice) {
+        aiPrice = newPrice;
+        reasons.push(
+          `매출 급감 ▼${(Math.abs(changePct) * 100).toFixed(0)}% + 매입 안정(${layer1.method.split("(")[0]}) → 수익률 ${newMargin.toFixed(1)}%(기준${targetMargin}% - ${marginReduction.toFixed(1)}%p)로 하향`
+        );
+      }
+    } else {
+      // 매입 등락 심함 → 1~2%p만 낮춤 (리스크 방어)
+      const marginReduction = Math.abs(changePct) > 0.7 ? 2 : 1;
+      const newMargin = Math.max(15, targetMargin - marginReduction);
+      const newPrice = Math.ceil(basePP / (1 - newMargin / 100) / 10) * 10;
+      if (newPrice < aiPrice) {
+        aiPrice = newPrice;
+        reasons.push(
+          `매출 급감 ▼${(Math.abs(changePct) * 100).toFixed(0)}% + 매입 등락(가중평균) → 수익률 ${newMargin.toFixed(1)}%(${marginReduction}%p만 하향, 리스크 방어)`
+        );
+      }
+    }
+  }
+  // (3) 매출 감소 (▼15~50%) — 소폭 인하
+  else if (salesAnalysis.direction === "감소") {
+    const newMargin = Math.max(15, targetMargin - 1);
+    const newPrice = Math.ceil(basePP / (1 - newMargin / 100) / 10) * 10;
+    if (newPrice < aiPrice && purchaseStable) {
+      aiPrice = newPrice;
       reasons.push(
-        `매출 급감 → 판매 촉진을 위해 추천가 3% 추가 인하`
+        `매출 감소 ▼${(Math.abs(salesAnalysis.change_pct || 0) * 100).toFixed(0)}% → 수익률 ${newMargin.toFixed(1)}%(-1%p)로 소폭 인하`
       );
     }
   }
-  // 매출량 ▲15% 이상 증가 — 가격예민/고정/일반별 차등 대응
-  else if (salesTrend === "상승" && salesChange !== null && salesChange > 0.15) {
+  // (4) 매출 증가 (▲15%+) — 가격예민/고정/일반 차등 대응
+  else if (salesAnalysis.direction === "증가" || salesAnalysis.direction === "호조") {
+    const changePct = salesAnalysis.change_pct || 0;
     if (priceSensitivity === "예민") {
       // 가격예민: 수익률 점진 상향 (+0.5%p)
       const boostedMargin = targetMargin + 0.5;
@@ -604,24 +731,21 @@ export function calculateAiRecommendation(input: AiRecInput): AiRecOutput {
       if (boostedPrice > aiPrice) {
         aiPrice = boostedPrice;
         reasons.push(
-          `매출 ▲${(salesChange * 100).toFixed(0)}% + 가격예민 품목 → 수익률 점진 상향(+0.5%p) 적용 ${boostedMargin.toFixed(1)}%`
+          `매출 ▲${(changePct * 100).toFixed(0)}% + 가격예민 품목 → 수익률 점진 상향(+0.5%p) ${boostedMargin.toFixed(1)}%`
         );
       }
     } else if (priceSensitivity === "고정") {
-      // 가격고정: 건드리지 않고 유지 (기존판매가 그대로)
+      // 가격고정: 건드리지 않고 유지
       if (prev > 0 && Math.abs((aiPrice - prev) / prev) > 0.02) {
         reasons.push(
-          `매출 ▲${(salesChange * 100).toFixed(0)}% + 가격고정 품목 → 건드리지 않고 유지 (${prev.toLocaleString()}원)`
+          `매출 ▲${(changePct * 100).toFixed(0)}% + 가격고정 품목 → 건드리지 않고 유지 (${prev.toLocaleString()}원)`
         );
         aiPrice = prev;
       }
-    } else {
-      // 일반: 매입 상승 중일 때만 인상 여력 언급
-      if (purchaseChange > 0) {
-        reasons.push(
-          `매출 호조 ▲${(salesChange * 100).toFixed(0)}% + 매입 상승 → 인상 여력 있음`
-        );
-      }
+    } else if (purchaseChange > 0) {
+      reasons.push(
+        `매출 ▲${(changePct * 100).toFixed(0)}% + 매입 상승 → 인상 여력 있음`
+      );
     }
   }
 
