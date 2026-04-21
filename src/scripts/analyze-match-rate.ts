@@ -52,25 +52,37 @@ async function main() {
     product_code: string; price_date: string;
     purchase_price: number | null; prev_purchase_price: number | null;
     product_name: string | null; category_name: string | null;
+    unit: string | null;
   };
   const mgmtData = await query<MgmtRow>(
-    `daily_product_management?price_date=eq.${priceDate}&select=product_code,price_date,purchase_price,prev_purchase_price,product_name,category_name`,
+    `daily_product_management?price_date=eq.${priceDate}&select=product_code,price_date,purchase_price,prev_purchase_price,product_name,category_name,unit`,
     key
   );
 
-  // 2) 상품 마스터
+  // 2) 상품 마스터 (Phase 5-A 컬럼 포함)
   type ProdRow = {
     product_code: string; product_group: number | null;
     is_key_item: boolean; target_margin_rate: number | null;
     product_type: string | null; price_sensitivity: string | null;
+    pack_role: string | null; pack_meta: unknown;
+    product_name: string | null; unit: string | null;
   };
   const allProducts = await query<ProdRow>(
-    `products?select=product_code,product_group,is_key_item,target_margin_rate,product_type,price_sensitivity`,
+    `products?select=product_code,product_group,is_key_item,target_margin_rate,product_type,price_sensitivity,pack_role,pack_meta,product_name,unit`,
     key
   );
   const prodMap = new Map<string, ProdRow>();
   for (const p of allProducts) prodMap.set(p.product_code, p);
   const vegeCodes = new Set(allProducts.filter((p) => p.product_type === "야채").map((p) => p.product_code));
+
+  // 그룹별 멤버 인덱싱
+  const groupMembersMap = new Map<number, ProdRow[]>();
+  for (const p of allProducts) {
+    if (p.product_group) {
+      if (!groupMembersMap.has(p.product_group)) groupMembersMap.set(p.product_group, []);
+      groupMembersMap.get(p.product_group)!.push(p);
+    }
+  }
 
   // 3) 판매가
   type SellingRow = {
@@ -146,22 +158,63 @@ async function main() {
   };
   const results: Result[] = [];
 
+  // 매입가가 없는 야채 상품도 포함 (Phase 5-A 효과 측정용)
+  // 단, 판매가가 있고 product가 야채여야 함
+  const codesToAnalyze = new Set<string>();
   for (const row of mgmtData) {
+    if (vegeCodes.has(row.product_code) && sellingMap.has(row.product_code)) {
+      codesToAnalyze.add(row.product_code);
+    }
+  }
+  // 매입가 없는 야채 품목도 추가
+  for (const code of sellingMap.keys()) {
+    if (vegeCodes.has(code) && !codesToAnalyze.has(code)) {
+      codesToAnalyze.add(code);
+    }
+  }
+
+  for (const code of codesToAnalyze) {
+    const row = mgmtData.find((r) => r.product_code === code) || {
+      product_code: code, price_date: priceDate,
+      purchase_price: 0, prev_purchase_price: 0,
+      product_name: allProducts.find((p) => p.product_code === code)?.product_name || "",
+      category_name: null, unit: allProducts.find((p) => p.product_code === code)?.unit || null,
+    };
     if (!vegeCodes.has(row.product_code)) continue;
     const prod = prodMap.get(row.product_code);
     const selling = sellingMap.get(row.product_code);
-    if (!selling || !row.purchase_price) continue;
+    if (!selling) continue;
 
     const priceSensitivity = (prod?.price_sensitivity as "예민" | "고정" | "일반" | null) || "일반";
 
+    // Phase 5-A: 그룹 멤버
+    const groupMembers = prod?.product_group
+      ? (groupMembersMap.get(prod.product_group) || [])
+          .filter((m) => m.product_code !== row.product_code)
+          .map((m) => ({
+            product_code: m.product_code,
+            product_name: m.product_name || "",
+            pack_role: (m.pack_role as "박스" | "소분" | null),
+            pack_meta: m.pack_meta as never,
+            unit: m.unit,
+            short_history: shortMap.get(m.product_code) || [],
+            long_history: longMap.get(m.product_code) || [],
+          }))
+      : [];
+
     const aiInput: AiRecInput = {
-      purchase_price: row.purchase_price,
+      purchase_price: row.purchase_price || 0,
       prev_purchase_price: row.prev_purchase_price || 0,
       current_selling_price: selling.selling_price,
       prev_selling_price: selling.prev_selling_price || 0,
       target_margin_rate: prod?.target_margin_rate ? Number(prod.target_margin_rate) : null,
       is_key_item: prod?.is_key_item || false,
       price_sensitivity: priceSensitivity,
+      pack_role: (prod?.pack_role as "박스" | "소분" | null) || null,
+      pack_meta: prod?.pack_meta as never,
+      group_members: groupMembers,
+      price_date: priceDate,
+      unit: row.unit || undefined,
       short_history: shortMap.get(row.product_code) || [],
       long_history: longMap.get(row.product_code) || [],
       monthly_sales: recentSalesMap.get(row.product_code) || [],
@@ -171,15 +224,16 @@ async function main() {
 
     const { ai_price } = calculateAiRecommendation(aiInput);
     const userPrice = selling.selling_price;
+    const pp = row.purchase_price || 0;
     const diff = ai_price - userPrice;
     const diffPct = userPrice > 0 ? (diff / userPrice) * 100 : 0;
-    const userMargin = userPrice > 0 ? (1 - row.purchase_price / userPrice) * 100 : 0;
-    const aiMargin = ai_price > 0 ? (1 - row.purchase_price / ai_price) * 100 : 0;
+    const userMargin = userPrice > 0 && pp > 0 ? (1 - pp / userPrice) * 100 : 0;
+    const aiMargin = ai_price > 0 && pp > 0 ? (1 - pp / ai_price) * 100 : 0;
 
     results.push({
       code: row.product_code,
       name: row.product_name || "",
-      purchase: row.purchase_price,
+      purchase: pp,
       user: userPrice,
       ai: ai_price,
       diff,
@@ -204,10 +258,22 @@ async function main() {
     if (c > 0) console.log(`  ${d}일: ${c}건 (${((c / results.length) * 100).toFixed(1)}%)`);
   }
 
-  // 5일 이상 이력 있는 품목만 (적정매입가 판단 가능)
+  // 5일 이상 이력 있는 품목 (적정매입가 판단 가능)
   const reliable = results.filter((r) => r.historyDays >= 5);
   console.log(`\n=== 🎯 이력 5일+ (적정매입가 판단 가능) — ${reliable.length}건 ===`);
   printStats(reliable);
+
+  // 매입가 없는 품목 (Phase 5-A 그룹 참조로 추정)
+  const noPurchase = results.filter((r) => r.purchase === 0);
+  console.log(`\n=== 🆕 매입가 없음, Phase 5-A 그룹 추정 — ${noPurchase.length}건 ===`);
+  const got_ai = noPurchase.filter((r) => r.ai > 0);
+  console.log(`  AI 추천 성공: ${got_ai.length}건 (${((got_ai.length / Math.max(noPurchase.length, 1)) * 100).toFixed(1)}%)`);
+  if (got_ai.length > 0) {
+    const within5 = got_ai.filter((r) => Math.abs(r.diffPct) <= 5).length;
+    const within10 = got_ai.filter((r) => Math.abs(r.diffPct) <= 10).length;
+    console.log(`  사용자 판매가와 ±5% 이내: ${within5}건 (${((within5 / got_ai.length) * 100).toFixed(1)}%)`);
+    console.log(`  사용자 판매가와 ±10% 이내: ${within10}건 (${((within10 / got_ai.length) * 100).toFixed(1)}%)`);
+  }
 
   // 전체
   console.log(`\n\n=== 전체 ${results.length}건 ===`);

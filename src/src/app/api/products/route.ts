@@ -22,6 +22,10 @@ async function fetchAll<T>(table: string, select: string, filters?: (q: any) => 
 // AI reason 문자열에서 UI용 짧은 태그 추출
 function extractShortReason(reason: string): string {
   if (reason.includes("역마진")) return "역마진";
+  if (reason.includes("박스→소분 관계식")) return "박스→소분";
+  if (reason.includes("소분→박스 관계식")) return "소분→박스";
+  if (reason.includes("소분→소분 관계식")) return "소분간환산";
+  if (reason.includes("변동률 교차참조")) return "그룹추정";
   if (reason.includes("이상치-상승")) return "상승이상";
   if (reason.includes("이상치-하락")) return "하락이상";
   if (reason.includes("매출 급감")) return "매출↓";
@@ -73,19 +77,30 @@ export async function GET(request: Request) {
       (q) => q.eq("price_date", priceDate)
     );
 
-    // 3) products 마스터
+    // 3) products 마스터 (Phase 5-A: pack_role, pack_meta 포함)
     type ProdRow = {
       product_code: string; product_group: number | null;
       is_key_item: boolean; target_margin_rate: number | null;
       is_event_item: boolean; product_type: string | null;
       price_sensitivity: string | null;
+      pack_role: string | null; pack_meta: unknown;
+      product_name: string | null; unit: string | null;
     };
     const productsData = await fetchAll<ProdRow>(
       "products",
-      "product_code,product_group,is_key_item,target_margin_rate,is_event_item,product_type,price_sensitivity"
+      "product_code,product_group,is_key_item,target_margin_rate,is_event_item,product_type,price_sensitivity,pack_role,pack_meta,product_name,unit"
     );
     const productMap = new Map<string, ProdRow>();
     for (const p of productsData) productMap.set(p.product_code, p);
+
+    // Phase 5-A: 그룹별 멤버 목록 인덱싱
+    const groupMembersMap = new Map<number, ProdRow[]>();
+    for (const p of productsData) {
+      if (p.product_group) {
+        if (!groupMembersMap.has(p.product_group)) groupMembersMap.set(p.product_group, []);
+        groupMembersMap.get(p.product_group)!.push(p);
+      }
+    }
 
     // 4) 플랫폼 판매가 + 월별 매출 통계
     type SellingRow = {
@@ -224,10 +239,25 @@ export async function GET(request: Request) {
       // 야채/공산 구분
       const productType = prod?.product_type || "공산";
 
-      // Claude 추천판매가 — Phase 1~4 통합 로직 사용 (학습 세션과 동일)
+      // Claude 추천판매가 — Phase 1~5 통합 로직 사용 (학습 세션과 동일)
       let recommendedPrice: number | null = null;
       let recommendReason = "";
-      if (purchasePrice > 0 && platformSellingPrice > 0) {
+      if (platformSellingPrice > 0 || purchasePrice > 0) {
+        // Phase 5-A: 같은 그룹 멤버 데이터 구성 (나 제외)
+        const groupMembers = prod?.product_group
+          ? (groupMembersMap.get(prod.product_group) || [])
+              .filter((m) => m.product_code !== row.product_code)
+              .map((m) => ({
+                product_code: m.product_code,
+                product_name: m.product_name || "",
+                pack_role: (m.pack_role as "박스" | "소분" | null),
+                pack_meta: m.pack_meta as never,
+                unit: m.unit,
+                short_history: shortHistoryMap.get(m.product_code) || [],
+                long_history: longHistoryMap.get(m.product_code) || [],
+              }))
+          : [];
+
         const aiInput: AiRecInput = {
           purchase_price: purchasePrice,
           prev_purchase_price: prevPurchase,
@@ -236,11 +266,16 @@ export async function GET(request: Request) {
           target_margin_rate: targetMargin,
           is_key_item: prod?.is_key_item || false,
           price_sensitivity: (prod?.price_sensitivity as "예민" | "고정" | "일반" | null) || "일반",
+          pack_role: (prod?.pack_role as "박스" | "소분" | null) || null,
+          pack_meta: prod?.pack_meta as never,
+          group_members: groupMembers,
+          price_date: priceDate,
+          unit: row.unit || undefined,
           short_history: shortHistoryMap.get(row.product_code) || [],
           long_history: longHistoryMap.get(row.product_code) || [],
           monthly_sales: recentSalesMap.get(row.product_code) || [],
           prev_monthly_sales: prevSalesMap.get(row.product_code) || [],
-          group_trend: null, // Phase 5에서 구현
+          group_trend: null,
         };
         const ai = calculateAiRecommendation(aiInput);
         recommendedPrice = ai.ai_price;

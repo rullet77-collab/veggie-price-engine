@@ -111,14 +111,25 @@ export async function POST() {
       is_key_item: boolean; target_margin_rate: number | null;
       product_type: string | null;
       price_sensitivity: string | null;
+      pack_role: string | null; pack_meta: unknown;
+      product_name: string | null; unit: string | null;
     };
     const allProducts = await fetchAll<ProdRow>(
       "products",
-      "product_code,product_group,is_key_item,target_margin_rate,product_type,price_sensitivity"
+      "product_code,product_group,is_key_item,target_margin_rate,product_type,price_sensitivity,pack_role,pack_meta,product_name,unit"
     );
     const vegeCodes = new Set(allProducts.filter((p) => p.product_type === "야채").map((p) => p.product_code));
     const productMap = new Map<string, ProdRow>();
     for (const p of allProducts) productMap.set(p.product_code, p);
+
+    // Phase 5-A: 그룹별 멤버 인덱싱
+    const groupMembersMap = new Map<number, ProdRow[]>();
+    for (const p of allProducts) {
+      if (p.product_group) {
+        if (!groupMembersMap.has(p.product_group)) groupMembersMap.set(p.product_group, []);
+        groupMembersMap.get(p.product_group)!.push(p);
+      }
+    }
 
     // 4) 판매가 변경이 있는 야채 상품
     type SellingRow = {
@@ -157,11 +168,21 @@ export async function POST() {
 
     type PurchRow = { product_code: string; price_date: string; purchase_price: number };
 
-    // 장기 (60일) — 모든 단기 데이터 포함
+    // Phase 5-A: 그룹 멤버의 이력도 필요하므로 관련 코드 확장
+    const relatedCodes = new Set<string>(codes);
+    for (const code of codes) {
+      const prod = productMap.get(code);
+      if (prod?.product_group) {
+        const members = groupMembersMap.get(prod.product_group) || [];
+        for (const m of members) relatedCodes.add(m.product_code);
+      }
+    }
+
+    // 장기 (60일) — 모든 단기 데이터 포함 (그룹 멤버까지)
     const longHistory = await fetchAll<PurchRow>(
       "daily_purchase_prices",
       "product_code,price_date,purchase_price",
-      (q) => q.in("product_code", codes)
+      (q) => q.in("product_code", Array.from(relatedCodes))
         .gte("price_date", sixtyDaysAgo.toISOString().slice(0, 10))
         .lte("price_date", priceDate)
         .order("price_date", { ascending: true })
@@ -284,6 +305,22 @@ export async function POST() {
       const targetMargin = prod?.target_margin_rate ? Number(prod.target_margin_rate) : null;
 
       const priceSensitivity = (prod?.price_sensitivity as "예민" | "고정" | "일반" | null) || "일반";
+
+      // Phase 5-A: 같은 그룹 멤버 데이터 구성 (나 제외)
+      const groupMembers = prod?.product_group
+        ? (groupMembersMap.get(prod.product_group) || [])
+            .filter((m) => m.product_code !== row.product_code)
+            .map((m) => ({
+              product_code: m.product_code,
+              product_name: m.product_name || "",
+              pack_role: (m.pack_role as "박스" | "소분" | null),
+              pack_meta: m.pack_meta as never,
+              unit: m.unit,
+              short_history: shortMap.get(m.product_code) || [],
+              long_history: longMap.get(m.product_code) || [],
+            }))
+        : [];
+
       const aiInput: AiRecInput = {
         purchase_price: purchasePrice,
         prev_purchase_price: prevPurchase,
@@ -292,6 +329,11 @@ export async function POST() {
         target_margin_rate: targetMargin,
         is_key_item: prod?.is_key_item || false,
         price_sensitivity: priceSensitivity,
+        pack_role: (prod?.pack_role as "박스" | "소분" | null) || null,
+        pack_meta: prod?.pack_meta as never,
+        group_members: groupMembers,
+        price_date: priceDate,
+        unit: row.unit || undefined,
         short_history: shortHistory,
         long_history: longHistArr,
         monthly_sales: recentSalesMap.get(row.product_code) || [],

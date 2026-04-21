@@ -11,6 +11,23 @@ export type PriceHistory = { date: string; price: number };
 
 export type PriceSensitivity = "예민" | "고정" | "일반";
 
+// Phase 5-A: 박스-소분 관계식 메타
+export type PackRole = "박스" | "소분";
+export type PackMeta =
+  | { formula_divisor: number; unit_kind: string; seasonal?: { winter_months: number[]; winter_divisor: number; summer_divisor: number; note?: string } }
+  | { quantity: number; unit_kind: string; half_box?: boolean };
+
+// Phase 5-A: 같은 그룹 멤버 정보
+export type GroupMember = {
+  product_code: string;
+  product_name: string;
+  pack_role: PackRole | null;
+  pack_meta: PackMeta | null;
+  unit: string | null;                   // "박스", "봉", "통", "개", "kg" 등
+  short_history: PriceHistory[];         // 8일 이력
+  long_history: PriceHistory[];          // 60일 이력 (장기 참조용)
+};
+
 export type AiRecInput = {
   purchase_price: number;
   prev_purchase_price: number;
@@ -19,6 +36,13 @@ export type AiRecInput = {
   target_margin_rate: number | null;
   is_key_item: boolean;
   price_sensitivity?: PriceSensitivity; // 가격 민감도 (Phase 4 신규)
+
+  // Phase 5-A: 내 품목의 pack 정보 + 그룹 멤버
+  pack_role?: PackRole | null;
+  pack_meta?: PackMeta | null;
+  group_members?: GroupMember[];         // 같은 그룹의 다른 멤버 (나 제외)
+  price_date?: string;                   // 분석 기준일 (시즌 판정용)
+  unit?: string;                         // 내 단위
 
   short_history: PriceHistory[]; // 8일
   long_history: PriceHistory[]; // 60일 (선택)
@@ -370,6 +394,211 @@ function isPurchaseStable(method: string): boolean {
 }
 
 // ─────────────────────────────────────────
+// Layer 4 / Phase 5-A: 박스-소분 관계식 + 그룹 교차 참조
+// ─────────────────────────────────────────
+
+// 가지 시즌 판정 (11~6월 ÷30 / 7~10월 ÷45)
+function getActiveDivisor(meta: PackMeta | null | undefined, date: Date): number | null {
+  if (!meta || !("formula_divisor" in meta)) return null;
+  if (meta.seasonal) {
+    const m = date.getMonth() + 1;
+    if (meta.seasonal.winter_months.includes(m)) return meta.seasonal.winter_divisor;
+    return meta.seasonal.summer_divisor;
+  }
+  return meta.formula_divisor;
+}
+
+// 10원 단위 올림
+function ceil10(v: number): number {
+  return Math.ceil(v / 10) * 10;
+}
+
+// 박스 매입가 → 소분 수량에 해당하는 매입가
+function boxToSubdiv(boxPrice: number, boxMeta: PackMeta, subdivMeta: PackMeta, date: Date): number | null {
+  if (!("formula_divisor" in boxMeta)) return null;
+  if (!("quantity" in subdivMeta)) return null;
+  const divisor = getActiveDivisor(boxMeta, date);
+  if (!divisor) return null;
+  // 반박스는 박스의 ÷2
+  if (subdivMeta.half_box) {
+    return ceil10(boxPrice / 2);
+  }
+  // 박스 × (수량 / 공식수) = 소분가
+  return ceil10(boxPrice * subdivMeta.quantity / divisor);
+}
+
+// 소분 매입가 → 같은 분류 박스 매입가 역산
+function subdivToBox(subdivPrice: number, subdivMeta: PackMeta, boxMeta: PackMeta, date: Date): number | null {
+  if (!("quantity" in subdivMeta)) return null;
+  if (!("formula_divisor" in boxMeta)) return null;
+  const divisor = getActiveDivisor(boxMeta, date);
+  if (!divisor) return null;
+  if (subdivMeta.half_box) {
+    return subdivPrice * 2;
+  }
+  // 소분가 ÷ 수량 × 공식수 = 박스가
+  return Math.round(subdivPrice / subdivMeta.quantity * divisor);
+}
+
+// 단위 민감도 계수 (다른 단위 간 변동률 전파 시)
+function getUnitSensitivity(fromUnit: string | null | undefined, toUnit: string | null | undefined): number {
+  const isBox = (u: string | null | undefined) => u === "박스" || u === "반박스" || u === "망";
+  const isPiece = (u: string | null | undefined) => u === "봉" || u === "단" || u === "통" || u === "개";
+  const fromBox = isBox(fromUnit);
+  const toBox = isBox(toUnit);
+  const fromPiece = isPiece(fromUnit);
+  const toPiece = isPiece(toUnit);
+  if (fromBox && toBox) return 1.0;
+  if (fromPiece && toPiece) return 1.0;
+  if (fromPiece && toBox) return 0.75;   // 낱개→박스: 박스는 변동 완화
+  if (fromBox && toPiece) return 1.3;    // 박스→낱개: 낱개는 민감
+  return 1.0;
+}
+
+// 두 이력에서 공통 매입일 찾기
+function findOverlapDates(a: PriceHistory[], b: PriceHistory[]): { date: string; aPrice: number; bPrice: number }[] {
+  const bMap = new Map<string, number>();
+  for (const h of b) if (h.price > 0) bMap.set(h.date, h.price);
+  const overlap: { date: string; aPrice: number; bPrice: number }[] = [];
+  for (const h of a) {
+    if (h.price > 0 && bMap.has(h.date)) {
+      overlap.push({ date: h.date, aPrice: h.price, bPrice: bMap.get(h.date)! });
+    }
+  }
+  return overlap.sort((x, y) => x.date.localeCompare(y.date));
+}
+
+// Phase 5-A 메인: 그룹 기반 매입가 추정
+type GroupEstimateResult = {
+  estimated_price: number;
+  method: string;        // "박스→소분 관계식" / "소분→박스 관계식" / "변동률 교차참조"
+  anchor_code: string;   // 참조한 품목 코드
+  anchor_name: string;
+  reason: string;        // 학습페이지용 설명
+  confidence: "high" | "medium" | "low";
+};
+
+function estimateFromGroupMembers(
+  myCode: string,
+  myName: string,
+  myPackRole: PackRole | null | undefined,
+  myPackMeta: PackMeta | null | undefined,
+  myUnit: string | null | undefined,
+  myHistory: PriceHistory[],
+  members: GroupMember[],
+  date: Date
+): GroupEstimateResult | null {
+  if (members.length === 0) return null;
+
+  // Case A: 나는 관계식 있고, 같은 그룹에 다른 관계식 품목이 최근 매입있음
+  if (myPackRole && myPackMeta) {
+    const formulaMembers = members
+      .filter((m) => m.pack_role && m.pack_meta && m.short_history.length > 0)
+      .sort((a, b) => b.short_history.length - a.short_history.length);
+
+    for (const m of formulaMembers) {
+      // 최신 매입가 가져오기
+      const latest = [...m.short_history].reverse().find((h) => h.price > 0);
+      if (!latest) continue;
+
+      let estimatedPrice: number | null = null;
+      let via: string;
+
+      if (m.pack_role === "박스" && myPackRole === "소분") {
+        // 박스 → 나(소분)
+        estimatedPrice = boxToSubdiv(latest.price, m.pack_meta!, myPackMeta, date);
+        via = "박스→소분 관계식";
+      } else if (m.pack_role === "소분" && myPackRole === "박스") {
+        // 소분 → 나(박스)
+        estimatedPrice = subdivToBox(latest.price, m.pack_meta!, myPackMeta, date);
+        via = "소분→박스 관계식";
+      } else if (m.pack_role === "소분" && myPackRole === "소분") {
+        // 소분 → 박스 → 내 소분
+        const box = subdivToBox(latest.price, m.pack_meta!, myPackMeta, date);
+        if (box) {
+          estimatedPrice = boxToSubdiv(box, myPackMeta, myPackMeta, date);
+          // 내 pack_meta 기준으로 역환산인데, 공식수만 필요하므로 reuse
+          // 사실은 m.quantity가 내 quantity와 다르면 변환해야 함
+          // 가지3개(3) → 가지5개(5) : 3개 기준 단가 × 5
+          if ("quantity" in m.pack_meta! && "quantity" in myPackMeta) {
+            estimatedPrice = ceil10(latest.price / m.pack_meta!.quantity * myPackMeta.quantity);
+          }
+        }
+        via = "소분→소분 관계식";
+      } else if (m.pack_role === "박스" && myPackRole === "박스") {
+        // 박스끼리 — 보통 같은 분류면 공식수가 같을 테니 그대로 사용
+        if ("formula_divisor" in m.pack_meta! && "formula_divisor" in myPackMeta &&
+            m.pack_meta!.formula_divisor === myPackMeta.formula_divisor) {
+          estimatedPrice = latest.price;
+        } else {
+          // 다른 공식수 → 비례 환산
+          const mDiv = getActiveDivisor(m.pack_meta!, date);
+          const myDiv = getActiveDivisor(myPackMeta, date);
+          if (mDiv && myDiv) estimatedPrice = Math.round(latest.price / mDiv * myDiv);
+        }
+        via = "박스→박스 관계식";
+      } else {
+        continue;
+      }
+
+      if (estimatedPrice && estimatedPrice > 0) {
+        return {
+          estimated_price: estimatedPrice,
+          method: via,
+          anchor_code: m.product_code,
+          anchor_name: m.product_name,
+          reason: `[그룹 참조] ${via}: ${m.product_name}(${m.product_code}) 최근 매입 ${latest.price.toLocaleString()}원 (${latest.date.slice(5)}) → 환산 ${estimatedPrice.toLocaleString()}원`,
+          confidence: "high",
+        };
+      }
+    }
+  }
+
+  // Case B: 관계식 환산 실패 or 나는 관계식 없음 → 변동률 교차참조
+  // 그룹 내 "이력 최다 + 최근 매입 있음" 품목 선정
+  const candidates = members
+    .filter((m) => m.short_history.some((h) => h.price > 0))
+    .sort((a, b) => b.short_history.filter((h) => h.price > 0).length - a.short_history.filter((h) => h.price > 0).length);
+
+  for (const anchor of candidates) {
+    const anchorValid = anchor.short_history.filter((h) => h.price > 0);
+    if (anchorValid.length < 2) continue;
+
+    // 내 이력과 공통일 찾기 (우선 8일, 부족하면 60일 확장)
+    const overlap8 = findOverlapDates(myHistory.filter((h) => h.price > 0), anchorValid);
+    const overlap = overlap8.length > 0
+      ? overlap8
+      : findOverlapDates(myHistory.filter((h) => h.price > 0), anchor.long_history.filter((h) => h.price > 0));
+
+    if (overlap.length === 0) continue;
+
+    // 가장 최근 공통일 기준
+    const ref = overlap[overlap.length - 1];
+    const anchorLatest = [...anchorValid].reverse().find((h) => h.price > 0)!;
+
+    if (ref.bPrice <= 0) continue;
+    const anchorChangeRate = (anchorLatest.price - ref.bPrice) / ref.bPrice;
+    const unitCoef = getUnitSensitivity(anchor.unit, myUnit);
+    const reflectRatio = 0.7; // 너무 공격적 반영 방지
+    const adjustedRate = anchorChangeRate * unitCoef * reflectRatio;
+    const estimatedPrice = ceil10(ref.aPrice * (1 + adjustedRate));
+
+    if (estimatedPrice > 0) {
+      return {
+        estimated_price: estimatedPrice,
+        method: "변동률 교차참조",
+        anchor_code: anchor.product_code,
+        anchor_name: anchor.product_name,
+        reason: `[그룹 참조] 변동률 교차참조: ${anchor.product_name}(${anchor.product_code}) ${ref.date.slice(5)}→${anchorLatest.date.slice(5)} ${(anchorChangeRate * 100).toFixed(1)}% × 단위계수${unitCoef} × 반영${reflectRatio} → 내 ${ref.date.slice(5)} ${ref.aPrice.toLocaleString()}원에 ${(adjustedRate * 100).toFixed(1)}% 적용 → 추정 ${estimatedPrice.toLocaleString()}원`,
+        confidence: overlap.length >= 2 ? "medium" : "low",
+      };
+    }
+  }
+
+  return null;
+}
+
+// ─────────────────────────────────────────
 // 2. 지지선/저항선 추출 (60일 창, 피벗 클러스터)
 // ─────────────────────────────────────────
 function extractSupport(longPrices: number[], currentPrice: number): { support: number | null; resistance: number | null } {
@@ -447,19 +676,24 @@ function detectSalesTrend(
 // ─────────────────────────────────────────
 export function calculateAiRecommendation(input: AiRecInput): AiRecOutput {
   const {
-    purchase_price: pp,
     prev_purchase_price: prevPP,
     current_selling_price: cur,
     prev_selling_price: prev,
     target_margin_rate: targetM,
     is_key_item: isKey,
     price_sensitivity: priceSensitivity = "일반",
+    pack_role,
+    pack_meta,
+    group_members,
+    price_date,
+    unit: myUnit,
     short_history,
     long_history,
     monthly_sales,
     prev_monthly_sales,
     group_trend,
   } = input;
+  let pp = input.purchase_price;  // 그룹 참조로 덮어쓸 수 있음
 
   const signals: AiRecOutput["signals"] = {
     short_trend: "횡보",
@@ -472,12 +706,37 @@ export function calculateAiRecommendation(input: AiRecInput): AiRecOutput {
     current_margin: 0,
   };
 
-  if (pp <= 0) {
+  // Phase 5-A: 매입 없음 or 이력 부족 시 그룹 참조로 추정
+  let estimatedFromGroup: GroupEstimateResult | null = null;
+  const validHistory = short_history.filter((h) => h.price > 0);
+  const shouldTryGroup = (pp <= 0 || validHistory.length < 5) && group_members && group_members.length > 0;
+
+  if (shouldTryGroup) {
+    const analysisDate = price_date ? new Date(price_date) : new Date();
+    estimatedFromGroup = estimateFromGroupMembers(
+      "",  // myCode 별도 불필요
+      "",
+      pack_role,
+      pack_meta,
+      myUnit,
+      short_history,
+      group_members || [],
+      analysisDate
+    );
+  }
+
+  // 매입 완전히 없는데 그룹 참조도 실패
+  if (pp <= 0 && !estimatedFromGroup) {
     return {
       ai_price: 0,
-      ai_reason: "매입가 없음 — 추천 불가",
+      ai_reason: "매입가 없음 + 그룹 참조 실패 — 추천 불가",
       signals,
     };
+  }
+
+  // pp가 없고 그룹 참조 성공 → 그 값으로 pp 대체하여 이후 로직 진행
+  if (pp <= 0 && estimatedFromGroup) {
+    pp = estimatedFromGroup.estimated_price;
   }
 
   const targetMargin = targetM || 20;
@@ -520,7 +779,15 @@ export function calculateAiRecommendation(input: AiRecInput): AiRecOutput {
   const reasons: string[] = [];
   let aiPrice: number;
 
-  // Layer 1 분석 결과를 첫 번째 reason으로 항상 포함
+  // Phase 5-A: 그룹 참조로 매입가를 추정했으면 먼저 표시
+  if (estimatedFromGroup && input.purchase_price <= 0) {
+    reasons.push(estimatedFromGroup.reason);
+  } else if (estimatedFromGroup && input.purchase_price > 0) {
+    // 이력 부족이지만 오늘 매입가는 있음 — 보조 정보만 기록
+    reasons.push(`[그룹 참조 보조] ${estimatedFromGroup.method} (${estimatedFromGroup.anchor_name}) 추정 ${estimatedFromGroup.estimated_price.toLocaleString()}원 / 오늘 매입 ${pp.toLocaleString()}원`);
+  }
+
+  // Layer 1 분석 결과를 reason에 포함
   reasons.push(layer1.reason);
 
   // 8일 전체 변동률 + 최근 3일 변동률
