@@ -253,6 +253,20 @@ const COLUMNS: Column[] = [
       const colors: Record<string, string> = { "매입↑": "text-red-600", "하락추세": "text-blue-600", "관망": "text-amber-600", "저수익": "text-orange-600", "최소마진": "text-red-700", "유지": "text-gray-400" };
       return <span className={`text-[10px] ${colors[p.recommend_reason] || ""}`}>{p.recommend_reason || "-"}</span>;
     } },
+  { key: "recommended_margin", label: "수익률", group: "추천", width: "w-14", align: "right", sortable: true,
+    render: (p) => {
+      if (p.recommended_margin == null) return <span className="text-gray-300">-</span>;
+      // 기준수익률 대비 차이(%p)를 색으로 강조
+      const target = p.target_margin_rate ? Number(p.target_margin_rate) / 100 : null;
+      const diffPp = target != null ? (p.recommended_margin - target) * 100 : 0;
+      const cls = marginClass(p.recommended_margin);
+      const diffStr = target != null ? ` (${diffPp >= 0 ? "+" : ""}${diffPp.toFixed(1)}%p)` : "";
+      return (
+        <span className={cls} title={`기준 ${target != null ? (target * 100).toFixed(1) : "-"}% 대비${diffStr}`}>
+          {pct(p.recommended_margin)}
+        </span>
+      );
+    } },
   // 플랫폼
   { key: "sinsunhang_price", label: "신선행", group: "플랫폼", width: "w-16", align: "right",
     render: (p) => fmt(p.sinsunhang_price) },
@@ -300,6 +314,7 @@ const COL_WIDTHS: Record<string, number> = {
   target_price: 64,
   recommended_price: 64,
   recommend_reason: 48,
+  recommended_margin: 56,
   sinsunhang_price: 64,
   sinsunhang_margin: 56,
   baemin_price: 64,
