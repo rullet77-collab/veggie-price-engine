@@ -1,5 +1,6 @@
 import { supabase } from "@/lib/supabase";
 import { calculateAiRecommendation, type AiRecInput } from "@/lib/aiRecommendation";
+import { computePrev3MonthPct } from "@/lib/salesStats";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 async function fetchAll<T>(table: string, select: string, filters?: (q: any) => any): Promise<T[]> {
@@ -21,27 +22,31 @@ async function fetchAll<T>(table: string, select: string, filters?: (q: any) => 
 
 // AI reason 문자열에서 UI용 짧은 태그 추출
 function extractShortReason(reason: string): string {
-  if (reason.includes("역마진")) return "역마진";
-  if (reason.includes("박스→소분 관계식")) return "박스→소분";
-  if (reason.includes("소분→박스 관계식")) return "소분→박스";
-  if (reason.includes("소분→소분 관계식")) return "소분간환산";
-  if (reason.includes("변동률 교차참조")) return "그룹추정";
-  if (reason.includes("이상치-상승")) return "상승이상";
-  if (reason.includes("이상치-하락")) return "하락이상";
-  if (reason.includes("매출 급감")) return "매출↓";
-  if (reason.includes("공격적 인하")) return "공격인하";
-  if (reason.includes("비인기 품목")) return "비인기";
-  if (reason.includes("8일간") && reason.includes("상승") && reason.includes("연속")) return "매입↑↑";
-  if (reason.includes("8일간") && reason.includes("하락") && reason.includes("연속")) return "매입↓↓";
-  if (reason.includes("상승 추세")) return "매입↑";
-  if (reason.includes("하락 추세")) return "매입↓";
-  if (reason.includes("변곡점")) return "변곡";
-  if (reason.includes("매출 ▲") && reason.includes("가격예민")) return "매출↑예민";
-  if (reason.includes("매출 ▲") && reason.includes("가격고정")) return "매출↑고정";
-  if (reason.includes("매출 ▲")) return "매출↑";
-  if (reason.includes("주요 경쟁품목")) return "경쟁가드";
-  if (reason.includes("하한선")) return "하한";
-  if (reason.includes("보합") || reason.includes("매입 이력 부족")) return "유지";
+  // 보조 성격의 [그룹 참조 보조] 구문은 태그 판정에서 제외
+  const main = reason.replace(/\[그룹 참조 보조\][^.]*\./g, "");
+
+  if (main.includes("역마진")) return "역마진";
+  // 그룹 참조가 실제 가격 계산에 쓰인 경우 (pp 대체)
+  if (main.includes("[그룹 참조]") && main.includes("박스→소분 관계식")) return "박스→소분";
+  if (main.includes("[그룹 참조]") && main.includes("소분→박스 관계식")) return "소분→박스";
+  if (main.includes("[그룹 참조]") && main.includes("소분→소분 관계식")) return "소분간환산";
+  if (main.includes("[그룹 참조]") && main.includes("변동률 교차참조")) return "그룹추정";
+  if (main.includes("이상치-상승")) return "상승이상";
+  if (main.includes("이상치-하락")) return "하락이상";
+  if (main.includes("매출 급감")) return "매출↓";
+  if (main.includes("공격적 인하")) return "공격인하";
+  if (main.includes("비인기 품목")) return "비인기";
+  if (main.includes("8일간") && main.includes("상승") && main.includes("연속")) return "매입↑↑";
+  if (main.includes("8일간") && main.includes("하락") && main.includes("연속")) return "매입↓↓";
+  if (main.includes("상승 추세")) return "매입↑";
+  if (main.includes("하락 추세")) return "매입↓";
+  if (main.includes("변곡점")) return "변곡";
+  if (main.includes("매출 ▲") && main.includes("가격예민")) return "매출↑예민";
+  if (main.includes("매출 ▲") && main.includes("가격고정")) return "매출↑고정";
+  if (main.includes("매출 ▲")) return "매출↑";
+  if (main.includes("주요 경쟁품목")) return "경쟁가드";
+  if (main.includes("하한선")) return "하한";
+  if (main.includes("보합") || main.includes("매입 이력 부족")) return "유지";
   return "기본";
 }
 
@@ -103,14 +108,14 @@ export async function GET(request: Request) {
     }
 
     // 4) 플랫폼 판매가 + 월별 매출 통계
+    // current_month_qty, prev_3month_pct 는 DB에 저장하지 않고 매번 계산 (single source of truth: monthly_sales_quantity)
     type SellingRow = {
       product_code: string; selling_price: number; prev_selling_price: number | null;
       month_1_qty: number | null; month_2_qty: number | null; month_3_qty: number | null;
-      current_month_qty: number | null; prev_3month_pct: string | null;
     };
     const sellingData = await fetchAll<SellingRow>(
       "product_selling_prices",
-      "product_code,selling_price,prev_selling_price,month_1_qty,month_2_qty,month_3_qty,current_month_qty,prev_3month_pct"
+      "product_code,selling_price,prev_selling_price,month_1_qty,month_2_qty,month_3_qty"
     );
     const sellingMap = new Map<string, SellingRow>();
     for (const s of sellingData) sellingMap.set(s.product_code, s);
@@ -275,6 +280,11 @@ export async function GET(request: Request) {
           long_history: longHistoryMap.get(row.product_code) || [],
           monthly_sales: recentSalesMap.get(row.product_code) || [],
           prev_monthly_sales: prevSalesMap.get(row.product_code) || [],
+          // PSP 과거 3개월 + MSQ 이번달 (시트 공식 기반 매출 판정)
+          month_1_qty: selling?.month_1_qty || null,
+          month_2_qty: selling?.month_2_qty || null,
+          month_3_qty: selling?.month_3_qty || null,
+          current_month_qty: monthlyQty,
           group_trend: null,
         };
         const ai = calculateAiRecommendation(aiInput);
@@ -326,8 +336,16 @@ export async function GET(request: Request) {
         month_1_qty: selling?.month_1_qty || null,
         month_2_qty: selling?.month_2_qty || null,
         month_3_qty: selling?.month_3_qty || null,
-        current_month_qty: selling?.current_month_qty || null,
-        prev_3month_pct: selling?.prev_3month_pct || null,
+        // 이번달 = monthly_sales_quantity(전체, 현재월) 원본 기준
+        current_month_qty: monthlyQty,
+        // 3개월대비 = (월말 예상 - avg(1~3월)) / avg(1~3월)
+        prev_3month_pct: computePrev3MonthPct(
+          selling?.month_1_qty || null,
+          selling?.month_2_qty || null,
+          selling?.month_3_qty || null,
+          monthlyQty,
+          priceDate
+        ),
       };
     });
 

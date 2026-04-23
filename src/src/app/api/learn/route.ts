@@ -1,5 +1,6 @@
 import { supabase } from "@/lib/supabase";
 import { calculateAiRecommendation as calcAi, type AiRecInput } from "@/lib/aiRecommendation";
+import { computePrev3MonthPct } from "@/lib/salesStats";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 async function fetchAll<T>(table: string, select: string, filters?: (q: any) => any): Promise<T[]> {
@@ -17,6 +18,57 @@ async function fetchAll<T>(table: string, select: string, filters?: (q: any) => 
     from += PAGE;
   }
   return all;
+}
+
+/**
+ * 주어진 상품 코드들에 대해 prev_3month_pct 를 온더플라이 계산
+ * - month_1~3 : product_selling_prices (고정된 과거 3개월)
+ * - current   : monthly_sales_quantity (source='전체', 현재월)
+ */
+async function buildPrev3MonthPctMap(
+  productCodes: string[],
+  priceDate: string
+): Promise<Map<string, string | null>> {
+  const out = new Map<string, string | null>();
+  if (productCodes.length === 0) return out;
+
+  type SellingMonths = {
+    product_code: string;
+    month_1_qty: number | null;
+    month_2_qty: number | null;
+    month_3_qty: number | null;
+  };
+  const { data: pspRows } = await supabase
+    .from("product_selling_prices")
+    .select("product_code,month_1_qty,month_2_qty,month_3_qty")
+    .in("product_code", productCodes);
+  const pspMap = new Map<string, SellingMonths>();
+  for (const r of (pspRows || []) as SellingMonths[]) pspMap.set(r.product_code, r);
+
+  const monthStr = priceDate.slice(0, 7) + "-01";
+  const { data: msRows } = await supabase
+    .from("monthly_sales_quantity")
+    .select("product_code,quantity,source")
+    .eq("sale_month", monthStr)
+    .in("product_code", productCodes);
+  const currentMap = new Map<string, number>();
+  for (const r of (msRows || []) as { product_code: string; quantity: number; source: string | null }[]) {
+    if (r.source && r.source !== "전체") continue;
+    currentMap.set(r.product_code, r.quantity);
+  }
+
+  for (const code of productCodes) {
+    const psp = pspMap.get(code);
+    const cur = currentMap.get(code) || null;
+    out.set(code, computePrev3MonthPct(
+      psp?.month_1_qty || null,
+      psp?.month_2_qty || null,
+      psp?.month_3_qty || null,
+      cur,
+      priceDate
+    ));
+  }
+  return out;
 }
 
 // GET: 세션 로드. ?date=YYYY-MM-DD 지정 시 해당 날짜, 미지정 시 최신 판매가 날짜
@@ -51,14 +103,9 @@ export async function GET(request: Request) {
       return Response.json({ items: [], price_date: priceDate, has_session: false });
     }
 
-    // prev_3month_pct 조회 (product_selling_prices)
+    // prev_3month_pct 온더플라이 계산
     const itemCodes = items.map((i: { product_code: string }) => i.product_code);
-    const { data: pspData } = await supabase
-      .from("product_selling_prices")
-      .select("product_code,prev_3month_pct")
-      .in("product_code", itemCodes);
-    const pctMap = new Map<string, string | null>();
-    for (const r of pspData || []) pctMap.set(r.product_code, r.prev_3month_pct);
+    const pctMap = await buildPrev3MonthPctMap(itemCodes, priceDate);
 
     return Response.json({
       items: items.map((item: { product_code: string }) => ({
@@ -134,11 +181,11 @@ export async function POST() {
     // 4) 판매가 변경이 있는 야채 상품
     type SellingRow = {
       product_code: string; selling_price: number; prev_selling_price: number | null;
-      prev_3month_pct: string | null;
+      month_1_qty: number | null; month_2_qty: number | null; month_3_qty: number | null;
     };
     const sellingData = await fetchAll<SellingRow>(
       "product_selling_prices",
-      "product_code,selling_price,prev_selling_price,prev_3month_pct"
+      "product_code,selling_price,prev_selling_price,month_1_qty,month_2_qty,month_3_qty"
     );
     const sellingMap = new Map<string, SellingRow>();
     for (const s of sellingData) sellingMap.set(s.product_code, s);
@@ -217,6 +264,8 @@ export async function POST() {
 
     const recentSalesMap = new Map<string, { sale_month: string; quantity: number }[]>();
     const prevSalesMap = new Map<string, { sale_month: string; quantity: number }[]>();
+    const currentMonthQtyMap = new Map<string, number>();  // MSQ 현재월 (시트 공식 입력용)
+    const currentMonthStr = priceDate.slice(0, 7) + "-01";
     const recentStartStr = recentMonthStart.toISOString().slice(0, 10);
     const prevStartStr = prevMonthStart.toISOString().slice(0, 10);
     const prevEndStr = prevMonthEnd.toISOString().slice(0, 10);
@@ -224,6 +273,9 @@ export async function POST() {
       // source '전체' 만 사용 (신선행 별도 처리 생략)
       if (ms.source && ms.source !== "전체") continue;
       const entry = { sale_month: ms.sale_month, quantity: ms.quantity || 0 };
+      if (ms.sale_month === currentMonthStr) {
+        currentMonthQtyMap.set(ms.product_code, ms.quantity || 0);
+      }
       if (ms.sale_month >= recentStartStr) {
         if (!recentSalesMap.has(ms.product_code)) recentSalesMap.set(ms.product_code, []);
         recentSalesMap.get(ms.product_code)!.push(entry);
@@ -338,6 +390,11 @@ export async function POST() {
         long_history: longHistArr,
         monthly_sales: recentSalesMap.get(row.product_code) || [],
         prev_monthly_sales: prevSalesMap.get(row.product_code) || [],
+        // PSP 과거 3개월 + MSQ 이번달 (시트 공식 기반 매출 판정)
+        month_1_qty: selling.month_1_qty,
+        month_2_qty: selling.month_2_qty,
+        month_3_qty: selling.month_3_qty,
+        current_month_qty: currentMonthQtyMap.get(row.product_code) ?? null,
         group_trend: prod?.product_group ? groupTrendMap.get(prod.product_group) || null : null,
       };
 
@@ -374,14 +431,9 @@ export async function POST() {
 
     if (insertError) throw insertError;
 
-    // prev_3month_pct 조회
+    // prev_3month_pct 온더플라이 계산
     const pspCodes = (inserted || []).map((i: { product_code: string }) => i.product_code);
-    const { data: pspPost } = await supabase
-      .from("product_selling_prices")
-      .select("product_code,prev_3month_pct")
-      .in("product_code", pspCodes);
-    const pctPostMap = new Map<string, string | null>();
-    for (const r of pspPost || []) pctPostMap.set(r.product_code, r.prev_3month_pct);
+    const pctPostMap = await buildPrev3MonthPctMap(pspCodes, priceDate);
 
     return Response.json({
       items: (inserted || []).map((item: { product_code: string }) => ({

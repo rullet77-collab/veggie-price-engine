@@ -4,8 +4,10 @@
 // 입력 신호:
 // 1. 단기 (8일)  — 매입가 추세, 변곡점
 // 2. 장기 (60일) — 지지선/저항선
-// 3. 매출량       — 최근 3개월 월별 판매 수량 추세
+// 3. 매출량       — PSP 과거 3개월(고정) + 이번달(MSQ) — 시트 공식 기반 일할계산
 // 4. 그룹 동조    — 같은 product_group / parent_product_code 의 추세 참조
+
+import { computeExpectedBaseQty } from "./salesStats";
 
 export type PriceHistory = { date: string; price: number };
 
@@ -47,8 +49,17 @@ export type AiRecInput = {
   short_history: PriceHistory[]; // 8일
   long_history: PriceHistory[]; // 60일 (선택)
 
-  monthly_sales: { sale_month: string; quantity: number }[]; // 최근 3~6개월
-  prev_monthly_sales: { sale_month: string; quantity: number }[]; // 비교용 (직전 동일 기간)
+  // [레거시] 스크립트 호환용 — 메인 로직은 아래 PSP 컬럼 기반 사용
+  monthly_sales: { sale_month: string; quantity: number }[];
+  prev_monthly_sales: { sale_month: string; quantity: number }[];
+
+  // [신규] PSP 고정 과거 3개월 + MSQ 이번달 (시트 공식과 동일)
+  //   month_1_qty = 3개월 전, month_2_qty = 2개월 전, month_3_qty = 1개월 전
+  //   current_month_qty = MSQ(source='전체', 현재월)
+  month_1_qty?: number | null;
+  month_2_qty?: number | null;
+  month_3_qty?: number | null;
+  current_month_qty?: number | null;
 
   group_trend: "상승" | "하락" | "횡보" | null; // 같은 그룹의 평균 추세
 };
@@ -317,50 +328,79 @@ function calculateBasePurchasePrice(
 }
 
 // ─────────────────────────────────────────
-// Layer 2: 매출량 판정 (Phase 3)
+// Layer 2: 매출량 판정 (Phase 3) — 플랫폼시트 공식과 동일
+//   a_daily = AVERAGE(각 과거월별 수량 ÷ 그 달의 일수)   ← 데이터 있는 월만 카운트
+//   e_base  = a_daily × DAY(priceDate)                  ← 오늘까지의 기대 누적치
+//   d_rate  = (currentQty - e_base) / e_base            ← 3개월대비 변화율
 // ─────────────────────────────────────────
 type SalesTier = "비인기" | "보통" | "인기" | "주력" | "없음";
 
 type SalesAnalysis = {
   tier: SalesTier;
-  monthly_avg: number;        // 월평균 건수
-  recent_total: number;       // 최근 3개월 총합
-  prev_total: number;         // 직전 3개월 총합
-  change_pct: number | null;  // 전기대비 변화율
+  monthly_avg: number;        // 과거 3개월 월평균 건수 (데이터 있는 월만)
+  recent_total: number;       // 이번달 누적 건수 (MSQ)
+  prev_total: number;         // PSP 과거 3개월 총합
+  expected_base: number;      // 시트 공식 e_base (오늘까지 기대치)
+  change_pct: number | null;  // 시트 공식 d_rate
   direction: "급감" | "감소" | "안정" | "증가" | "호조" | "없음";
-  recommendation: string;     // 기본 대응 전략
+  recommendation: string;
 };
 
 function analyzeSales(
-  recent: { sale_month: string; quantity: number }[],
-  previous: { sale_month: string; quantity: number }[]
+  m1: number | null | undefined,
+  m2: number | null | undefined,
+  m3: number | null | undefined,
+  currentQty: number | null | undefined,
+  priceDate: string | null | undefined
 ): SalesAnalysis {
-  const recentTotal = recent.reduce((s, r) => s + (r.quantity || 0), 0);
-  const prevTotal = previous.reduce((s, r) => s + (r.quantity || 0), 0);
-  const monthCount = Math.max(recent.length, 1);
-  const monthlyAvg = recentTotal / monthCount;
+  const v1 = m1 || 0;
+  const v2 = m2 || 0;
+  const v3 = m3 || 0;
+  const cur = currentQty || 0;
 
-  // Tier 판정 (월평균 건수 기준)
+  const prevTotal = v1 + v2 + v3;
+  const nonZeroMonths = [v1, v2, v3].filter((v) => v > 0).length;
+  const monthlyAvg = nonZeroMonths > 0 ? prevTotal / nonZeroMonths : 0;
+
+  // Tier 판정 (과거 3개월 월평균 기준)
   let tier: SalesTier;
-  if (recentTotal === 0) tier = "없음";
+  if (nonZeroMonths === 0 && cur === 0) tier = "없음";
+  else if (monthlyAvg === 0 && cur > 0) tier = "보통"; // 신규매출은 기본 tier 부여
   else if (monthlyAvg < 10) tier = "비인기";
   else if (monthlyAvg < 50) tier = "보통";
   else if (monthlyAvg < 100) tier = "인기";
   else tier = "주력";
 
-  // 변화율 계산
+  // e_base / d_rate 계산 (시트 공식)
+  const eBase = priceDate ? (computeExpectedBaseQty(v1 || null, v2 || null, v3 || null, priceDate) || 0) : 0;
+
   let changePct: number | null = null;
-  if (prevTotal > 0) changePct = (recentTotal - prevTotal) / prevTotal;
+  if (eBase >= 0.1) changePct = (cur - eBase) / eBase;
 
   // 방향 판정
   let direction: SalesAnalysis["direction"];
-  if (recentTotal === 0) direction = "없음";
-  else if (changePct === null) direction = "안정"; // 이전 데이터 없으면 기본값
-  else if (changePct < -0.5) direction = "급감";
-  else if (changePct < -0.15) direction = "감소";
-  else if (changePct <= 0.15) direction = "안정";
-  else if (changePct <= 0.5) direction = "증가";
-  else direction = "호조";
+  if (nonZeroMonths === 0 && cur === 0) {
+    direction = "없음";
+  } else if (nonZeroMonths === 0 && cur > 0) {
+    direction = "호조"; // 신규매출
+  } else if (eBase < 0.1) {
+    // 과거가 극소량인데 현재도 있으면 일단 안정 취급 (기준치미달)
+    direction = cur > 0 ? "안정" : "없음";
+  } else if (cur === 0) {
+    direction = "없음";
+  } else if (changePct === null) {
+    direction = "안정";
+  } else if (changePct > 0.5) {
+    direction = "호조";
+  } else if (changePct > 0.15) {
+    direction = "증가";
+  } else if (changePct >= -0.15) {
+    direction = "안정";
+  } else if (changePct >= -0.5) {
+    direction = "감소";
+  } else {
+    direction = "급감";
+  }
 
   // 기본 대응 전략
   let recommendation: string;
@@ -380,8 +420,9 @@ function analyzeSales(
   return {
     tier,
     monthly_avg: monthlyAvg,
-    recent_total: recentTotal,
+    recent_total: cur,
     prev_total: prevTotal,
+    expected_base: eBase,
     change_pct: changePct,
     direction,
     recommendation,
@@ -651,27 +692,6 @@ function extractSupport(longPrices: number[], currentPrice: number): { support: 
 }
 
 // ─────────────────────────────────────────
-// 3. 매출량 추세 (최근 vs 직전 동기)
-// ─────────────────────────────────────────
-function detectSalesTrend(
-  recent: { sale_month: string; quantity: number }[],
-  previous: { sale_month: string; quantity: number }[]
-): { trend: "상승" | "하락" | "횡보" | null; change_pct: number | null } {
-  if (!recent.length) return { trend: null, change_pct: null };
-
-  const recentTotal = recent.reduce((s, r) => s + (r.quantity || 0), 0);
-  const prevTotal = previous.reduce((s, r) => s + (r.quantity || 0), 0);
-
-  if (recentTotal === 0 && prevTotal === 0) return { trend: null, change_pct: null };
-  if (prevTotal === 0) return { trend: "상승", change_pct: null };
-
-  const changePct = (recentTotal - prevTotal) / prevTotal;
-  if (changePct > 0.15) return { trend: "상승", change_pct: changePct };
-  if (changePct < -0.15) return { trend: "하락", change_pct: changePct };
-  return { trend: "횡보", change_pct: changePct };
-}
-
-// ─────────────────────────────────────────
 // 메인 추천 함수
 // ─────────────────────────────────────────
 export function calculateAiRecommendation(input: AiRecInput): AiRecOutput {
@@ -689,8 +709,6 @@ export function calculateAiRecommendation(input: AiRecInput): AiRecOutput {
     unit: myUnit,
     short_history,
     long_history,
-    monthly_sales,
-    prev_monthly_sales,
     group_trend,
   } = input;
   let pp = input.purchase_price;  // 그룹 참조로 덮어쓸 수 있음
@@ -765,13 +783,21 @@ export function calculateAiRecommendation(input: AiRecInput): AiRecOutput {
   signals.long_support = support;
   signals.long_resistance = resistance;
 
-  // 매출량 추세
-  const { trend: salesTrend, change_pct: salesChange } = detectSalesTrend(
-    monthly_sales,
-    prev_monthly_sales
+  // 매출량 분석 (Phase 3) — PSP 과거3개월 + 이번달(MSQ) 시트 공식 기반
+  const salesAnalysis = analyzeSales(
+    input.month_1_qty,
+    input.month_2_qty,
+    input.month_3_qty,
+    input.current_month_qty,
+    price_date || null
   );
-  signals.sales_trend = salesTrend;
-  signals.sales_change_pct = salesChange;
+  // 신호 매핑: direction → 상승/하락/횡보
+  let mappedSalesTrend: "상승" | "하락" | "횡보" | null = null;
+  if (salesAnalysis.direction === "호조" || salesAnalysis.direction === "증가") mappedSalesTrend = "상승";
+  else if (salesAnalysis.direction === "감소" || salesAnalysis.direction === "급감") mappedSalesTrend = "하락";
+  else if (salesAnalysis.direction === "안정") mappedSalesTrend = "횡보";
+  signals.sales_trend = mappedSalesTrend;
+  signals.sales_change_pct = salesAnalysis.change_pct;
 
   // ─────────────────────────────────────
   // 의사결정 (Layer 1 적정매입가 기반)
@@ -899,21 +925,23 @@ export function calculateAiRecommendation(input: AiRecInput): AiRecOutput {
   }
 
   // ─────────────────────────────────────
-  // Layer 2: 매출량 분석 (Phase 3 강화)
+  // Layer 2: 매출량 분석 (Phase 3) — salesAnalysis 는 위에서 이미 계산됨
   // ─────────────────────────────────────
-  const salesAnalysis = analyzeSales(monthly_sales, prev_monthly_sales);
   const purchaseStable = isPurchaseStable(layer1.method);
 
-  // 매출 판정 reason (tier + 변화 + 대응 전략)
+  // 매출 판정 reason (이번달 / 3개월대비 / 대응 전략)
   {
     const changeStr = salesAnalysis.change_pct === null
-      ? "신규"
-      : (salesAnalysis.change_pct >= 0 ? "▲" : "▼") + Math.abs(salesAnalysis.change_pct * 100).toFixed(0) + "%";
+      ? (salesAnalysis.recent_total > 0 ? "신규매출" : "데이터없음")
+      : (salesAnalysis.change_pct >= 0 ? "▲" : "▼") + Math.abs(salesAnalysis.change_pct * 100).toFixed(2) + "%";
     const monthlyStr = salesAnalysis.tier === "없음"
-      ? "매출 없음"
-      : `월평균 ${salesAnalysis.monthly_avg.toFixed(1)}건`;
+      ? "과거 매출 없음"
+      : `과거3개월 월평균 ${salesAnalysis.monthly_avg.toFixed(1)}건`;
+    const eBaseStr = salesAnalysis.expected_base >= 0.1
+      ? `기대치 ${salesAnalysis.expected_base.toFixed(1)}건`
+      : "기대치 미달";
     reasons.push(
-      `[매출 판정] 최근 3개월 ${salesAnalysis.recent_total.toLocaleString()}건 (${monthlyStr}, ${salesAnalysis.tier}, 전기대비 ${changeStr}) → ${salesAnalysis.recommendation}`
+      `[매출 판정] 이번달 ${salesAnalysis.recent_total.toLocaleString()}건 / ${monthlyStr} / ${eBaseStr} / 3개월대비 ${changeStr} (${salesAnalysis.tier}, ${salesAnalysis.direction}) → ${salesAnalysis.recommendation}`
     );
   }
 
