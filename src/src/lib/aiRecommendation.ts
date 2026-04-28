@@ -199,26 +199,211 @@ function detectShortTrend(prices: number[]): "상승" | "하락" | "횡보" | "�
 }
 
 // ─────────────────────────────────────────
-// Layer 1: 적정 매입가 판단
-// 오늘 매입가가 아닌, 8일 이력에서 "실제 거래 가격대"를 산출
+// Layer 1: 적정 매입가 판단 — basePP_v3 (2025-04 정의)
+//
+//   파라미터
+//     THRESHOLD      = 0.05  구간추세 판별 ±5%
+//     RECENT_N       = 4     최근/과거 분할
+//     W_RECENT       = 0.70  최근 가중치
+//     W_OLDER        = 0.30  과거 가중치
+//     SPIKE_UP/DN    = 0.15  당일 급등/급락 ±15%
+//     MODE_GAP_LIMIT = 0.15  최빈값 버림(오늘가 대비 15%↓)
+//
+//   메인 흐름
+//     STEP1 당일충격 → 급등=오늘가 / 급락=완충(높은값)
+//     STEP2 최빈값 유효성(오늘가 대비 -15% 초과면 버림)
+//     STEP3+4 추세별 비대칭 선택
+//        상승:  max(최빈, 가중, 오늘가×0.95)
+//        하락:  max(최빈, 가중)             ← 완충
+//        횡보:  median(최빈, 가중)
+//        최빈X: median(오늘가, 최근중앙, 가중)
 // ─────────────────────────────────────────
+const V3_THRESHOLD = 0.05;
+const V3_RECENT_N = 4;
+const V3_W_RECENT = 0.70;
+const V3_W_OLDER = 0.30;
+const V3_SPIKE_UP = 0.15;
+const V3_SPIKE_DN = 0.15;
+const V3_MODE_GAP_LIMIT = 0.15;
+
+type V3Trend = "상승" | "하락" | "횡보";
+type V3Shock = "급등" | "급락" | "정상";
+
 type BasePurchaseResult = {
-  base_purchase_price: number;   // 적정 매입가
+  base_purchase_price: number;
   confidence: "high" | "medium" | "low";
-  method: string;                // 산출 방법
-  is_abnormal_today: boolean;    // 오늘 매입가가 적정가 대비 이상인지
-  reason: string;                // 학습페이지용 설명
+  method: string;
+  is_abnormal_today: boolean;
+  reason: string;
+  // v3 신호 (downstream 분기에서 활용)
+  v3_trend?: V3Trend;
+  v3_shock?: V3Shock;
 };
+
+// sp = 최신→과거 순
+function v3GetTrend(sp: number[]): V3Trend {
+  const recent = sp.slice(0, V3_RECENT_N);
+  const older = sp.slice(V3_RECENT_N);
+  if (older.length === 0) return "횡보";
+  const rAvg = recent.reduce((s, p) => s + p, 0) / recent.length;
+  const oAvg = older.reduce((s, p) => s + p, 0) / older.length;
+  if (oAvg <= 0) return "횡보";
+  const ratio = (rAvg - oAvg) / oAvg;
+  if (ratio > V3_THRESHOLD) return "상승";
+  if (ratio < -V3_THRESHOLD) return "하락";
+  return "횡보";
+}
+
+function v3GetMode(prices: number[], trend: V3Trend): { modePrice: number | null; maxFreq: number; note: string } {
+  const freq = new Map<number, number>();
+  for (const p of prices) freq.set(p, (freq.get(p) || 0) + 1);
+  let maxFreq = 0;
+  for (const v of freq.values()) if (v > maxFreq) maxFreq = v;
+  const modes: number[] = [];
+  for (const [k, v] of freq.entries()) if (v === maxFreq) modes.push(k);
+  modes.sort((a, b) => a - b);
+
+  if (maxFreq >= 3 && modes.length === 1) {
+    return { modePrice: modes[0], maxFreq, note: "단일최빈" };
+  }
+  if (maxFreq >= 3 && modes.length > 1) {
+    if (trend === "상승") return { modePrice: Math.max(...modes), maxFreq, note: "동률→상승→max" };
+    if (trend === "하락") return { modePrice: Math.min(...modes), maxFreq, note: "동률→하락→min" };
+    const mid = modes.length % 2 === 0
+      ? (modes[modes.length / 2 - 1] + modes[modes.length / 2]) / 2
+      : modes[Math.floor(modes.length / 2)];
+    return { modePrice: Math.trunc(mid), maxFreq, note: "동률→횡보→중앙" };
+  }
+  return { modePrice: null, maxFreq, note: `최빈<3(max ${maxFreq}회)` };
+}
+
+function v3GetWavg(sp: number[]): number {
+  const recent = sp.slice(0, V3_RECENT_N);
+  const older = sp.slice(V3_RECENT_N);
+  const rAvg = recent.reduce((s, p) => s + p, 0) / recent.length;
+  const oAvg = older.length > 0 ? older.reduce((s, p) => s + p, 0) / older.length : rAvg;
+  return Math.round(rAvg * V3_W_RECENT + oAvg * V3_W_OLDER);
+}
+
+function v3GetRecentMedian(sp: number[]): number {
+  const recent = sp.slice(0, V3_RECENT_N);
+  const sorted = [...recent].sort((a, b) => a - b);
+  const med = sorted.length % 2 === 0
+    ? (sorted[sorted.length / 2 - 1] + sorted[sorted.length / 2]) / 2
+    : sorted[Math.floor(sorted.length / 2)];
+  return Math.trunc(med);
+}
+
+function v3MedianOf3(a: number, b: number, c: number): number {
+  const arr = [a, b, c].sort((x, y) => x - y);
+  return Math.trunc(arr[1]);
+}
+
+function v3MedianOf2(a: number, b: number): number {
+  return Math.trunc((a + b) / 2);
+}
+
+type V3Result = {
+  basePP: number;
+  today: number;
+  yesterday: number;
+  day_chg: number;
+  shock: V3Shock;
+  trend: V3Trend;
+  mode_price: number | null;
+  mode_note: string;
+  wavg: number;
+  recent_median: number;
+  basis: string;
+};
+
+function calcBasePP_v3(sp: number[]): V3Result {
+  const today = sp[0];
+  const yesterday = sp.length > 1 ? sp[1] : sp[0];
+  const trend = v3GetTrend(sp);
+  let { modePrice, maxFreq: _mf, note: modeNote } = v3GetMode(sp, trend);
+  void _mf;
+  const wavg = v3GetWavg(sp);
+  const recentMed = v3GetRecentMedian(sp);
+  const dayChg = yesterday > 0 ? (today - yesterday) / yesterday : 0;
+
+  // STEP 1 — 당일충격
+  if (dayChg >= V3_SPIKE_UP) {
+    if (modePrice !== null && (today - modePrice) / today > V3_MODE_GAP_LIMIT) {
+      modeNote += "→최빈버림";
+      modePrice = null;
+    }
+    return {
+      basePP: today, today, yesterday, day_chg: dayChg, shock: "급등", trend,
+      mode_price: modePrice, mode_note: modeNote, wavg, recent_median: recentMed,
+      basis: "당일급등→오늘가",
+    };
+  }
+  if (dayChg <= -V3_SPIKE_DN) {
+    let basePP: number;
+    let basis: string;
+    if (modePrice !== null) {
+      basePP = Math.max(modePrice, wavg);
+      basis = "당일급락→완충(최빈/가중 높은값)";
+    } else {
+      basePP = Math.max(recentMed, wavg);
+      basis = "당일급락→완충(최근중앙/가중 높은값)";
+    }
+    return {
+      basePP, today, yesterday, day_chg: dayChg, shock: "급락", trend,
+      mode_price: modePrice, mode_note: modeNote, wavg, recent_median: recentMed, basis,
+    };
+  }
+
+  // STEP 2 — 최빈값 유효성 검사
+  if (modePrice !== null && (today - modePrice) / today > V3_MODE_GAP_LIMIT) {
+    const dropPct = ((today - modePrice) / today * 100).toFixed(0);
+    modeNote += `(오늘가 대비 ${dropPct}%↓버림)`;
+    modePrice = null;
+  }
+
+  // STEP 3+4 — 추세별 비대칭 선택
+  let basePP: number;
+  let basis: string;
+  if (modePrice !== null) {
+    if (trend === "상승") {
+      basePP = Math.max(modePrice, wavg, Math.round(today * 0.95));
+      basis = "상승→max(최빈,가중,오늘가×0.95)";
+    } else if (trend === "하락") {
+      basePP = Math.max(modePrice, wavg);
+      basis = "하락→완충(최빈/가중 높은값)";
+    } else {
+      basePP = v3MedianOf2(modePrice, wavg);
+      basis = "횡보→MEDIAN(최빈,가중)";
+    }
+  } else {
+    basePP = v3MedianOf3(today, recentMed, wavg);
+    basis = `최빈없음→MEDIAN(오늘${today.toLocaleString()},최근중앙${recentMed.toLocaleString()},가중${wavg.toLocaleString()})`;
+  }
+
+  return {
+    basePP, today, yesterday, day_chg: dayChg, shock: "정상", trend,
+    mode_price: modePrice, mode_note: modeNote, wavg, recent_median: recentMed, basis,
+  };
+}
 
 function calculateBasePurchasePrice(
   history: PriceHistory[],
   todayPrice: number
 ): BasePurchaseResult {
   const valid = history.filter((h) => h.price > 0);
-  const prices = valid.map((h) => h.price);
+
+  // sp 구성: 최신→과거 (history 는 ASC 정렬이므로 reverse)
+  let sp = valid.slice().reverse().map((h) => h.price);
+
+  // 오늘 매입이 history 에 없을 수 있으면 todayPrice 를 sp[0] 에 우선
+  // (mgmt 와 daily_purchase_prices 가 항상 일치하지 않을 수 있어 안전장치)
+  if (todayPrice > 0 && (sp.length === 0 || sp[0] !== todayPrice)) {
+    sp = [todayPrice, ...sp];
+  }
 
   // 유효 데이터 2일 미만 → 오늘 매입가 그대로
-  if (prices.length < 2) {
+  if (sp.length < 2) {
     return {
       base_purchase_price: todayPrice,
       confidence: "low",
@@ -228,69 +413,18 @@ function calculateBasePurchasePrice(
     };
   }
 
-  // Step 1: 중앙값 산출 (이상치 판별 기준)
-  const sorted = [...prices].sort((a, b) => a - b);
-  const median = sorted.length % 2 === 0
-    ? (sorted[sorted.length / 2 - 1] + sorted[sorted.length / 2]) / 2
-    : sorted[Math.floor(sorted.length / 2)];
+  // v3 알고리즘 실행
+  const v3 = calcBasePP_v3(sp);
 
-  // Step 2: 이상치 제거 (중앙값 대비 ±30% 벗어나는 값)
-  const filtered = prices.filter((p) => Math.abs(p - median) / median <= 0.3);
-  const filteredCount = prices.length - filtered.length;
-
-  // Step 3: 적정가 산출 (우선순위)
-  let basePP: number;
-  let method: string;
+  // 신뢰도 매핑
   let confidence: BasePurchaseResult["confidence"];
+  if (v3.shock !== "정상") confidence = "high";
+  else if (v3.mode_price !== null) confidence = "high";
+  else confidence = "medium";
 
-  // (1) 최빈값이 명확할 때 (같은 가격이 3회 이상)
-  const freqMap = new Map<number, number>();
-  for (const p of filtered) freqMap.set(p, (freqMap.get(p) || 0) + 1);
-  const maxFreq = Math.max(...freqMap.values());
-  const modePrice = [...freqMap.entries()].find(([, cnt]) => cnt === maxFreq)?.[0] || 0;
-
-  if (maxFreq >= 3 && modePrice > 0) {
-    basePP = modePrice;
-    method = `최빈값(${modePrice.toLocaleString()}원 ${maxFreq}회)`;
-    confidence = "high";
-  }
-  // (2) 박스권 횡보 (최고-최저 차이 < 20%)
-  else if (filtered.length >= 3) {
-    const fMax = Math.max(...filtered);
-    const fMin = Math.min(...filtered);
-    const range = fMax > 0 ? (fMax - fMin) / fMin : 0;
-
-    if (range < 0.2) {
-      // 중앙값 사용
-      const fSorted = [...filtered].sort((a, b) => a - b);
-      const fMedian = fSorted.length % 2 === 0
-        ? (fSorted[fSorted.length / 2 - 1] + fSorted[fSorted.length / 2]) / 2
-        : fSorted[Math.floor(fSorted.length / 2)];
-      basePP = Math.round(fMedian);
-      method = `중앙값(박스권 ${fMin.toLocaleString()}~${fMax.toLocaleString()}원)`;
-      confidence = "medium";
-    } else {
-      // (3) 변동 큰 품목 → 추세 반영 가중평균 (최근 3일에 가중)
-      const recent3 = filtered.slice(-3);
-      const older = filtered.slice(0, -3);
-      const recent3Avg = recent3.reduce((s, p) => s + p, 0) / recent3.length;
-      const olderAvg = older.length > 0 ? older.reduce((s, p) => s + p, 0) / older.length : recent3Avg;
-      // 최근 3일에 60% 가중
-      basePP = Math.round(recent3Avg * 0.6 + olderAvg * 0.4);
-      method = `가중평균(등락 큰 품목, 최근3일 60%가중)`;
-      confidence = "medium";
-    }
-  }
-  // 데이터 2일뿐
-  else {
-    basePP = Math.round(filtered.reduce((s, p) => s + p, 0) / filtered.length);
-    method = `평균(${filtered.length}일)`;
-    confidence = "low";
-  }
-
-  // Step 4: 오늘 매입가와의 괴리 체크
-  const deviation = basePP > 0 ? (todayPrice - basePP) / basePP : 0;
-  const isAbnormal = Math.abs(deviation) > 0.2; // 적정가 대비 ±20% 이상
+  // 오늘 매입가와의 괴리 체크 (이상치 표기는 기존 인터페이스 유지)
+  const deviation = v3.basePP > 0 ? (todayPrice - v3.basePP) / v3.basePP : 0;
+  const isAbnormal = Math.abs(deviation) > 0.2;
 
   // reason 조립
   const parts: string[] = [];
@@ -298,32 +432,41 @@ function calculateBasePurchasePrice(
   const firstDate = dates[0]?.slice(5) || "?";
   const lastDate = dates[dates.length - 1]?.slice(5) || "?";
 
-  // 이력 요약: 가격별 빈도
+  // 가격별 빈도 (최신→과거 순 sp 기준)
+  const freqMap = new Map<number, number>();
+  for (const p of sp) freqMap.set(p, (freqMap.get(p) || 0) + 1);
   const freqDesc = [...freqMap.entries()]
     .sort((a, b) => b[1] - a[1])
     .slice(0, 4)
     .map(([p, cnt]) => `${p.toLocaleString()}원 ${cnt}회`)
     .join(", ");
 
-  parts.push(`[이력 분석] ${valid.length}일간(${firstDate}~${lastDate}) ${freqDesc}`);
-  parts.push(`→ 적정매입가 ${basePP.toLocaleString()}원(${method})`);
-
-  if (filteredCount > 0) {
-    parts.push(`이상치 ${filteredCount}건 제외`);
-  }
+  parts.push(`[이력 분석 v3] ${sp.length}일간(${firstDate}~${lastDate}) ${freqDesc}`);
+  parts.push(
+    `추세=${v3.trend} / 충격=${v3.shock}(일변동${(v3.day_chg * 100).toFixed(1)}%) / 최빈=${
+      v3.mode_price !== null ? v3.mode_price.toLocaleString() + "원" : "X"
+    }(${v3.mode_note}) / 가중=${v3.wavg.toLocaleString()}원 / 최근${V3_RECENT_N}중앙=${v3.recent_median.toLocaleString()}원`
+  );
+  parts.push(`→ 적정매입가 ${v3.basePP.toLocaleString()}원 (${v3.basis})`);
 
   if (isAbnormal) {
-    parts.push(`오늘 ${todayPrice.toLocaleString()}원은 적정가 대비 ${deviation > 0 ? "+" : ""}${(deviation * 100).toFixed(1)}% (이상 매입)`);
+    parts.push(
+      `오늘 ${todayPrice.toLocaleString()}원은 적정가 대비 ${deviation > 0 ? "+" : ""}${(deviation * 100).toFixed(1)}% (이상 매입)`
+    );
   } else if (Math.abs(deviation) > 0.05) {
-    parts.push(`오늘 ${todayPrice.toLocaleString()}원은 적정가 대비 ${deviation > 0 ? "+" : ""}${(deviation * 100).toFixed(1)}%`);
+    parts.push(
+      `오늘 ${todayPrice.toLocaleString()}원은 적정가 대비 ${deviation > 0 ? "+" : ""}${(deviation * 100).toFixed(1)}%`
+    );
   }
 
   return {
-    base_purchase_price: basePP,
+    base_purchase_price: v3.basePP,
     confidence,
-    method,
+    method: v3.basis,
     is_abnormal_today: isAbnormal,
     reason: parts.join(". "),
+    v3_trend: v3.trend,
+    v3_shock: v3.shock,
   };
 }
 
@@ -429,9 +572,13 @@ function analyzeSales(
   };
 }
 
-// 매입 안정성 판정 (Layer 1의 method 문자열 기반)
-function isPurchaseStable(method: string): boolean {
-  return method.includes("최빈값") || method.includes("중앙값") || method.includes("박스권");
+// 매입 안정성 판정 (v3 신호: 횡보 + 정상 충격)
+function isPurchaseStable(layer1: BasePurchaseResult): boolean {
+  if (layer1.v3_trend !== undefined) {
+    return layer1.v3_trend === "횡보" && layer1.v3_shock === "정상";
+  }
+  // fallback: 옛 method 문자열 기반
+  return layer1.method.includes("최빈") || layer1.method.includes("중앙") || layer1.method.includes("MEDIAN");
 }
 
 // ─────────────────────────────────────────
@@ -927,7 +1074,7 @@ export function calculateAiRecommendation(input: AiRecInput): AiRecOutput {
   // ─────────────────────────────────────
   // Layer 2: 매출량 분석 (Phase 3) — salesAnalysis 는 위에서 이미 계산됨
   // ─────────────────────────────────────
-  const purchaseStable = isPurchaseStable(layer1.method);
+  const purchaseStable = isPurchaseStable(layer1);
 
   // 매출 판정 reason (이번달 / 3개월대비 / 대응 전략)
   {
@@ -996,7 +1143,7 @@ export function calculateAiRecommendation(input: AiRecInput): AiRecOutput {
       if (newPrice < aiPrice) {
         aiPrice = newPrice;
         reasons.push(
-          `매출 급감 ▼${(Math.abs(changePct) * 100).toFixed(0)}% + 매입 안정(${layer1.method.split("(")[0]}) → 수익률 ${newMargin.toFixed(1)}%(기준${targetMargin}% - ${marginReduction.toFixed(1)}%p, 민감도${priceSensitivity}하한${MARGIN_FLOOR_PCT}%)로 하향`
+          `매출 급감 ▼${(Math.abs(changePct) * 100).toFixed(0)}% + 매입 안정(${layer1.v3_trend ?? layer1.method.split("(")[0]}/${layer1.v3_shock ?? "정상"}) → 수익률 ${newMargin.toFixed(1)}%(기준${targetMargin}% - ${marginReduction.toFixed(1)}%p, 민감도${priceSensitivity}하한${MARGIN_FLOOR_PCT}%)로 하향`
         );
       }
     } else {
