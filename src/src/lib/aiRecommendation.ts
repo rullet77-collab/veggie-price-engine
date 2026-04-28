@@ -26,6 +26,7 @@ export type GroupMember = {
   pack_role: PackRole | null;
   pack_meta: PackMeta | null;
   unit: string | null;                   // "박스", "봉", "통", "개", "kg" 등
+  spec?: string | null;                  // 규격 ("박스/±5kg", "반박스/10kg", "1kg" 등) — Layer 4-B 단위환산용
   short_history: PriceHistory[];         // 8일 이력
   long_history: PriceHistory[];          // 60일 이력 (장기 참조용)
 };
@@ -45,6 +46,8 @@ export type AiRecInput = {
   group_members?: GroupMember[];         // 같은 그룹의 다른 멤버 (나 제외)
   price_date?: string;                   // 분석 기준일 (시즌 판정용)
   unit?: string;                         // 내 단위
+  product_name?: string | null;          // Layer 4-B 등급키 매칭용
+  spec?: string | null;                  // Layer 4-B kg 환산용
 
   short_history: PriceHistory[]; // 8일
   long_history: PriceHistory[]; // 60일 (선택)
@@ -659,12 +662,133 @@ function findOverlapDates(a: PriceHistory[], b: PriceHistory[]): { date: string;
 // Phase 5-A 메인: 그룹 기반 매입가 추정
 type GroupEstimateResult = {
   estimated_price: number;
-  method: string;        // "박스→소분 관계식" / "소분→박스 관계식" / "변동률 교차참조"
+  method: string;        // "박스→소분 관계식" / "소분→박스 관계식" / "변동률 교차참조" / "동일등급 단위환산"
   anchor_code: string;   // 참조한 품목 코드
   anchor_name: string;
   reason: string;        // 학습페이지용 설명
   confidence: "high" | "medium" | "low";
 };
+
+// ─────────────────────────────────────────
+// Layer 4-B: 동일 등급 단위환산 (xlsx 매핑 밖 상품들 간 가격 유추)
+// 예: 005045(가지/상/박스) ↔ 007751(가지/상/반박스)  공유 텍스트 "가지/상" → 박스 ÷2 = 반박스
+// ─────────────────────────────────────────
+
+/**
+ * product_name 에서 "품목/등급" 키 추출
+ *  "**가지/특/국내산"   → "가지/특"
+ *  "**가지/상/국내산"   → "가지/상"
+ *  "가지/상/국내산"      → "가지/상"
+ *  "**감자/왕특/국내산"  → "감자/왕특"
+ *  "**청양고추/홀용/국내산" → "청양고추/홀용"
+ *  "가지 1kg/국내산"     → null  (등급 슬래시 없음)
+ *  "가지 3개/국내산"     → null
+ */
+function extractGradeKey(name: string | null | undefined): string | null {
+  if (!name) return null;
+  const cleaned = name.replace(/^\*+/, "").trim();
+  // 패턴: 품목명 + "/" + 등급 + ("/원산지" 또는 끝)
+  const m = cleaned.match(/^([가-힣A-Za-z0-9]+)\/([가-힣A-Za-z0-9]+)(?=\/|$)/);
+  if (!m) return null;
+  // "1kg", "3개", "10봉" 같은 패턴은 등급이 아님 — 숫자+단위 형태 제외
+  if (/^\d/.test(m[2])) return null;
+  return `${m[1]}/${m[2]}`;
+}
+
+/**
+ * spec 문자열에서 kg 무게 추출
+ *  "박스/±5kg" → 5,  "반박스/10kg" → 10,  "1kg" → 1,  "박스/12개" → null
+ */
+function extractKgFromSpec(spec: string | null | undefined): number | null {
+  if (!spec) return null;
+  const m = spec.match(/(\d+\.?\d*)\s*[kK][gG]/);
+  return m ? parseFloat(m[1]) : null;
+}
+
+/**
+ * 단위환산 비율 산출 — anchor 단위 기준 1, target 단위는 비율
+ * 반환: target = anchor.price / ratio  (즉 박스(ratio=2) → 반박스 = 박스/2)
+ *
+ * 케이스:
+ *  - 박스 ↔ 반박스: ratio = 2
+ *  - 박스(spec kg) ↔ 봉(spec kg): ratio = 박스kg / 봉kg
+ *  - 같은 단위: ratio = 1 (같은 등급이면 단가 같다고 보고 그대로)
+ */
+function getUnitConversionRatio(
+  anchorUnit: string | null | undefined,
+  anchorSpec: string | null | undefined,
+  myUnit: string | null | undefined,
+  mySpec: string | null | undefined
+): { ratio: number; note: string } | null {
+  const a = (anchorUnit || "").trim();
+  const t = (myUnit || "").trim();
+  if (!a || !t) return null;
+
+  // 같은 단위
+  if (a === t) return { ratio: 1, note: "동일 단위" };
+
+  // 박스 ↔ 반박스
+  if (a === "박스" && t === "반박스") return { ratio: 2, note: "박스→반박스 ÷2" };
+  if (a === "반박스" && t === "박스") return { ratio: 0.5, note: "반박스→박스 ×2" };
+
+  // kg 기반 비례 환산 (박스↔봉, 반박스↔봉 등)
+  const aKg = extractKgFromSpec(anchorSpec);
+  const tKg = extractKgFromSpec(mySpec);
+  if (aKg && tKg && aKg > 0 && tKg > 0) {
+    return { ratio: aKg / tKg, note: `${aKg}kg→${tKg}kg ÷${(aKg / tKg).toFixed(2)}` };
+  }
+
+  return null;
+}
+
+/**
+ * Layer 4-B 메인: 같은 그룹 + 같은 등급키 멤버에서 단위환산으로 가격 유추
+ *  - pack_role 태깅 없이도 동작 (xlsx 매핑 밖 상품들 대상)
+ *  - 가격이 가장 최근에 있는 멤버를 anchor 로 선정
+ */
+function inferFromSameGradeMember(
+  myName: string,
+  myUnit: string | null | undefined,
+  mySpec: string | null | undefined,
+  members: GroupMember[]
+): GroupEstimateResult | null {
+  const myKey = extractGradeKey(myName);
+  if (!myKey) return null;
+
+  // 같은 등급키 + 최근 매입가 보유 멤버
+  const sameGrade = members
+    .filter((m) => extractGradeKey(m.product_name) === myKey)
+    .filter((m) => m.short_history.some((h) => h.price > 0))
+    .sort((a, b) => {
+      // 우선순위: 최신 매입일 가장 가까운 순 → 이력 길이
+      const aLatest = [...a.short_history].reverse().find((h) => h.price > 0)?.date || "";
+      const bLatest = [...b.short_history].reverse().find((h) => h.price > 0)?.date || "";
+      if (aLatest !== bLatest) return bLatest.localeCompare(aLatest);
+      return b.short_history.filter((h) => h.price > 0).length - a.short_history.filter((h) => h.price > 0).length;
+    });
+
+  for (const m of sameGrade) {
+    const latest = [...m.short_history].reverse().find((h) => h.price > 0);
+    if (!latest) continue;
+
+    const conv = getUnitConversionRatio(m.unit, m.spec, myUnit, mySpec);
+    if (!conv) continue;
+
+    const estimatedPrice = ceil10(latest.price / conv.ratio);
+    if (estimatedPrice <= 0) continue;
+
+    return {
+      estimated_price: estimatedPrice,
+      method: "동일등급 단위환산",
+      anchor_code: m.product_code,
+      anchor_name: m.product_name,
+      reason: `[동일등급 추론] ${myKey} 공유: ${m.product_name}(${m.product_code}) ${latest.price.toLocaleString()}원 (${m.unit}, ${latest.date.slice(5)}) → ${conv.note} → ${myUnit} 환산 ${estimatedPrice.toLocaleString()}원`,
+      confidence: "high",
+    };
+  }
+
+  return null;
+}
 
 function estimateFromGroupMembers(
   myCode: string,
@@ -672,11 +796,17 @@ function estimateFromGroupMembers(
   myPackRole: PackRole | null | undefined,
   myPackMeta: PackMeta | null | undefined,
   myUnit: string | null | undefined,
+  mySpec: string | null | undefined,
   myHistory: PriceHistory[],
   members: GroupMember[],
   date: Date
 ): GroupEstimateResult | null {
   if (members.length === 0) return null;
+
+  // ── Layer 4-B 우선 시도: 같은 등급키 + 단위환산 (xlsx 밖 상품 간 가격 유추)
+  // pack_role 없는 케이스(005045 ↔ 007751 같은 별개매입 페어)에 작동
+  const sameGrade = inferFromSameGradeMember(myName, myUnit, mySpec, members);
+  if (sameGrade) return sameGrade;
 
   // Case A: 나는 관계식 있고, 같은 그룹에 다른 관계식 품목이 최근 매입있음
   if (myPackRole && myPackMeta) {
@@ -743,10 +873,20 @@ function estimateFromGroupMembers(
   }
 
   // Case B: 관계식 환산 실패 or 나는 관계식 없음 → 변동률 교차참조
-  // 그룹 내 "이력 최다 + 최근 매입 있음" 품목 선정
+  // 그룹 내 "동일 등급키 우선 → 이력 최다 + 최근 매입 있음" 품목 선정
+  const myKeyForSort = extractGradeKey(myName);
   const candidates = members
     .filter((m) => m.short_history.some((h) => h.price > 0))
-    .sort((a, b) => b.short_history.filter((h) => h.price > 0).length - a.short_history.filter((h) => h.price > 0).length);
+    .sort((a, b) => {
+      // 1순위: 동일 등급키 우선 (가지/특 vs 가지/상 같은 미스매치 방지)
+      if (myKeyForSort) {
+        const aMatch = extractGradeKey(a.product_name) === myKeyForSort ? 0 : 1;
+        const bMatch = extractGradeKey(b.product_name) === myKeyForSort ? 0 : 1;
+        if (aMatch !== bMatch) return aMatch - bMatch;
+      }
+      // 2순위: 이력 최다
+      return b.short_history.filter((h) => h.price > 0).length - a.short_history.filter((h) => h.price > 0).length;
+    });
 
   for (const anchor of candidates) {
     const anchorValid = anchor.short_history.filter((h) => h.price > 0);
@@ -880,10 +1020,11 @@ export function calculateAiRecommendation(input: AiRecInput): AiRecOutput {
     const analysisDate = price_date ? new Date(price_date) : new Date();
     estimatedFromGroup = estimateFromGroupMembers(
       "",  // myCode 별도 불필요
-      "",
+      input.product_name || "",
       pack_role,
       pack_meta,
       myUnit,
+      input.spec || null,
       short_history,
       group_members || [],
       analysisDate

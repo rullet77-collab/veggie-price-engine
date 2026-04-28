@@ -82,7 +82,7 @@ export async function GET(request: Request) {
       (q) => q.eq("price_date", priceDate)
     );
 
-    // 3) products 마스터 (Phase 5-A: pack_role, pack_meta 포함)
+    // 3) products 마스터 (Phase 5-A: pack_role, pack_meta 포함 / Layer 4-B: spec 포함)
     type ProdRow = {
       product_code: string; product_group: number | null;
       is_key_item: boolean; target_margin_rate: number | null;
@@ -90,10 +90,11 @@ export async function GET(request: Request) {
       price_sensitivity: string | null;
       pack_role: string | null; pack_meta: unknown;
       product_name: string | null; unit: string | null;
+      spec: string | null;
     };
     const productsData = await fetchAll<ProdRow>(
       "products",
-      "product_code,product_group,is_key_item,target_margin_rate,is_event_item,product_type,price_sensitivity,pack_role,pack_meta,product_name,unit"
+      "product_code,product_group,is_key_item,target_margin_rate,is_event_item,product_type,price_sensitivity,pack_role,pack_meta,product_name,unit,spec"
     );
     const productMap = new Map<string, ProdRow>();
     for (const p of productsData) productMap.set(p.product_code, p);
@@ -248,7 +249,7 @@ export async function GET(request: Request) {
       let recommendedPrice: number | null = null;
       let recommendReason = "";
       if (platformSellingPrice > 0 || purchasePrice > 0) {
-        // Phase 5-A: 같은 그룹 멤버 데이터 구성 (나 제외)
+        // Phase 5-A / Layer 4-B: 같은 그룹 멤버 데이터 구성 (나 제외, spec 포함)
         const groupMembers = prod?.product_group
           ? (groupMembersMap.get(prod.product_group) || [])
               .filter((m) => m.product_code !== row.product_code)
@@ -258,6 +259,7 @@ export async function GET(request: Request) {
                 pack_role: (m.pack_role as "박스" | "소분" | null),
                 pack_meta: m.pack_meta as never,
                 unit: m.unit,
+                spec: m.spec,
                 short_history: shortHistoryMap.get(m.product_code) || [],
                 long_history: longHistoryMap.get(m.product_code) || [],
               }))
@@ -276,6 +278,8 @@ export async function GET(request: Request) {
           group_members: groupMembers,
           price_date: priceDate,
           unit: row.unit || undefined,
+          product_name: row.product_name,
+          spec: row.spec,
           short_history: shortHistoryMap.get(row.product_code) || [],
           long_history: longHistoryMap.get(row.product_code) || [],
           monthly_sales: recentSalesMap.get(row.product_code) || [],

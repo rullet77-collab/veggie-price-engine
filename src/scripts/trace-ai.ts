@@ -30,6 +30,7 @@ async function rest<T>(path: string, key: string): Promise<T> {
 
 type ProdRow = {
   product_code: string; product_name: string; unit: string | null;
+  spec: string | null;
   product_group: number | null; is_key_item: boolean;
   target_margin_rate: number | null; price_sensitivity: string | null;
   pack_role: string | null; pack_meta: unknown;
@@ -43,7 +44,7 @@ type MsqRow = { product_code: string; sale_month: string; quantity: number; sour
 async function traceCode(code: string, key: string, priceDate: string) {
   // 1) products 마스터
   const prods = await rest<ProdRow[]>(
-    `products?product_code=eq.${code}&select=product_code,product_name,unit,product_group,is_key_item,target_margin_rate,price_sensitivity,pack_role,pack_meta`, key);
+    `products?product_code=eq.${code}&select=product_code,product_name,unit,spec,product_group,is_key_item,target_margin_rate,price_sensitivity,pack_role,pack_meta`, key);
   const prod = prods[0];
   if (!prod) { console.log(`${code}: products 없음`); return; }
 
@@ -78,7 +79,7 @@ async function traceCode(code: string, key: string, priceDate: string) {
   let groupMembers: GroupMember[] = [];
   if (prod.product_group) {
     const mems = await rest<ProdRow[]>(
-      `products?product_group=eq.${prod.product_group}&product_code=neq.${code}&select=product_code,product_name,unit,pack_role,pack_meta`, key);
+      `products?product_group=eq.${prod.product_group}&product_code=neq.${code}&select=product_code,product_name,unit,spec,pack_role,pack_meta`, key);
     if (mems.length > 0) {
       const memCodes = mems.map((m) => m.product_code).join(",");
       const memPh = await rest<PurchRow[]>(
@@ -93,7 +94,7 @@ async function traceCode(code: string, key: string, priceDate: string) {
         return {
           product_code: m.product_code, product_name: m.product_name,
           pack_role: m.pack_role as "박스" | "소분" | null,
-          pack_meta: m.pack_meta as never, unit: m.unit,
+          pack_meta: m.pack_meta as never, unit: m.unit, spec: m.spec,
           short_history: hist.filter((h) => h.price_date >= eightStr).map((h) => ({ date: h.price_date, price: h.purchase_price })),
           long_history: hist.map((h) => ({ date: h.price_date, price: h.purchase_price })),
         };
@@ -115,6 +116,8 @@ async function traceCode(code: string, key: string, priceDate: string) {
     group_members: groupMembers,
     price_date: priceDate,
     unit: prod.unit || undefined,
+    product_name: prod.product_name,
+    spec: prod.spec,
     short_history: shortHistory,
     long_history: longHistory,
     monthly_sales: [],
