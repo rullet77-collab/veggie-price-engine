@@ -30,8 +30,7 @@
 매일 반복되는 워크플로:
 1. `/upload` — 오늘자 로우데이터 업로드 (매입상세 + 매출상세 + ★ 플랫폼시트)
 2. `/products` — 전체상품 대시보드에서 판매가 확인·조정·확정
-3. `/learn` — 변경된 품목 중 랜덤 10개로 학습 세션 (AI 추천 vs 실제 비교)
-4. `/learn/history` — 누적 학습 이력 확인
+3. `/platform` — 플랫폼별 업로드 파일 다운로드
 
 | 테이블 | 현재 상태 | 비고 |
 |--------|-----------|------|
@@ -39,7 +38,7 @@
 | daily_purchase_prices | 2026년~ 데이터만 | 일일 업로드로 누적 |
 | daily_selling_prices | 2026년~ 데이터만 | 일일 업로드로 누적 |
 | product_selling_prices | 현재 판매가 | 판매가 조정 시 upsert |
-| learn_sessions / learn_items | 학습 이력 | 학습 세션마다 생성 |
+| learning_sessions / learning_items | 학습 이력 (보존) | 학습 기능 제거됨, 데이터만 보관 |
 
 ## 데이터베이스 스키마 (현재 Supabase에 존재)
 
@@ -96,18 +95,18 @@ CREATE TABLE daily_selling_prices (
 - 엑셀 업로드 API (매입상세 + 매출상세 + ★ 플랫폼시트 → DB)
 - 전체상품 대시보드 (/products) — 필터, 인라인 수정, 수익률일괄변경 실행
 - AI 추천 엔진 (3층 구조: 신호 해석 → 전략 선택 → 가격 산출)
-- 학습 시스템 (/learn, /learn/history) — AI vs 실제 비교 학습
 - 2025년 데이터 정리 완료 (Supabase에서 삭제, 2026년~ 데이터만 유지)
 
+### 🗑️ 제거됨
+- 학습 시스템 (/learn, /learn/history) — 코드 삭제, DB 테이블(learning_sessions/items)은 보존
+
 ### 🔄 현재 — 일일 운영 + 개선
-- 매일 로우데이터 업로드 → 판매가 조정 → 학습 세션 반복
-- 학습 이력 누적 → AI 추천 정확도 점진적 개선
+- 매일 로우데이터 업로드 → 판매가 조정
 - 품목별 패턴이 보이면 aiRecommendation.ts 로직 분기 추가
 
 ### 📋 다음 단계
 - 플랫폼 업로드 파일 자동 생성 (식봄/온일장/배민/신선행)
 - 상품그룹 동조화 UI (대표상품 ↔ 소분상품 연동)
-- 학습 이력 기반 AI 파라미터 자동 튜닝 (데이터 충분히 쌓인 후)
 
 ## 핵심 비즈니스 규칙
 
@@ -153,8 +152,6 @@ CREATE TABLE daily_selling_prices (
     │   ├── page.tsx                     ← / (대시보드)
     │   ├── products/page.tsx            ← /products (전체상품)
     │   ├── upload/page.tsx              ← /upload (데이터 업로드)
-    │   ├── learn/page.tsx               ← /learn (학습)
-    │   ├── learn/history/page.tsx       ← /learn/history (학습 이력)
     │   ├── platform/page.tsx            ← /platform (플랫폼 업로드)
     │   └── api/                         ← API 라우트
     └── src/lib/
