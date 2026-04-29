@@ -1,5 +1,5 @@
 import { supabase } from "@/lib/supabase";
-import { calculateAiRecommendation, type AiRecInput } from "@/lib/aiRecommendation";
+import { calculateAiRecommendation, type AiRecInput, extractGradeKey, getUnitConversionRatio, ceil10 } from "@/lib/aiRecommendation";
 import { computePrev3MonthPct } from "@/lib/salesStats";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -139,6 +139,8 @@ export async function GET(request: Request) {
     const purchaseMap = new Map<string, { prices: number[]; todayPrice: number | null }>();     // 7일 (UI)
     const shortHistoryMap = new Map<string, { date: string; price: number }[]>();                 // 8일 (Layer 1)
     const longHistoryMap = new Map<string, { date: string; price: number }[]>();                  // 60일 (Layer 1 장기)
+    // 날짜별 코드별 가격 인덱스 (UI 7일 동향 빈 슬롯 그룹 환산용)
+    const priceByDateAndCode = new Map<string, Map<string, number>>();
     const sevenDaysAgoStr = sevenDaysAgo.toISOString().slice(0, 10);
     const eightDaysAgoStr = eightDaysAgo.toISOString().slice(0, 10);
 
@@ -158,6 +160,21 @@ export async function GET(request: Request) {
         const u = purchaseMap.get(ph.product_code)!;
         u.prices.push(ph.purchase_price);
         if (ph.price_date === priceDate) u.todayPrice = ph.purchase_price;
+
+        // 날짜별 코드별 인덱스 (그룹 환산용)
+        if (!priceByDateAndCode.has(ph.price_date)) priceByDateAndCode.set(ph.price_date, new Map());
+        priceByDateAndCode.get(ph.price_date)!.set(ph.product_code, ph.purchase_price);
+      }
+    }
+
+    // 7일 동향 슬롯 날짜 배열 (sevenDaysAgo ~ priceDate, 8일 inclusive)
+    const slotDates: string[] = [];
+    {
+      const d = new Date(sevenDaysAgo);
+      const end = new Date(priceDate);
+      while (d <= end) {
+        slotDates.push(d.toISOString().slice(0, 10));
+        d.setDate(d.getDate() + 1);
       }
     }
 
@@ -222,6 +239,41 @@ export async function GET(request: Request) {
       const prices7d = ph?.prices || [];
       const maxPrice7d = prices7d.length > 0 ? Math.max(...prices7d) : null;
       const todayPurchase = ph?.todayPrice || null;
+
+      // 7일 동향 슬롯 (8개 날짜) — 실제 매입(actual) + 같은등급 단위환산(inferred) 병합
+      // 같은 그룹의 같은 등급키 멤버 중 단위환산 가능한 후보 미리 수집
+      type GradeAnchor = { code: string; ratio: number; name: string };
+      const myKey = extractGradeKey(row.product_name);
+      const sameGradeAnchors: GradeAnchor[] = [];
+      if (myKey && prod?.product_group) {
+        const grpMembers = groupMembersMap.get(prod.product_group) || [];
+        for (const m of grpMembers) {
+          if (m.product_code === row.product_code) continue;
+          if (extractGradeKey(m.product_name) !== myKey) continue;
+          const conv = getUnitConversionRatio(m.unit, m.spec, row.unit, row.spec);
+          if (!conv) continue;
+          sameGradeAnchors.push({ code: m.product_code, ratio: conv.ratio, name: m.product_name || "" });
+        }
+      }
+
+      const purchaseHistory8d = slotDates.map((date) => {
+        const actual = priceByDateAndCode.get(date)?.get(row.product_code);
+        if (actual != null && actual > 0) {
+          return { date, price: actual, source: "actual" as const, anchor: null };
+        }
+        // 빈 슬롯 → 같은 등급 멤버에서 단위환산
+        for (const a of sameGradeAnchors) {
+          const anchorPrice = priceByDateAndCode.get(date)?.get(a.code);
+          if (anchorPrice == null || anchorPrice <= 0) continue;
+          return {
+            date,
+            price: ceil10(anchorPrice / a.ratio),
+            source: "inferred" as const,
+            anchor: a.name,
+          };
+        }
+        return { date, price: null, source: "missing" as const, anchor: null };
+      });
 
       // 수익률일괄변경용
       const targetMargin = prod?.target_margin_rate ? Number(prod.target_margin_rate) : null;
@@ -320,6 +372,7 @@ export async function GET(request: Request) {
         purchase_prices_7d: prices7d,
         max_price_7d: maxPrice7d,
         today_purchase: todayPurchase,
+        purchase_history_8d: purchaseHistory8d,
 
         prev_selling_price: prevPlatformSellingPrice,
         selling_price: platformSellingPrice,

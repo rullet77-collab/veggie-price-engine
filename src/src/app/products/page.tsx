@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useEffect, useState, useMemo, useCallback, useRef } from "react";
+import { createPortal } from "react-dom";
 import { List } from "react-window";
 
 // ── Types ──
@@ -27,6 +28,12 @@ type Product = {
   purchase_prices_7d: number[];
   max_price_7d: number | null;
   today_purchase: number | null;
+  purchase_history_8d: Array<{
+    date: string;
+    price: number | null;
+    source: "actual" | "inferred" | "missing";
+    anchor: string | null;
+  }>;
 
   prev_selling_price: number | null;
   selling_price: number;
@@ -76,20 +83,103 @@ function marginClass(rate: number): string {
   return "";
 }
 
-function Sparkline({ prices }: { prices: number[] }) {
-  if (prices.length < 2) return <span className="text-gray-300 text-xs">-</span>;
+type HistEntry = {
+  date: string;
+  price: number | null;
+  source: "actual" | "inferred" | "missing";
+  anchor: string | null;
+};
+
+function Sparkline({
+  history,
+  fallbackPrices,
+}: {
+  history?: HistEntry[];
+  fallbackPrices?: number[];
+}) {
+  const [tip, setTip] = useState<{ x: number; y: number } | null>(null);
+
+  // history 우선, 없으면 fallbackPrices 로 합성
+  const hist: HistEntry[] = history && history.length > 0
+    ? history
+    : (fallbackPrices || []).map((p, i) => ({ date: `slot-${i}`, price: p, source: "actual" as const, anchor: null }));
+
+  const valid = hist.filter((h) => h.price != null && h.price > 0) as Array<HistEntry & { price: number }>;
+  if (valid.length < 2) return <span className="text-gray-300 text-xs">-</span>;
+
+  const prices = valid.map((h) => h.price);
   const min = Math.min(...prices);
   const max = Math.max(...prices);
   const range = max - min || 1;
   const w = 60, h = 20;
-  const points = prices
-    .map((p, i) => `${(i / (prices.length - 1)) * w},${h - ((p - min) / range) * (h - 2) - 1}`)
-    .join(" ");
-  const color = prices[prices.length - 1] > prices[0] ? "#ef4444" : prices[prices.length - 1] < prices[0] ? "#3b82f6" : "#9ca3af";
+
+  const pts = valid.map((entry, i) => {
+    const x = (i / (valid.length - 1)) * w;
+    const y = h - ((entry.price - min) / range) * (h - 2) - 1;
+    return { x, y, entry };
+  });
+
+  const lineColor =
+    valid[valid.length - 1].price > valid[0].price
+      ? "#ef4444"
+      : valid[valid.length - 1].price < valid[0].price
+        ? "#3b82f6"
+        : "#9ca3af";
+
+  const polylinePoints = pts.map((p) => `${p.x},${p.y}`).join(" ");
+
+  const showTip = (e: React.MouseEvent) => {
+    setTip({ x: e.clientX, y: e.clientY });
+  };
+  const hideTip = () => setTip(null);
+
   return (
-    <svg width={w} height={h} className="inline-block">
-      <polyline points={points} fill="none" stroke={color} strokeWidth="1.5" />
-    </svg>
+    <span
+      className="inline-block relative"
+      onMouseEnter={showTip}
+      onMouseMove={showTip}
+      onMouseLeave={hideTip}
+    >
+      <svg width={w} height={h} className="inline-block">
+        <polyline points={polylinePoints} fill="none" stroke={lineColor} strokeWidth="1.2" />
+        {pts.map((p, i) => (
+          <circle
+            key={i}
+            cx={p.x}
+            cy={p.y}
+            r={1.8}
+            fill={p.entry.source === "actual" ? "#000" : "#ef4444"}
+          />
+        ))}
+      </svg>
+      {tip && typeof window !== "undefined" &&
+        createPortal(
+          <div
+            className="fixed z-[9999] bg-white border border-gray-300 rounded shadow-lg px-2 py-1 pointer-events-none"
+            style={{ left: tip.x + 12, top: tip.y + 12, fontSize: "11px", minWidth: "120px" }}
+          >
+            <div className="text-gray-500 mb-0.5 text-[10px]">7일 매입가 (과거→현재)</div>
+            {hist.map((h, i) => {
+              const dateLabel = h.date.length >= 10 ? h.date.slice(5) : h.date;
+              if (h.price == null) {
+                return (
+                  <div key={i} className="text-gray-300">
+                    {dateLabel}: -
+                  </div>
+                );
+              }
+              const cls = h.source === "actual" ? "text-black" : "text-red-600";
+              const tag = h.source === "inferred" ? " (계산)" : "";
+              return (
+                <div key={i} className={cls}>
+                  <span className="font-mono">{dateLabel}</span>: {h.price.toLocaleString()}원{tag}
+                </div>
+              );
+            })}
+          </div>,
+          document.body,
+        )}
+    </span>
   );
 }
 
@@ -224,7 +314,7 @@ const COLUMNS: Column[] = [
   { key: "change_amount", label: "변동액", group: "매입가", width: "w-14", align: "right", sortable: true,
     render: (p) => <span className={changeClass(p.change_amount)}>{p.change_amount !== 0 ? (p.change_amount > 0 ? "+" : "") + fmt(p.change_amount) : "-"}</span> },
   { key: "purchase_prices_7d", label: "7일동향", group: "매입가", width: "w-16", align: "center",
-    render: (p) => <Sparkline prices={p.purchase_prices_7d} /> },
+    render: (p) => <Sparkline history={p.purchase_history_8d} fallbackPrices={p.purchase_prices_7d} /> },
   { key: "max_price_7d", label: "7일최고", group: "매입가", width: "w-14", align: "right", sortable: true,
     render: (p) => fmt(p.max_price_7d) },
   { key: "today_purchase", label: "오늘매입", group: "매입가", width: "w-14", align: "right", sortable: true,

@@ -600,7 +600,7 @@ function getActiveDivisor(meta: PackMeta | null | undefined, date: Date): number
 }
 
 // 10원 단위 올림
-function ceil10(v: number): number {
+export function ceil10(v: number): number {
   return Math.ceil(v / 10) * 10;
 }
 
@@ -684,7 +684,7 @@ type GroupEstimateResult = {
  *  "가지 1kg/국내산"     → null  (등급 슬래시 없음)
  *  "가지 3개/국내산"     → null
  */
-function extractGradeKey(name: string | null | undefined): string | null {
+export function extractGradeKey(name: string | null | undefined): string | null {
   if (!name) return null;
   const cleaned = name.replace(/^\*+/, "").trim();
   // 패턴: 품목명 + "/" + 등급 + ("/원산지" 또는 끝)
@@ -714,7 +714,7 @@ function extractKgFromSpec(spec: string | null | undefined): number | null {
  *  - 박스(spec kg) ↔ 봉(spec kg): ratio = 박스kg / 봉kg
  *  - 같은 단위: ratio = 1 (같은 등급이면 단가 같다고 보고 그대로)
  */
-function getUnitConversionRatio(
+export function getUnitConversionRatio(
   anchorUnit: string | null | undefined,
   anchorSpec: string | null | undefined,
   myUnit: string | null | undefined,
