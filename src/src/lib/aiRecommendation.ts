@@ -684,6 +684,112 @@ type GroupEstimateResult = {
  *  "가지 1kg/국내산"     → null  (등급 슬래시 없음)
  *  "가지 3개/국내산"     → null
  */
+/**
+ * 상품명을 의미있는 토큰들로 분리 (Layer 4-B 등급 매칭용)
+ *  - 슬래시(/)와 공백으로 분리
+ *  - 선행 ** 제거
+ *  - 원산지 토큰 제외 (국내산/수입산/중국산 등)
+ *  - 숫자로 시작하는 토큰 제외 (1kg, 3개 등 수량/규격)
+ *
+ *  "**가지/특/국내산"            → ["가지", "특"]
+ *  "**가지/상/국내산"            → ["가지", "상"]
+ *  "**고구마/밤/긴상/꿀/국내산"  → ["고구마", "밤", "긴상", "꿀"]
+ *  "고구마/밤 1kg/국내산"        → ["고구마", "밤"]
+ *  "가지 3개/국내산"             → ["가지"]
+ */
+export function tokenizeName(name: string | null | undefined): string[] {
+  if (!name) return [];
+  return name.replace(/^\*+/, "").trim()
+    .split(/[\s/]+/)
+    .filter((t) => t.length > 0)
+    .filter((t) => !/^(국내산|수입산|중국산|미국산|뉴질랜드산|국산|외국산|일본산|미얀마산)$/.test(t))
+    .filter((t) => !/^\d/.test(t));
+}
+
+/**
+ * 상품명에서 등급 tier 추출 — 작을수록 높은 등급(=비쌈)
+ *
+ * 사용자 도메인 규칙:
+ *  - 1호 > 2호 > 3호  (숫자 호 패턴, 1호 가장 비쌈)
+ *  - 특 > 상 > 일반 > 보통 > 파지
+ *  - (default 마커 없음) > B  (예: 적근대 > 적근대B)
+ *  - (default 마커 없음) > /상  (예: 치커리 > 치커리/상)
+ *  - 고구마/밤 그룹: 中 > 긴하·특 > 왕大 > 긴왕·왕왕
+ *  - 꿀(honey suffix) = 프리미엄
+ *
+ *  반환값: 작을수록 높은 등급. 등급 마커 없음 = 5 (default 최상).
+ */
+export function getGradeTier(name: string | null | undefined): number {
+  const tokens = tokenizeName(name);
+  if (tokens.length === 0) return 5;
+
+  // 1) 숫자 호 패턴 (1호=101, 2호=102...) — 명시 등급 우선
+  for (const t of tokens) {
+    const m = t.match(/^(\d+)호$/);
+    if (m) return 100 + parseInt(m[1]);
+  }
+
+  // 2) 등급 키워드 사전 (작을수록 높은 등급)
+  const ranks: Record<string, number> = {
+    // 최상위 (tier 5) — default 마커 없음과 동급
+    "中": 5, "중": 5,
+    "꿀": 5,
+
+    // 2단계 (tier 10) — 최상급 라벨
+    "특": 10,
+    "긴상": 10,
+    "긴하": 10,
+
+    // 3단계 (tier 20) — 王/大 계열 큰 사이즈
+    "왕大": 20, "왕대": 20,
+    "왕": 20, "大": 20, "대": 20,
+
+    // 4단계 (tier 25) — 中사이즈
+    "왕왕": 25,
+    "긴왕": 25,
+    "긴중": 25,
+    "中사이즈": 25,
+
+    // 5단계 (tier 30)
+    "상": 30,
+
+    // 6단계 (tier 40)
+    "일반": 40,
+    "보통": 40,
+    "中급": 40,
+
+    // 하위 (tier 50+)
+    "B": 50,
+    "하": 50,
+    "小": 55, "소": 55,
+    "파지": 60,
+  };
+
+  let minRank = Infinity;
+  for (const t of tokens) {
+    const r = ranks[t];
+    if (r != null && r < minRank) minRank = r;
+  }
+
+  // 등급 마커 토큰 없음 → 5 (default = 최상급, 치커리 vs 치커리/상 케이스)
+  return minRank === Infinity ? 5 : minRank;
+}
+
+/**
+ * 두 토큰 배열의 공통 토큰 수 (등급 매칭 점수)
+ */
+export function gradeMatchScore(a: string[], b: string[]): number {
+  if (a.length === 0 || b.length === 0) return 0;
+  const setB = new Set(b);
+  let count = 0;
+  for (const t of a) if (setB.has(t)) count++;
+  return count;
+}
+
+/**
+ * @deprecated tokenizeName + gradeMatchScore 사용 권장
+ * 첫 슬래시 기준 등급키 추출 (호환용)
+ */
 export function extractGradeKey(name: string | null | undefined): string | null {
   if (!name) return null;
   const cleaned = name.replace(/^\*+/, "").trim();
@@ -742,52 +848,72 @@ export function getUnitConversionRatio(
 }
 
 /**
- * Layer 4-B 메인: 같은 그룹 + 같은 등급키 멤버에서 단위환산으로 가격 유추
+ * Layer 4-B 메인: 같은 그룹 + 토큰 점수 매칭 + 단위환산으로 가격 유추
  *  - pack_role 태깅 없이도 동작 (xlsx 매핑 밖 상품들 대상)
- *  - 가격이 가장 최근에 있는 멤버를 anchor 로 선정
+ *  - 정렬: 공통 토큰 점수 ↓ → 자기 기준가 유사도 ↑ → 최신 매입일 ↓
+ *  - myReferencePrice 가 있으면 가격 유사도 동점처리에 활용 (자기 매입가 기준)
  */
 function inferFromSameGradeMember(
   myName: string,
   myUnit: string | null | undefined,
   mySpec: string | null | undefined,
-  members: GroupMember[]
+  members: GroupMember[],
+  myReferencePrice: number = 0
 ): GroupEstimateResult | null {
-  const myKey = extractGradeKey(myName);
-  if (!myKey) return null;
+  const myTokens = tokenizeName(myName);
+  if (myTokens.length === 0) return null;
 
-  // 같은 등급키 + 최근 매입가 보유 멤버
-  const sameGrade = members
-    .filter((m) => extractGradeKey(m.product_name) === myKey)
-    .filter((m) => m.short_history.some((h) => h.price > 0))
-    .sort((a, b) => {
-      // 우선순위: 최신 매입일 가장 가까운 순 → 이력 길이
-      const aLatest = [...a.short_history].reverse().find((h) => h.price > 0)?.date || "";
-      const bLatest = [...b.short_history].reverse().find((h) => h.price > 0)?.date || "";
-      if (aLatest !== bLatest) return bLatest.localeCompare(aLatest);
-      return b.short_history.filter((h) => h.price > 0).length - a.short_history.filter((h) => h.price > 0).length;
-    });
-
-  for (const m of sameGrade) {
-    const latest = [...m.short_history].reverse().find((h) => h.price > 0);
-    if (!latest) continue;
-
+  // 후보: 단위환산 가능 + 매입 이력 보유 + 공통 토큰 1개 이상
+  type Cand = {
+    member: GroupMember;
+    conv: { ratio: number; note: string };
+    score: number;
+    latest: PriceHistory;
+  };
+  const candidates: Cand[] = [];
+  for (const m of members) {
     const conv = getUnitConversionRatio(m.unit, m.spec, myUnit, mySpec);
     if (!conv) continue;
-
-    const estimatedPrice = ceil10(latest.price / conv.ratio);
-    if (estimatedPrice <= 0) continue;
-
-    return {
-      estimated_price: estimatedPrice,
-      method: "동일등급 단위환산",
-      anchor_code: m.product_code,
-      anchor_name: m.product_name,
-      reason: `[동일등급 추론] ${myKey} 공유: ${m.product_name}(${m.product_code}) ${latest.price.toLocaleString()}원 (${m.unit}, ${latest.date.slice(5)}) → ${conv.note} → ${myUnit} 환산 ${estimatedPrice.toLocaleString()}원`,
-      confidence: "high",
-    };
+    const latest = [...m.short_history].reverse().find((h) => h.price > 0);
+    if (!latest) continue;
+    const score = gradeMatchScore(myTokens, tokenizeName(m.product_name));
+    if (score === 0) continue;
+    candidates.push({ member: m, conv, score, latest });
   }
+  if (candidates.length === 0) return null;
 
-  return null;
+  const myTier = getGradeTier(myName);
+  candidates.sort((a, b) => {
+    if (a.score !== b.score) return b.score - a.score;
+    // 같은 unit 우선 (박스↔박스 → 박스↔봉/반박스 보다 신뢰도 높음)
+    const aUnitMatch = a.member.unit === myUnit ? 0 : 1;
+    const bUnitMatch = b.member.unit === myUnit ? 0 : 1;
+    if (aUnitMatch !== bUnitMatch) return aUnitMatch - bUnitMatch;
+    // 등급 tier diff (특/상/일반/보통/파지, 1호/2호/3호 등 hierarchy)
+    const aTierDiff = Math.abs(getGradeTier(a.member.product_name) - myTier);
+    const bTierDiff = Math.abs(getGradeTier(b.member.product_name) - myTier);
+    if (aTierDiff !== bTierDiff) return aTierDiff - bTierDiff;
+    if (myReferencePrice > 0) {
+      const aDiff = Math.abs(a.latest.price / a.conv.ratio - myReferencePrice);
+      const bDiff = Math.abs(b.latest.price / b.conv.ratio - myReferencePrice);
+      if (aDiff !== bDiff) return aDiff - bDiff;
+    }
+    if (a.latest.date !== b.latest.date) return b.latest.date.localeCompare(a.latest.date);
+    return a.member.product_code.localeCompare(b.member.product_code);
+  });
+
+  const w = candidates[0];
+  const estimatedPrice = ceil10(w.latest.price / w.conv.ratio);
+  if (estimatedPrice <= 0) return null;
+
+  return {
+    estimated_price: estimatedPrice,
+    method: "동일등급 단위환산",
+    anchor_code: w.member.product_code,
+    anchor_name: w.member.product_name,
+    reason: `[동일등급 추론] 토큰 ${w.score}개 공유: ${w.member.product_name}(${w.member.product_code}) ${w.latest.price.toLocaleString()}원 (${w.member.unit}, ${w.latest.date.slice(5)}) → ${w.conv.note} → ${myUnit} 환산 ${estimatedPrice.toLocaleString()}원`,
+    confidence: "high",
+  };
 }
 
 function estimateFromGroupMembers(
@@ -799,13 +925,14 @@ function estimateFromGroupMembers(
   mySpec: string | null | undefined,
   myHistory: PriceHistory[],
   members: GroupMember[],
-  date: Date
+  date: Date,
+  myReferencePrice: number = 0
 ): GroupEstimateResult | null {
   if (members.length === 0) return null;
 
-  // ── Layer 4-B 우선 시도: 같은 등급키 + 단위환산 (xlsx 밖 상품 간 가격 유추)
+  // ── Layer 4-B 우선 시도: 토큰 점수 매칭 + 단위환산 (xlsx 밖 상품 간 가격 유추)
   // pack_role 없는 케이스(005045 ↔ 007751 같은 별개매입 페어)에 작동
-  const sameGrade = inferFromSameGradeMember(myName, myUnit, mySpec, members);
+  const sameGrade = inferFromSameGradeMember(myName, myUnit, mySpec, members, myReferencePrice);
   if (sameGrade) return sameGrade;
 
   // Case A: 나는 관계식 있고, 같은 그룹에 다른 관계식 품목이 최근 매입있음
@@ -873,18 +1000,28 @@ function estimateFromGroupMembers(
   }
 
   // Case B: 관계식 환산 실패 or 나는 관계식 없음 → 변동률 교차참조
-  // 그룹 내 "동일 등급키 우선 → 이력 최다 + 최근 매입 있음" 품목 선정
-  const myKeyForSort = extractGradeKey(myName);
+  // 정렬: 토큰 점수 ↓ → 같은 unit 우선 → 등급 tier diff ↑ → 가격 유사도 ↑ → 이력 길이 ↓
+  const myTokensForSort = tokenizeName(myName);
+  const myTierForSort = getGradeTier(myName);
   const candidates = members
     .filter((m) => m.short_history.some((h) => h.price > 0))
     .sort((a, b) => {
-      // 1순위: 동일 등급키 우선 (가지/특 vs 가지/상 같은 미스매치 방지)
-      if (myKeyForSort) {
-        const aMatch = extractGradeKey(a.product_name) === myKeyForSort ? 0 : 1;
-        const bMatch = extractGradeKey(b.product_name) === myKeyForSort ? 0 : 1;
-        if (aMatch !== bMatch) return aMatch - bMatch;
+      const aScore = gradeMatchScore(myTokensForSort, tokenizeName(a.product_name));
+      const bScore = gradeMatchScore(myTokensForSort, tokenizeName(b.product_name));
+      if (aScore !== bScore) return bScore - aScore;
+      const aUnitMatch = a.unit === myUnit ? 0 : 1;
+      const bUnitMatch = b.unit === myUnit ? 0 : 1;
+      if (aUnitMatch !== bUnitMatch) return aUnitMatch - bUnitMatch;
+      const aTierDiff = Math.abs(getGradeTier(a.product_name) - myTierForSort);
+      const bTierDiff = Math.abs(getGradeTier(b.product_name) - myTierForSort);
+      if (aTierDiff !== bTierDiff) return aTierDiff - bTierDiff;
+      if (myReferencePrice > 0) {
+        const aLatest = [...a.short_history].reverse().find((h) => h.price > 0)?.price ?? 0;
+        const bLatest = [...b.short_history].reverse().find((h) => h.price > 0)?.price ?? 0;
+        const aDiff = Math.abs(aLatest - myReferencePrice);
+        const bDiff = Math.abs(bLatest - myReferencePrice);
+        if (aDiff !== bDiff) return aDiff - bDiff;
       }
-      // 2순위: 이력 최다
       return b.short_history.filter((h) => h.price > 0).length - a.short_history.filter((h) => h.price > 0).length;
     });
 
@@ -1018,6 +1155,8 @@ export function calculateAiRecommendation(input: AiRecInput): AiRecOutput {
 
   if (shouldTryGroup) {
     const analysisDate = price_date ? new Date(price_date) : new Date();
+    // 자기 매입가(있으면) 또는 직전 매입가를 가격유사도 기준으로 전달
+    const myReferencePrice = pp > 0 ? pp : prevPP > 0 ? prevPP : 0;
     estimatedFromGroup = estimateFromGroupMembers(
       "",  // myCode 별도 불필요
       input.product_name || "",
@@ -1027,7 +1166,8 @@ export function calculateAiRecommendation(input: AiRecInput): AiRecOutput {
       input.spec || null,
       short_history,
       group_members || [],
-      analysisDate
+      analysisDate,
+      myReferencePrice
     );
   }
 

@@ -1,5 +1,5 @@
 import { supabase } from "@/lib/supabase";
-import { calculateAiRecommendation, type AiRecInput, extractGradeKey, getUnitConversionRatio, ceil10 } from "@/lib/aiRecommendation";
+import { calculateAiRecommendation, type AiRecInput, tokenizeName, gradeMatchScore, getGradeTier, getUnitConversionRatio, ceil10 } from "@/lib/aiRecommendation";
 import { computePrev3MonthPct } from "@/lib/salesStats";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -240,28 +240,67 @@ export async function GET(request: Request) {
       const maxPrice7d = prices7d.length > 0 ? Math.max(...prices7d) : null;
       const todayPurchase = ph?.todayPrice || null;
 
-      // 7일 동향 슬롯 (8개 날짜) — 실제 매입(actual) + 같은등급 단위환산(inferred) 병합
-      // 같은 그룹의 같은 등급키 멤버 중 단위환산 가능한 후보 미리 수집
-      type GradeAnchor = { code: string; ratio: number; name: string };
-      const myKey = extractGradeKey(row.product_name);
+      // 7일 동향 슬롯 (8개 날짜) — 실제 매입(actual) + 토큰 매칭 단위환산(inferred) 병합
+      // 후보 빌드: 토큰 점수 + 단위환산 비율 + 등급 tier + 최신 매입가
+      type GradeAnchor = {
+        code: string;
+        name: string;
+        ratio: number;
+        score: number;
+        latestPrice: number;
+        unitMatch: number;
+        tierDiff: number;
+      };
+      const myTokens = tokenizeName(row.product_name);
+      const myTier = getGradeTier(row.product_name);
       const sameGradeAnchors: GradeAnchor[] = [];
-      if (myKey && prod?.product_group) {
+      if (myTokens.length > 0 && prod?.product_group) {
         const grpMembers = groupMembersMap.get(prod.product_group) || [];
         for (const m of grpMembers) {
           if (m.product_code === row.product_code) continue;
-          if (extractGradeKey(m.product_name) !== myKey) continue;
           const conv = getUnitConversionRatio(m.unit, m.spec, row.unit, row.spec);
           if (!conv) continue;
-          sameGradeAnchors.push({ code: m.product_code, ratio: conv.ratio, name: m.product_name || "" });
+          const score = gradeMatchScore(myTokens, tokenizeName(m.product_name));
+          if (score === 0) continue;
+          const memDates = (priceByDateAndCode.size > 0)
+            ? slotDates.filter((d) => priceByDateAndCode.get(d)?.get(m.product_code) != null)
+            : [];
+          const latestDate = memDates.length > 0 ? memDates[memDates.length - 1] : null;
+          const latestPrice = latestDate ? (priceByDateAndCode.get(latestDate)?.get(m.product_code) ?? 0) : 0;
+          sameGradeAnchors.push({
+            code: m.product_code,
+            name: m.product_name || "",
+            ratio: conv.ratio,
+            score,
+            latestPrice,
+            unitMatch: m.unit === row.unit ? 0 : 1,
+            tierDiff: Math.abs(getGradeTier(m.product_name) - myTier),
+          });
         }
       }
+
+      // 정렬: 토큰 점수 ↓ → 같은 unit 우선 → 등급 tier diff ↑ → 가격 유사도 ↑ → product_code ↑
+      const myRefPrice = purchasePrice > 0 ? purchasePrice : prevPurchase > 0 ? prevPurchase : 0;
+      sameGradeAnchors.sort((a, b) => {
+        if (a.score !== b.score) return b.score - a.score;
+        if (a.unitMatch !== b.unitMatch) return a.unitMatch - b.unitMatch;
+        if (a.tierDiff !== b.tierDiff) return a.tierDiff - b.tierDiff;
+        if (myRefPrice > 0 && a.latestPrice > 0 && b.latestPrice > 0) {
+          const aDiff = Math.abs(a.latestPrice / a.ratio - myRefPrice);
+          const bDiff = Math.abs(b.latestPrice / b.ratio - myRefPrice);
+          if (aDiff !== bDiff) return aDiff - bDiff;
+        }
+        if (a.latestPrice > 0 && b.latestPrice <= 0) return -1;
+        if (a.latestPrice <= 0 && b.latestPrice > 0) return 1;
+        return a.code.localeCompare(b.code);
+      });
 
       const purchaseHistory8d = slotDates.map((date) => {
         const actual = priceByDateAndCode.get(date)?.get(row.product_code);
         if (actual != null && actual > 0) {
           return { date, price: actual, source: "actual" as const, anchor: null };
         }
-        // 빈 슬롯 → 같은 등급 멤버에서 단위환산
+        // 빈 슬롯 → 정렬된 후보 순으로 첫 매칭 anchor 사용
         for (const a of sameGradeAnchors) {
           const anchorPrice = priceByDateAndCode.get(date)?.get(a.code);
           if (anchorPrice == null || anchorPrice <= 0) continue;
