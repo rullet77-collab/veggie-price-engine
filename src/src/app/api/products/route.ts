@@ -142,6 +142,8 @@ export async function GET(request: Request) {
     const longHistoryMap = new Map<string, { date: string; price: number }[]>();                  // 60일 (Layer 1 장기)
     // 날짜별 코드별 가격 인덱스 (UI 7일 동향 빈 슬롯 그룹 환산용)
     const priceByDateAndCode = new Map<string, Map<string, number>>();
+    // daily 기반 today/prev 자동 도출용 — distinct date 별 마지막 매입가
+    const datePriceByCode = new Map<string, Map<string, number>>();
     const sevenDaysAgoStr = sevenDaysAgo.toISOString().slice(0, 10);
     const eightDaysAgoStr = eightDaysAgo.toISOString().slice(0, 10);
 
@@ -166,6 +168,19 @@ export async function GET(request: Request) {
         if (!priceByDateAndCode.has(ph.price_date)) priceByDateAndCode.set(ph.price_date, new Map());
         priceByDateAndCode.get(ph.price_date)!.set(ph.product_code, ph.purchase_price);
       }
+
+      // distinct date 별 마지막 매입가 (60일 윈도우 전체)
+      if (!datePriceByCode.has(ph.product_code)) datePriceByCode.set(ph.product_code, new Map());
+      datePriceByCode.get(ph.product_code)!.set(ph.price_date, ph.purchase_price);
+    }
+
+    // daily 기반 today / prev 자동 도출 (가장 최근 distinct date + 그 직전)
+    const dailyTodayMap = new Map<string, number>();
+    const dailyPrevMap = new Map<string, number>();
+    for (const [code, dPrices] of datePriceByCode.entries()) {
+      const sortedDates = [...dPrices.keys()].sort().reverse();  // desc
+      if (sortedDates[0]) dailyTodayMap.set(code, dPrices.get(sortedDates[0])!);
+      if (sortedDates[1]) dailyPrevMap.set(code, dPrices.get(sortedDates[1])!);
     }
 
     // 7일 동향 슬롯 날짜 배열 (sevenDaysAgo ~ priceDate, 8일 inclusive)
@@ -222,8 +237,12 @@ export async function GET(request: Request) {
       const ph = purchaseMap.get(row.product_code);
       const monthlyQty = salesQtyMap.get(row.product_code) || null;
 
-      const purchasePrice = row.purchase_price || 0;
-      const prevPurchase = row.prev_purchase_price || 0;
+      // daily_purchase_prices 우선 (매일 매입 이력 누적이 source of truth),
+      // mgmt 의 기존/변경 컬럼은 fallback (daily 데이터 없을 때만)
+      const dailyToday = dailyTodayMap.get(row.product_code);
+      const dailyPrev = dailyPrevMap.get(row.product_code);
+      const purchasePrice = (dailyToday != null && dailyToday > 0) ? dailyToday : (row.purchase_price || 0);
+      const prevPurchase = (dailyPrev != null && dailyPrev > 0) ? dailyPrev : (row.prev_purchase_price || 0);
 
       // 변동률/변동액
       const changeAmount = prevPurchase > 0 ? purchasePrice - prevPurchase : 0;
