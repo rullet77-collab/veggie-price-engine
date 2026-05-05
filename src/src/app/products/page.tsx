@@ -3,6 +3,7 @@
 import React, { useEffect, useState, useMemo, useCallback, useRef } from "react";
 import { createPortal } from "react-dom";
 import { List } from "react-window";
+import { tokenizeName, gradeMatchScore } from "@/lib/aiRecommendation";
 
 // ── Types ──
 
@@ -728,14 +729,9 @@ export default function ProductsPage() {
         seenGroups.add(g);
         out.push({ ...p, _isAnchor: true });
 
-        // 그룹의 모든 멤버 (자기 포함)
+        // 그룹의 모든 멤버 (자기 포함) + 박스 멤버들 (anchor 후보 풀)
         const allMembers = products.filter((m) => m.product_group === g);
-
-        // 그룹 anchor 박스: pack_role=박스 + pack_meta 보유 + 매입가 > 0 인 박스 멤버 (가격 가장 비싼 박스 = T1)
-        const boxAnchors = allMembers
-          .filter((m) => m.unit === "박스" && (m.purchase_price || 0) > 0)
-          .sort((a, b) => (b.purchase_price || 0) - (a.purchase_price || 0));
-        const boxAnchor = boxAnchors[0] || null;
+        const boxAnchorPool = allMembers.filter((m) => m.unit === "박스" && (m.purchase_price || 0) > 0);
 
         const members = allMembers
           .filter((m) => m.product_code !== p.product_code)
@@ -747,28 +743,66 @@ export default function ProductsPage() {
             return (a.product_code || "").localeCompare(b.product_code || "");
           });
 
+        // 자식별 anchor 선정 helper — 환산 가능한 박스 중에서 토큰/tier/가격 우선
+        const pickAnchorFor = (child: Product): { anchor: Product; conv: { expected: number; note: string } } | null => {
+          if (boxAnchorPool.length === 0) return null;
+          // 1) 환산 가능한 박스만 후보로 좁힘 (pack_meta 없는 박스는 봉/단 환산 불가)
+          const eligible: Array<{ anchor: Product; conv: { expected: number; note: string } }> = [];
+          for (const a of boxAnchorPool) {
+            const conv = computeExpectedFromBox(
+              a.purchase_price as number,
+              a.spec,
+              a.pack_meta,
+              child.unit,
+              child.spec,
+              child.product_name,
+              today,
+            );
+            if (conv) eligible.push({ anchor: a, conv });
+          }
+          if (eligible.length === 0) return null;
+
+          const myTokens = tokenizeName(child.product_name);
+          const myTier = child.learned_tier ?? null;
+          const myRefPrice = child.purchase_price || 0;
+
+          eligible.sort((a, b) => {
+            // 1) 토큰 점수 (가지/상 vs 가지/특)
+            const aScore = gradeMatchScore(myTokens, tokenizeName(a.anchor.product_name));
+            const bScore = gradeMatchScore(myTokens, tokenizeName(b.anchor.product_name));
+            if (aScore !== bScore) return bScore - aScore;
+            // 2) 학습 tier diff
+            if (myTier != null && a.anchor.learned_tier != null && b.anchor.learned_tier != null) {
+              const aD = Math.abs(a.anchor.learned_tier - myTier);
+              const bD = Math.abs(b.anchor.learned_tier - myTier);
+              if (aD !== bD) return aD - bD;
+            }
+            // 3) 가격 유사도 (실제 매입가 vs 환산 예상값 차이)
+            if (myRefPrice > 0) {
+              const aDiff = Math.abs(a.conv.expected - myRefPrice);
+              const bDiff = Math.abs(b.conv.expected - myRefPrice);
+              if (aDiff !== bDiff) return aDiff - bDiff;
+            }
+            // 4) product_code asc
+            return (a.anchor.product_code || "").localeCompare(b.anchor.product_code || "");
+          });
+          return eligible[0];
+        };
+
         for (const m of members) {
           const child: ProductRow = { ...m, _isChild: true };
 
-          // 환산식 + 이상치 계산 (박스 anchor 가 있고 자기는 박스가 아닐 때)
-          if (boxAnchor && m.unit !== "박스" && (boxAnchor.purchase_price || 0) > 0) {
-            const conv = computeExpectedFromBox(
-              boxAnchor.purchase_price as number,
-              boxAnchor.spec,
-              boxAnchor.pack_meta,
-              m.unit,
-              m.spec,
-              m.product_name,
-              today,
-            );
-            if (conv) {
-              child._expectedFromAnchor = conv.expected;
-              child._conversionNote = conv.note;
-              child._anchorBoxPrice = boxAnchor.purchase_price;
-              child._anchorBoxName = boxAnchor.product_name;
+          // 자기 자신은 박스가 아닌 경우만 환산 계산 (anchor 후보 중 환산 가능한 것 우선)
+          if (m.unit !== "박스") {
+            const picked = pickAnchorFor(m);
+            if (picked) {
+              child._expectedFromAnchor = picked.conv.expected;
+              child._conversionNote = picked.conv.note;
+              child._anchorBoxPrice = picked.anchor.purchase_price;
+              child._anchorBoxName = picked.anchor.product_name;
               const actual = m.purchase_price || 0;
-              if (actual > 0 && conv.expected > 0) {
-                const delta = (actual - conv.expected) / conv.expected;
+              if (actual > 0 && picked.conv.expected > 0) {
+                const delta = (actual - picked.conv.expected) / picked.conv.expected;
                 child._conversionDelta = delta;
                 if (Math.abs(delta) > 0.2) {
                   child._anomaly = `환산 ±${(delta * 100).toFixed(0)}%`;
@@ -777,12 +811,16 @@ export default function ProductsPage() {
             }
           }
 
-          // 등급 역전 감지 (학습 tier 기준): 자기 박스가 anchor 박스보다 비쌈 = 역전
-          if (m.unit === "박스" && boxAnchor && m.product_code !== boxAnchor.product_code) {
-            const aLT = boxAnchor.learned_tier;
-            const mLT = m.learned_tier;
-            if (aLT != null && mLT != null && mLT < aLT) {
-              child._anomaly = (child._anomaly ? child._anomaly + " / " : "") + "tier역전";
+          // 등급 역전 감지 (박스 멤버끼리): 학습 tier 가 낮은 등급(=숫자 큼)이 더 비싸면 이상
+          if (m.unit === "박스" && boxAnchorPool.length > 1) {
+            // 자기 가격이 같은 그룹 내 학습 tier 1 박스보다 비싼지 체크
+            const t1Boxes = boxAnchorPool.filter((b) => b.learned_tier === 1 && b.product_code !== m.product_code);
+            const myT = m.learned_tier;
+            if (myT != null && myT > 1 && t1Boxes.length > 0) {
+              const t1Max = Math.max(...t1Boxes.map((b) => b.purchase_price || 0));
+              if ((m.purchase_price || 0) > t1Max && t1Max > 0) {
+                child._anomaly = (child._anomaly ? child._anomaly + " / " : "") + "tier역전";
+              }
             }
           }
 
