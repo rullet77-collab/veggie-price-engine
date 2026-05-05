@@ -57,6 +57,8 @@ type Product = {
   current_month_qty: number | null;
   prev_3month_pct: string | null;
   learned_tier?: number | null;
+  pack_role?: "박스" | "소분" | null;
+  pack_meta?: unknown;
 };
 
 type SortKey = keyof Product;
@@ -277,7 +279,69 @@ function EditableCell({
 // ── Column definitions ──
 
 // 그룹 expand UI 상태가 행에 주입됨 — 자식 표시용
-type ProductRow = Product & { _isChild?: boolean; _isAnchor?: boolean };
+type ProductRow = Product & {
+  _isChild?: boolean;
+  _isAnchor?: boolean;
+  // Phase 2: 자식 행에 가격 관계식 검증 메타 주입
+  _expectedFromAnchor?: number | null;   // 박스 → 자기 환산 예상가
+  _conversionNote?: string | null;       // "÷2", "×5/30", "×1/5kg" 등
+  _conversionDelta?: number | null;      // (실제-예상)/예상  (양수=비싸짐)
+  _anomaly?: string | null;              // "등급역전" / "환산불일치 +20%" / null
+  _anchorBoxPrice?: number | null;
+  _anchorBoxName?: string | null;
+};
+
+// Phase 2: 환산 helper — 박스 → 자기 단위 예상가
+function computeExpectedFromBox(
+  boxPrice: number,
+  boxSpec: string | null | undefined,
+  boxPackMeta: unknown,
+  myUnit: string | null | undefined,
+  mySpec: string | null | undefined,
+  myName: string | null | undefined,
+  date: Date,
+): { expected: number; note: string } | null {
+  if (!boxPrice || boxPrice <= 0) return null;
+
+  // 박스 → 반박스: ÷2
+  if (myUnit === "반박스") {
+    return { expected: Math.ceil(boxPrice / 2 / 10) * 10, note: "÷2" };
+  }
+
+  // 박스 → 봉/단/통: pack_meta.formula_divisor + 자기 quantity
+  // boxPackMeta = { formula_divisor: 30, seasonal: { winter_months, winter_divisor, summer_divisor } }
+  let divisor: number | null = null;
+  if (boxPackMeta && typeof boxPackMeta === "object") {
+    const meta = boxPackMeta as { formula_divisor?: number; seasonal?: { winter_months?: number[]; winter_divisor?: number; summer_divisor?: number } };
+    if (meta.seasonal) {
+      const m = date.getMonth() + 1;
+      divisor = meta.seasonal.winter_months?.includes(m) ? meta.seasonal.winter_divisor ?? null : meta.seasonal.summer_divisor ?? null;
+    }
+    if (!divisor && meta.formula_divisor) divisor = meta.formula_divisor;
+  }
+
+  // 자기 수량 추출 (상품명 또는 spec 에서 "N개" / "Nkg" / "Nkg±")
+  const nameStr = (myName || "") + " " + (mySpec || "");
+  const piecesMatch = nameStr.match(/(\d+)\s*개/);
+  const kgMatch = nameStr.match(/(\d+\.?\d*)\s*[kK][gG]/);
+
+  if (divisor && piecesMatch) {
+    const qty = parseInt(piecesMatch[1]);
+    return { expected: Math.ceil((boxPrice * qty / divisor) / 10) * 10, note: `×${qty}/${divisor}개` };
+  }
+
+  // kg 환산: 박스spec kg / 자기 kg
+  const boxKgMatch = (boxSpec || "").match(/(\d+\.?\d*)\s*[kK][gG]/);
+  if (boxKgMatch && kgMatch) {
+    const boxKg = parseFloat(boxKgMatch[1]);
+    const myKg = parseFloat(kgMatch[1]);
+    if (boxKg > 0 && myKg > 0) {
+      return { expected: Math.ceil((boxPrice * myKg / boxKg) / 10) * 10, note: `×${myKg}kg/${boxKg}kg` };
+    }
+  }
+
+  return null;
+}
 
 type Column = {
   key: string;
@@ -298,9 +362,22 @@ const COLUMNS: Column[] = [
   { key: "product_group", label: "그룹", group: "기본", width: "w-12", align: "center", sortable: true,
     render: (p, ctx) => {
       if (!p.product_group) return <span className="text-gray-300">-</span>;
-      // 자식 행: 들여쓰기 + 회색 (토글 버튼 없음)
+      // 학습 tier 색 dot — null=회색
+      const tier = p.learned_tier;
+      const tierDot = tier === 1
+        ? "bg-emerald-500"
+        : tier === 2 ? "bg-amber-400"
+        : tier === 3 ? "bg-rose-400"
+        : "bg-gray-300";
+      const tierTip = tier ? `학습 tier ${tier}` : "tier 미학습";
+
       if (p._isChild) {
-        return <span className="text-gray-400 text-[10px]">└ {p.product_group}</span>;
+        return (
+          <span className="text-gray-400 text-[10px] inline-flex items-center gap-0.5">
+            <span className={`inline-block w-1.5 h-1.5 rounded-full ${tierDot}`} title={tierTip} />
+            └ {p.product_group}
+          </span>
+        );
       }
       const expanded = ctx.expandedGroups?.has(p.product_group);
       return (
@@ -313,6 +390,7 @@ const COLUMNS: Column[] = [
           >
             {expanded ? "▼" : "▶"}
           </button>
+          <span className={`inline-block w-1.5 h-1.5 rounded-full ${tierDot}`} title={tierTip} />
           <span>{p.product_group}</span>
         </span>
       );
@@ -366,6 +444,24 @@ const COLUMNS: Column[] = [
     } },
   { key: "recommend_reason", label: "사유", group: "추천", width: "w-12", align: "center",
     render: (p) => {
+      // 자식 행 + 환산식 메타가 있으면 환산식 + 이상치 표시
+      if (p._isChild && p._conversionNote) {
+        const exp = p._expectedFromAnchor;
+        const delta = p._conversionDelta ?? null;
+        const ok = delta != null && Math.abs(delta) <= 0.2;
+        const icon = p._anomaly ? "⚠️" : ok ? "✓" : "";
+        const cls = p._anomaly
+          ? "text-red-600"
+          : ok ? "text-emerald-600" : "text-gray-500";
+        const tip = p._anomaly
+          ? `이상치: ${p._anomaly} (anchor ${p._anchorBoxName?.slice(0, 12) ?? ""} ${(p._anchorBoxPrice || 0).toLocaleString()}원 → 예상 ${exp?.toLocaleString() ?? "-"}원, 실제 ${(p.purchase_price || 0).toLocaleString()}원)`
+          : `${p._anchorBoxName?.slice(0, 12) ?? ""} → ${p._conversionNote} = ${exp?.toLocaleString() ?? "-"}원`;
+        return (
+          <span className={`text-[10px] ${cls}`} title={tip}>
+            {p._conversionNote} {icon}
+          </span>
+        );
+      }
       const colors: Record<string, string> = { "매입↑": "text-red-600", "하락추세": "text-blue-600", "관망": "text-amber-600", "저수익": "text-orange-600", "최소마진": "text-red-700", "유지": "text-gray-400" };
       return <span className={`text-[10px] ${colors[p.recommend_reason] || ""}`}>{p.recommend_reason || "-"}</span>;
     } },
@@ -616,34 +712,82 @@ export default function ProductsPage() {
     });
   }, [products, sortKey, sortDir, onlyChanged, onlyKeyItems, onlyLowMargin, debouncedSearch, productType]);
 
-  // 그룹 expand 가 적용된 표시용 행 배열 — 자식은 부모(처음 만난 멤버) 바로 아래에 삽입
-  // 자식은 전체 products 에서 가져옴 (필터 상태 무시 — 그룹 전체 멤버 보기 위함)
+  // 그룹 expand 가 적용된 표시용 행 배열 — 자식은 anchor 바로 아래에 삽입
+  // Phase 2: 자식에 박스→자기 환산 예상가 + 이상치 플래그 주입
   const displayRows = useMemo<ProductRow[]>(() => {
     if (expandedGroups.size === 0) return filtered as ProductRow[];
     const seenGroups = new Set<number>();
     const out: ProductRow[] = [];
     const unitOrder = (u: string | null | undefined): number =>
       u === "박스" ? 0 : u === "반박스" ? 1 : u === "망" ? 2 : u === "봉" ? 3 : u === "단" ? 4 : u === "통" ? 5 : 6;
+    const today = new Date();
     for (const p of filtered) {
       const g = p.product_group;
       if (g != null && expandedGroups.has(g)) {
-        if (seenGroups.has(g)) continue; // 이미 anchor 아래 child 로 표시됨
+        if (seenGroups.has(g)) continue;
         seenGroups.add(g);
         out.push({ ...p, _isAnchor: true });
-        const members = products
-          .filter((m) => m.product_group === g && m.product_code !== p.product_code)
+
+        // 그룹의 모든 멤버 (자기 포함)
+        const allMembers = products.filter((m) => m.product_group === g);
+
+        // 그룹 anchor 박스: pack_role=박스 + pack_meta 보유 + 매입가 > 0 인 박스 멤버 (가격 가장 비싼 박스 = T1)
+        const boxAnchors = allMembers
+          .filter((m) => m.unit === "박스" && (m.purchase_price || 0) > 0)
+          .sort((a, b) => (b.purchase_price || 0) - (a.purchase_price || 0));
+        const boxAnchor = boxAnchors[0] || null;
+
+        const members = allMembers
+          .filter((m) => m.product_code !== p.product_code)
           .sort((a, b) => {
             const ua = unitOrder(a.unit), ub = unitOrder(b.unit);
             if (ua !== ub) return ua - ub;
-            const ta = a.recommend_reason; void ta;
-            // tier 1 > 2 > 3 (낮은 숫자 우선). null 은 가장 뒤.
-            const at = (a as Product & { learned_tier?: number | null }).learned_tier;
-            const bt = (b as Product & { learned_tier?: number | null }).learned_tier;
-            const an = at ?? 9, bn = bt ?? 9;
-            if (an !== bn) return an - bn;
+            const at = a.learned_tier ?? 9, bt = b.learned_tier ?? 9;
+            if (at !== bt) return at - bt;
             return (a.product_code || "").localeCompare(b.product_code || "");
           });
-        for (const m of members) out.push({ ...m, _isChild: true });
+
+        for (const m of members) {
+          const child: ProductRow = { ...m, _isChild: true };
+
+          // 환산식 + 이상치 계산 (박스 anchor 가 있고 자기는 박스가 아닐 때)
+          if (boxAnchor && m.unit !== "박스" && (boxAnchor.purchase_price || 0) > 0) {
+            const conv = computeExpectedFromBox(
+              boxAnchor.purchase_price as number,
+              boxAnchor.spec,
+              boxAnchor.pack_meta,
+              m.unit,
+              m.spec,
+              m.product_name,
+              today,
+            );
+            if (conv) {
+              child._expectedFromAnchor = conv.expected;
+              child._conversionNote = conv.note;
+              child._anchorBoxPrice = boxAnchor.purchase_price;
+              child._anchorBoxName = boxAnchor.product_name;
+              const actual = m.purchase_price || 0;
+              if (actual > 0 && conv.expected > 0) {
+                const delta = (actual - conv.expected) / conv.expected;
+                child._conversionDelta = delta;
+                if (Math.abs(delta) > 0.2) {
+                  child._anomaly = `환산 ±${(delta * 100).toFixed(0)}%`;
+                }
+              }
+            }
+          }
+
+          // 등급 역전 감지 (학습 tier 기준): 자기 박스가 anchor 박스보다 비쌈 = 역전
+          if (m.unit === "박스" && boxAnchor && m.product_code !== boxAnchor.product_code) {
+            const aLT = boxAnchor.learned_tier;
+            const mLT = m.learned_tier;
+            if (aLT != null && mLT != null && mLT < aLT) {
+              child._anomaly = (child._anomaly ? child._anomaly + " / " : "") + "tier역전";
+            }
+          }
+
+          out.push(child);
+        }
       } else {
         out.push(p as ProductRow);
       }

@@ -463,6 +463,8 @@ export async function GET(request: Request) {
         recommend_reason: recommendReason,
 
         learned_tier: prod?.learned_tier ?? null,
+        pack_role: prod?.pack_role ?? null,
+        pack_meta: prod?.pack_meta ?? null,
 
         sinsunhang_price: sinsunhangPrice,
         sinsunhang_margin: sinsunhangMargin,
