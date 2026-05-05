@@ -519,21 +519,13 @@ const COLUMNS: Column[] = [
     render: (p) => <span className="text-gray-600">{p.spec || "-"}</span> },
   { key: "unit", label: "단위", group: "기본", width: "w-12", align: "center",
     render: (p) => p.unit || "-" },
-  // 매입가
-  { key: "prev_purchase_price", label: "기존", group: "매입가", width: "w-16", align: "right", sortable: true,
-    render: (p) => fmt(p.prev_purchase_price) },
-  { key: "purchase_price", label: "변경", group: "매입가", width: "w-16", align: "right", sortable: true,
-    render: (p) => <span className={p.change_amount !== 0 ? "font-semibold" : ""}>{fmt(p.purchase_price)}</span> },
+  // 매입가 (기존/변경/7일최고/오늘매입 컬럼 제거 — daily_purchase_prices 자동 도출로 중복)
   { key: "change_rate", label: "변동률", group: "매입가", width: "w-14", align: "right", sortable: true,
     render: (p) => <span className={changeClass(p.change_rate)}>{p.change_rate !== 0 ? (p.change_rate > 0 ? "+" : "") + pct(p.change_rate) : "-"}</span> },
   { key: "change_amount", label: "변동액", group: "매입가", width: "w-14", align: "right", sortable: true,
     render: (p) => <span className={changeClass(p.change_amount)}>{p.change_amount !== 0 ? (p.change_amount > 0 ? "+" : "") + fmt(p.change_amount) : "-"}</span> },
   { key: "purchase_prices_7d", label: "7일동향", group: "매입가", width: "w-16", align: "center",
     render: (p) => <Sparkline history={p.purchase_history_8d} fallbackPrices={p.purchase_prices_7d} /> },
-  { key: "max_price_7d", label: "7일최고", group: "매입가", width: "w-14", align: "right", sortable: true,
-    render: (p) => fmt(p.max_price_7d) },
-  { key: "today_purchase", label: "오늘매입", group: "매입가", width: "w-14", align: "right", sortable: true,
-    render: (p) => <span className={p.today_purchase ? "" : "text-gray-300"}>{fmt(p.today_purchase)}</span> },
   // 판매가
   { key: "prev_selling_price", label: "기존판매가", group: "판매가", width: "w-16", align: "right", sortable: true,
     render: (p) => fmt(p.prev_selling_price) },
@@ -995,11 +987,6 @@ export default function ProductsPage() {
         // 그룹의 모든 멤버 (자기 포함) + 박스 멤버들 (anchor 후보 풀)
         const allMembers = products.filter((m) => m.product_group === g);
 
-        // Phase 3: 차트 row 삽입 (8일 매입가 있는 멤버 2개 이상일 때)
-        const chartMembers = allMembers.filter((m) => (m.purchase_history_8d || []).some((h) => h.price != null && h.price > 0));
-        if (chartMembers.length >= 2) {
-          out.push({ _isChartRow: true, group: g, members: chartMembers });
-        }
 
         const boxAnchorPool = allMembers.filter((m) => m.unit === "박스" && (m.purchase_price || 0) > 0);
 
