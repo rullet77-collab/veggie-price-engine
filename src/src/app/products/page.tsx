@@ -292,6 +292,18 @@ type ProductRow = Product & {
   _anchorBoxName?: string | null;
 };
 
+// Phase 3: 차트 row (그룹 비교 차트)
+type ChartRow = {
+  _isChartRow: true;
+  group: number;
+  members: Product[];   // 차트에 그릴 멤버들 (모든 단위)
+};
+
+type DisplayItem = ProductRow | ChartRow;
+function isChartRow(item: DisplayItem): item is ChartRow {
+  return (item as ChartRow)._isChartRow === true;
+}
+
 // Phase 2: 환산 helper — 박스 → 자기 단위 예상가
 function computeExpectedFromBox(
   boxPrice: number,
@@ -558,12 +570,97 @@ for (const g of COL_GROUPS) {
 
 // ── Virtual scroll constants ──
 const ROW_HEIGHT = 28;
+const CHART_ROW_HEIGHT = 110;
 const MAX_TABLE_HEIGHT = 700;
 const TABLE_MIN_WIDTH = 1600;
 
+// ── Phase 3: 그룹 매입 동조 비교 차트 ──
+const CHART_COLORS = ["#ef4444", "#3b82f6", "#10b981", "#f59e0b", "#8b5cf6", "#ec4899", "#0891b2", "#84cc16"];
+
+function GroupCompareChart({ members }: { members: Product[] }) {
+  const W = 1500, H = 90, PAD = 8;
+  // 모든 멤버에서 슬롯 날짜 수집 (각 멤버 같은 8일 윈도우 가정)
+  const allDates = new Set<string>();
+  for (const m of members) {
+    for (const h of m.purchase_history_8d || []) allDates.add(h.date);
+  }
+  const dates = [...allDates].sort();
+  if (dates.length < 2) return null;
+
+  // 각 멤버 정규화 — 자기 min~max 를 0~1 스케일로 (트렌드 비교 위주)
+  type Series = { code: string; name: string; unit: string | null; tier: number | null; color: string; points: { x: number; y: number; price: number; date: string }[] };
+  const series: Series[] = members.slice(0, 8).map((m, idx) => {
+    const valid = (m.purchase_history_8d || []).filter((h) => h.price != null && (h.price as number) > 0) as Array<{ date: string; price: number; source: string }>;
+    if (valid.length < 2) return null;
+    const prices = valid.map((h) => h.price);
+    const min = Math.min(...prices), max = Math.max(...prices);
+    const range = max - min || 1;
+    const points = valid.map((h) => {
+      const dateIdx = dates.indexOf(h.date);
+      const x = PAD + (dateIdx / Math.max(dates.length - 1, 1)) * (W - PAD * 2);
+      const y = (H - PAD) - ((h.price - min) / range) * (H - PAD * 2);
+      return { x, y, price: h.price, date: h.date };
+    });
+    return {
+      code: m.product_code,
+      name: m.product_name || m.product_code,
+      unit: m.unit,
+      tier: m.learned_tier ?? null,
+      color: CHART_COLORS[idx % CHART_COLORS.length],
+      points,
+    };
+  }).filter(Boolean) as Series[];
+
+  if (series.length < 2) return null;
+
+  return (
+    <div className="flex items-center gap-3 px-3 py-2 bg-slate-50 border-b border-slate-200" style={{ minWidth: TABLE_MIN_WIDTH }}>
+      <svg width={W} height={H} className="bg-white border border-gray-200 rounded">
+        {/* x축 날짜 */}
+        {dates.map((d, i) => {
+          const x = PAD + (i / Math.max(dates.length - 1, 1)) * (W - PAD * 2);
+          return (
+            <g key={d}>
+              <line x1={x} y1={H - PAD} x2={x} y2={H - PAD + 2} stroke="#cbd5e1" />
+              <text x={x} y={H - PAD + 8} textAnchor="middle" fontSize="8" fill="#64748b">{d.slice(5)}</text>
+            </g>
+          );
+        })}
+        {series.map((s) => (
+          <g key={s.code}>
+            <polyline
+              points={s.points.map((p) => `${p.x},${p.y}`).join(" ")}
+              fill="none"
+              stroke={s.color}
+              strokeWidth="1.5"
+              opacity="0.85"
+            />
+            {s.points.map((p, i) => (
+              <circle key={i} cx={p.x} cy={p.y} r={1.8} fill={s.color}>
+                <title>{`${s.code} ${s.name} (${s.unit ?? "-"}) ${p.date.slice(5)}: ${p.price.toLocaleString()}원`}</title>
+              </circle>
+            ))}
+          </g>
+        ))}
+      </svg>
+      {/* 범례 */}
+      <div className="flex flex-col gap-0.5 text-[10px] flex-shrink-0">
+        {series.map((s) => (
+          <div key={s.code} className="flex items-center gap-1 whitespace-nowrap">
+            <span className="inline-block w-3 h-0.5" style={{ backgroundColor: s.color }} />
+            <span className="font-mono text-gray-500">{s.code}</span>
+            <span className="text-gray-700">{(s.name || "").replace(/^\*+/, "").slice(0, 14)}</span>
+            <span className="text-gray-400">{s.unit ?? ""}{s.tier ? ` T${s.tier}` : ""}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 // ── Virtual Row (for react-window v2) ──
 interface VirtualRowProps {
-  items: ProductRow[];
+  items: DisplayItem[];
   onPriceSaved: (code: string, price: number) => void;
   onMarginSaved: (code: string, margin: number) => void;
   expandedGroups: Set<number>;
@@ -576,9 +673,19 @@ function VirtualRow(props: any) {
     index: number;
     style: React.CSSProperties;
   } & VirtualRowProps;
-  const p = items[index];
-  if (!p) return null;
-  // 자식 행은 시각 구분 (얇은 들여쓰기 효과 + 옅은 배경)
+  const item = items[index];
+  if (!item) return null;
+
+  // 차트 행: 그룹 비교 차트 렌더
+  if (isChartRow(item)) {
+    return (
+      <div style={style} className="overflow-hidden">
+        <GroupCompareChart members={item.members} />
+      </div>
+    );
+  }
+
+  const p = item;
   const childBg = p._isChild ? "bg-violet-50/40" : (index % 2 === 0 ? "bg-white" : "bg-gray-50/30");
   return (
     <div
@@ -715,10 +822,11 @@ export default function ProductsPage() {
 
   // 그룹 expand 가 적용된 표시용 행 배열 — 자식은 anchor 바로 아래에 삽입
   // Phase 2: 자식에 박스→자기 환산 예상가 + 이상치 플래그 주입
-  const displayRows = useMemo<ProductRow[]>(() => {
+  // Phase 3: anchor 와 자식 사이에 차트 row 삽입 (그룹 매입 동조 시각화)
+  const displayRows = useMemo<DisplayItem[]>(() => {
     if (expandedGroups.size === 0) return filtered as ProductRow[];
     const seenGroups = new Set<number>();
-    const out: ProductRow[] = [];
+    const out: DisplayItem[] = [];
     const unitOrder = (u: string | null | undefined): number =>
       u === "박스" ? 0 : u === "반박스" ? 1 : u === "망" ? 2 : u === "봉" ? 3 : u === "단" ? 4 : u === "통" ? 5 : 6;
     const today = new Date();
@@ -731,6 +839,13 @@ export default function ProductsPage() {
 
         // 그룹의 모든 멤버 (자기 포함) + 박스 멤버들 (anchor 후보 풀)
         const allMembers = products.filter((m) => m.product_group === g);
+
+        // Phase 3: 차트 row 삽입 (8일 매입가 있는 멤버 2개 이상일 때)
+        const chartMembers = allMembers.filter((m) => (m.purchase_history_8d || []).some((h) => h.price != null && h.price > 0));
+        if (chartMembers.length >= 2) {
+          out.push({ _isChartRow: true, group: g, members: chartMembers });
+        }
+
         const boxAnchorPool = allMembers.filter((m) => m.unit === "박스" && (m.purchase_price || 0) > 0);
 
         const members = allMembers
@@ -834,6 +949,13 @@ export default function ProductsPage() {
   }, [filtered, products, expandedGroups]);
 
   const priceDate = products.length > 0 ? products[0].price_date : "";
+
+  // List 전체 높이 계산 — chart row 110px, 일반 28px
+  const totalListHeight = useMemo(() => {
+    let h = 0;
+    for (const r of displayRows) h += isChartRow(r) ? CHART_ROW_HEIGHT : ROW_HEIGHT;
+    return h;
+  }, [displayRows]);
 
   const stats = useMemo(() => {
     const total = filtered.length;
@@ -1036,13 +1158,13 @@ export default function ProductsPage() {
               }}
             >
               <List
-                defaultHeight={Math.min(displayRows.length * ROW_HEIGHT, MAX_TABLE_HEIGHT)}
+                defaultHeight={Math.min(totalListHeight, MAX_TABLE_HEIGHT)}
                 rowCount={displayRows.length}
-                rowHeight={ROW_HEIGHT}
+                rowHeight={(idx: number) => isChartRow(displayRows[idx]) ? CHART_ROW_HEIGHT : ROW_HEIGHT}
                 overscanCount={10}
                 rowComponent={VirtualRow}
                 rowProps={{ items: displayRows, onPriceSaved: handlePriceSaved, onMarginSaved: handleMarginSaved, expandedGroups, toggleGroup }}
-                style={{ height: Math.min(displayRows.length * ROW_HEIGHT, MAX_TABLE_HEIGHT), minWidth: TABLE_MIN_WIDTH }}
+                style={{ height: Math.min(totalListHeight, MAX_TABLE_HEIGHT), minWidth: TABLE_MIN_WIDTH }}
               />
             </div>
           </div>
