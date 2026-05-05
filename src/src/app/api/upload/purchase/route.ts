@@ -1,5 +1,6 @@
 import { createClient } from "@supabase/supabase-js";
 import * as XLSX from "xlsx";
+import { rollSellingPrices } from "@/lib/rollSellingPrices";
 
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -203,11 +204,22 @@ export async function POST(request: Request) {
       console.warn("learn_tiers 호출 실패 (학습 갱신은 다음 업로드 때 재시도):", e);
     }
 
+    // selling_price 라이프사이클 자동 갱신
+    // 1. prev_selling_price ← COALESCE(selling, recommended)
+    // 2. recommended_price ← Phase 1~5-A 산출
+    let rolled: { prev_rolled: number; recommended_set: number; duration_ms: number } | null = null;
+    try {
+      rolled = await rollSellingPrices(supabase);
+    } catch (e) {
+      console.warn("rollSellingPrices 실패 (다음 업로드 때 재시도):", e);
+    }
+
     return Response.json({
       success: true,
       total: rows.length,
       inserted,
       learned_tiers: learned,
+      rolled_selling: rolled,
     });
   } catch (err: unknown) {
     console.error("Upload error:", err);

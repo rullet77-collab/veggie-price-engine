@@ -37,7 +37,7 @@ type Product = {
   }>;
 
   prev_selling_price: number | null;
-  selling_price: number;
+  selling_price: number | null;   // NULL = 추천가 자동 적용
   margin_rate: number;
 
   target_price: number | null;
@@ -277,6 +277,104 @@ function EditableCell({
   );
 }
 
+// ── 사용자 수동 selling_price 셀 (NULL 허용 + 추천가 placeholder) ──
+function SellingPriceCell({
+  value,
+  recommended,
+  productCode,
+  onSaved,
+}: {
+  value: number | null;
+  recommended: number | null;
+  productCode: string;
+  onSaved: (code: string, newValue: number) => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(value != null ? String(value) : "");
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (editing) {
+      inputRef.current?.focus();
+      inputRef.current?.select();
+    }
+  }, [editing]);
+
+  const save = async () => {
+    const trimmed = draft.trim();
+    let newVal: number | null = null;
+    if (trimmed !== "") {
+      const n = Math.round(Number(trimmed));
+      if (isNaN(n) || n < 0) {
+        setDraft(value != null ? String(value) : "");
+        setEditing(false);
+        return;
+      }
+      newVal = n;
+    }
+    if (newVal === value) {
+      setEditing(false);
+      return;
+    }
+    try {
+      const res = await fetch("/api/products/update-selling-price", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ product_code: productCode, selling_price: newVal }),
+      });
+      if (res.ok) {
+        // newVal 이 null 일 수도 있어 onSaved 시그니처에 0 전달 (실제 DB는 NULL).
+        // 다음 fetchData 에서 정확한 값으로 재동기화됨. 일단 즉시 시각 업데이트.
+        onSaved(productCode, newVal ?? 0);
+      }
+    } catch {
+      // ignore
+    }
+    setEditing(false);
+  };
+
+  if (editing) {
+    return (
+      <input
+        ref={inputRef}
+        type="number"
+        step="1"
+        value={draft}
+        placeholder={recommended ? recommended.toLocaleString() : ""}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={save}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") save();
+          if (e.key === "Escape") { setDraft(value != null ? String(value) : ""); setEditing(false); }
+        }}
+        className="w-16 px-1 py-0 text-xs text-right border border-blue-400 rounded bg-blue-50 outline-none"
+      />
+    );
+  }
+
+  // 표시: 사용자 입력 우선, 없으면 추천가 회색 표시
+  if (value != null && value > 0) {
+    return (
+      <span
+        onClick={() => { setDraft(String(value)); setEditing(true); }}
+        className="cursor-pointer hover:bg-yellow-100 px-1 py-0.5 rounded font-semibold"
+        title="클릭하여 편집 (빈 값으로 저장하면 추천가 자동 적용)"
+      >
+        {fmt(value)}
+      </span>
+    );
+  }
+  return (
+    <span
+      onClick={() => { setDraft(""); setEditing(true); }}
+      className="cursor-pointer hover:bg-yellow-100 px-1 py-0.5 rounded text-gray-400"
+      title="추천가 자동 적용 중. 클릭하여 수동 입력"
+    >
+      {recommended != null && recommended > 0 ? `(${fmt(recommended)})` : "-"}
+    </span>
+  );
+}
+
 // ── Column definitions ──
 
 // 그룹 expand UI 상태가 행에 주입됨 — 자식 표시용
@@ -440,7 +538,14 @@ const COLUMNS: Column[] = [
   { key: "prev_selling_price", label: "기존판매가", group: "판매가", width: "w-16", align: "right", sortable: true,
     render: (p) => fmt(p.prev_selling_price) },
   { key: "selling_price", label: "판매가", group: "판매가", width: "w-20", align: "right", sortable: true,
-    render: (p, { onPriceSaved }) => <EditableCell value={p.selling_price} productCode={p.product_code} apiUrl="/api/products/update-selling-price" fieldName="selling_price" onSaved={onPriceSaved} /> },
+    render: (p, { onPriceSaved }) => (
+      <SellingPriceCell
+        value={p.selling_price}
+        recommended={p.recommended_price}
+        productCode={p.product_code}
+        onSaved={onPriceSaved}
+      />
+    ) },
   { key: "margin_rate", label: "수익률", group: "판매가", width: "w-14", align: "right", sortable: true,
     render: (p) => <span className={marginClass(p.margin_rate)}>{pct(p.margin_rate)}</span> },
   // 수익률일괄변경
@@ -451,8 +556,13 @@ const COLUMNS: Column[] = [
   // Claude 추천
   { key: "recommended_price", label: "추천가", group: "추천", width: "w-16", align: "right", sortable: true,
     render: (p) => {
-      if (!p.recommended_price || !p.selling_price) return <span className="text-gray-300">-</span>;
-      const diff = p.recommended_price - p.selling_price;
+      if (!p.recommended_price) return <span className="text-gray-300">-</span>;
+      // 사용자 selling_price 가 있으면 그것과 비교, 없으면 그냥 표시
+      const compareTo = p.selling_price ?? null;
+      if (compareTo == null) {
+        return <span className="text-gray-700">{fmt(p.recommended_price)}</span>;
+      }
+      const diff = p.recommended_price - compareTo;
       return <span className={diff > 0 ? "text-red-600 font-semibold" : diff < 0 ? "text-blue-600 font-semibold" : "text-gray-500"}>{fmt(p.recommended_price)}</span>;
     } },
   { key: "recommend_reason", label: "사유", group: "추천", width: "w-12", align: "center",

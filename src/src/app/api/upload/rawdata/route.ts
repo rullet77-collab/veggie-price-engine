@@ -1,4 +1,5 @@
 import { createClient } from "@supabase/supabase-js";
+import { rollSellingPrices } from "@/lib/rollSellingPrices";
 import * as XLSX from "xlsx";
 
 const supabase = createClient(
@@ -627,25 +628,30 @@ export async function POST(request: Request) {
       );
     }
 
-    // 매입 데이터 영향이 있는 시트(상품별매입현황)가 처리되면 학습 tier 재계산
+    // 매입 데이터 영향이 있는 시트(상품별매입현황)가 처리되면 학습 tier 재계산 + selling_price 라이프사이클 갱신
     const hasPurchaseChange = results.some((r) =>
       r.type.includes("매입현황") || r.type.includes("매입상세")
     );
     let learned: { updated: number; tier1: number; tier2: number; tier3: number } | null = null;
+    let rolled: { prev_rolled: number; recommended_set: number; duration_ms: number } | null = null;
     if (hasPurchaseChange) {
       try {
         const { data: tierData, error: tierErr } = await supabase.rpc("learn_tiers", { days: 365 });
-        if (tierErr) {
-          console.warn("learn_tiers RPC 경고:", tierErr.message);
-        } else if (Array.isArray(tierData) && tierData.length > 0) {
+        if (tierErr) console.warn("learn_tiers RPC 경고:", tierErr.message);
+        else if (Array.isArray(tierData) && tierData.length > 0) {
           learned = tierData[0] as { updated: number; tier1: number; tier2: number; tier3: number };
         }
       } catch (e) {
         console.warn("learn_tiers 호출 실패:", e);
       }
+      try {
+        rolled = await rollSellingPrices(supabase);
+      } catch (e) {
+        console.warn("rollSellingPrices 실패:", e);
+      }
     }
 
-    return Response.json({ success: true, results, learned_tiers: learned });
+    return Response.json({ success: true, results, learned_tiers: learned, rolled_selling: rolled });
   } catch (err: unknown) {
     console.error("Upload error:", err);
     const message = err instanceof Error ? err.message : "알 수 없는 오류";

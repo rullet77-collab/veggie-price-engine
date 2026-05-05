@@ -112,12 +112,15 @@ export async function GET(request: Request) {
     // 4) 플랫폼 판매가 + 월별 매출 통계
     // current_month_qty, prev_3month_pct 는 DB에 저장하지 않고 매번 계산 (single source of truth: monthly_sales_quantity)
     type SellingRow = {
-      product_code: string; selling_price: number; prev_selling_price: number | null;
+      product_code: string;
+      selling_price: number | null;
+      prev_selling_price: number | null;
+      recommended_price: number | null;
       month_1_qty: number | null; month_2_qty: number | null; month_3_qty: number | null;
     };
     const sellingData = await fetchAll<SellingRow>(
       "product_selling_prices",
-      "product_code,selling_price,prev_selling_price,month_1_qty,month_2_qty,month_3_qty"
+      "product_code,selling_price,prev_selling_price,recommended_price,month_1_qty,month_2_qty,month_3_qty"
     );
     const sellingMap = new Map<string, SellingRow>();
     for (const s of sellingData) sellingMap.set(s.product_code, s);
