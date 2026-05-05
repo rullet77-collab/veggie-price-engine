@@ -462,6 +462,8 @@ export async function GET(request: Request) {
         recommended_margin: recommendedMargin,
         recommend_reason: recommendReason,
 
+        learned_tier: prod?.learned_tier ?? null,
+
         sinsunhang_price: sinsunhangPrice,
         sinsunhang_margin: sinsunhangMargin,
         baemin_price: baeminPrice,

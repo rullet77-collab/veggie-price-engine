@@ -56,6 +56,7 @@ type Product = {
   month_3_qty: number | null;
   current_month_qty: number | null;
   prev_3month_pct: string | null;
+  learned_tier?: number | null;
 };
 
 type SortKey = keyof Product;
@@ -275,22 +276,47 @@ function EditableCell({
 
 // ── Column definitions ──
 
+// 그룹 expand UI 상태가 행에 주입됨 — 자식 표시용
+type ProductRow = Product & { _isChild?: boolean; _isAnchor?: boolean };
+
 type Column = {
   key: string;
   label: string;
   group: string;
   width: string;
   align?: "left" | "right" | "center";
-  render: (p: Product, callbacks: {
+  render: (p: ProductRow, callbacks: {
     onPriceSaved: (code: string, price: number) => void;
     onMarginSaved: (code: string, margin: number) => void;
+    expandedGroups?: Set<number>;
+    toggleGroup?: (g: number) => void;
   }) => React.ReactNode;
   sortable?: boolean;
 };
 
 const COLUMNS: Column[] = [
   { key: "product_group", label: "그룹", group: "기본", width: "w-12", align: "center", sortable: true,
-    render: (p) => p.product_group ?? "-" },
+    render: (p, ctx) => {
+      if (!p.product_group) return <span className="text-gray-300">-</span>;
+      // 자식 행: 들여쓰기 + 회색 (토글 버튼 없음)
+      if (p._isChild) {
+        return <span className="text-gray-400 text-[10px]">└ {p.product_group}</span>;
+      }
+      const expanded = ctx.expandedGroups?.has(p.product_group);
+      return (
+        <span className="inline-flex items-center gap-0.5">
+          <button
+            type="button"
+            onClick={(e) => { e.stopPropagation(); ctx.toggleGroup?.(p.product_group!); }}
+            className="text-gray-400 hover:text-blue-600 cursor-pointer text-[8px] font-mono w-2.5 leading-none select-none"
+            title={expanded ? "그룹 접기" : "그룹 멤버 펼치기"}
+          >
+            {expanded ? "▼" : "▶"}
+          </button>
+          <span>{p.product_group}</span>
+        </span>
+      );
+    } },
   { key: "product_code", label: "코드", group: "기본", width: "w-16", sortable: true,
     render: (p) => <span className="font-mono text-xs">{p.product_code}</span> },
   { key: "product_name", label: "상품명", group: "기본", width: "w-44", sortable: true,
@@ -440,25 +466,29 @@ const TABLE_MIN_WIDTH = 1600;
 
 // ── Virtual Row (for react-window v2) ──
 interface VirtualRowProps {
-  items: Product[];
+  items: ProductRow[];
   onPriceSaved: (code: string, price: number) => void;
   onMarginSaved: (code: string, margin: number) => void;
+  expandedGroups: Set<number>;
+  toggleGroup: (g: number) => void;
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function VirtualRow(props: any) {
-  const { index, style, items, onPriceSaved, onMarginSaved } = props as {
+  const { index, style, items, onPriceSaved, onMarginSaved, expandedGroups, toggleGroup } = props as {
     index: number;
     style: React.CSSProperties;
   } & VirtualRowProps;
   const p = items[index];
   if (!p) return null;
+  // 자식 행은 시각 구분 (얇은 들여쓰기 효과 + 옅은 배경)
+  const childBg = p._isChild ? "bg-violet-50/40" : (index % 2 === 0 ? "bg-white" : "bg-gray-50/30");
   return (
     <div
       style={style}
-      className={`flex items-center border-b border-gray-100 hover:bg-blue-50/30 text-xs whitespace-nowrap ${
-        index % 2 === 0 ? "bg-white" : "bg-gray-50/30"
-      } ${p.change_amount !== 0 ? "bg-yellow-50/40" : ""}`}
+      className={`flex items-center border-b border-gray-100 hover:bg-blue-50/30 text-xs whitespace-nowrap ${childBg} ${
+        p.change_amount !== 0 && !p._isChild ? "bg-yellow-50/40" : ""
+      }`}
     >
       {COLUMNS.map((col) => (
         <div
@@ -466,7 +496,7 @@ function VirtualRow(props: any) {
           className={`flex-shrink-0 px-2 py-1 ${col.align === "right" ? "text-right" : col.align === "center" ? "text-center" : "text-left"}`}
           style={{ width: COL_WIDTHS[col.key] || 60 }}
         >
-          {col.render(p, { onPriceSaved, onMarginSaved })}
+          {col.render(p, { onPriceSaved, onMarginSaved, expandedGroups, toggleGroup })}
         </div>
       ))}
     </div>
@@ -488,9 +518,19 @@ export default function ProductsPage() {
   const [onlyKeyItems, setOnlyKeyItems] = useState(false);
   const [onlyLowMargin, setOnlyLowMargin] = useState(false);
   const [bulkApplying, setBulkApplying] = useState(false);
+  const [expandedGroups, setExpandedGroups] = useState<Set<number>>(new Set());
 
   const headerRef = useRef<HTMLDivElement>(null);
   const bodyRef = useRef<HTMLDivElement>(null);
+
+  const toggleGroup = useCallback((g: number) => {
+    setExpandedGroups((prev) => {
+      const next = new Set(prev);
+      if (next.has(g)) next.delete(g);
+      else next.add(g);
+      return next;
+    });
+  }, []);
 
   // 검색 디바운스 (300ms)
   useEffect(() => {
@@ -575,6 +615,41 @@ export default function ProductsPage() {
       return sortDir === "asc" ? cmp : -cmp;
     });
   }, [products, sortKey, sortDir, onlyChanged, onlyKeyItems, onlyLowMargin, debouncedSearch, productType]);
+
+  // 그룹 expand 가 적용된 표시용 행 배열 — 자식은 부모(처음 만난 멤버) 바로 아래에 삽입
+  // 자식은 전체 products 에서 가져옴 (필터 상태 무시 — 그룹 전체 멤버 보기 위함)
+  const displayRows = useMemo<ProductRow[]>(() => {
+    if (expandedGroups.size === 0) return filtered as ProductRow[];
+    const seenGroups = new Set<number>();
+    const out: ProductRow[] = [];
+    const unitOrder = (u: string | null | undefined): number =>
+      u === "박스" ? 0 : u === "반박스" ? 1 : u === "망" ? 2 : u === "봉" ? 3 : u === "단" ? 4 : u === "통" ? 5 : 6;
+    for (const p of filtered) {
+      const g = p.product_group;
+      if (g != null && expandedGroups.has(g)) {
+        if (seenGroups.has(g)) continue; // 이미 anchor 아래 child 로 표시됨
+        seenGroups.add(g);
+        out.push({ ...p, _isAnchor: true });
+        const members = products
+          .filter((m) => m.product_group === g && m.product_code !== p.product_code)
+          .sort((a, b) => {
+            const ua = unitOrder(a.unit), ub = unitOrder(b.unit);
+            if (ua !== ub) return ua - ub;
+            const ta = a.recommend_reason; void ta;
+            // tier 1 > 2 > 3 (낮은 숫자 우선). null 은 가장 뒤.
+            const at = (a as Product & { learned_tier?: number | null }).learned_tier;
+            const bt = (b as Product & { learned_tier?: number | null }).learned_tier;
+            const an = at ?? 9, bn = bt ?? 9;
+            if (an !== bn) return an - bn;
+            return (a.product_code || "").localeCompare(b.product_code || "");
+          });
+        for (const m of members) out.push({ ...m, _isChild: true });
+      } else {
+        out.push(p as ProductRow);
+      }
+    }
+    return out;
+  }, [filtered, products, expandedGroups]);
 
   const priceDate = products.length > 0 ? products[0].price_date : "";
 
@@ -779,13 +854,13 @@ export default function ProductsPage() {
               }}
             >
               <List
-                defaultHeight={Math.min(filtered.length * ROW_HEIGHT, MAX_TABLE_HEIGHT)}
-                rowCount={filtered.length}
+                defaultHeight={Math.min(displayRows.length * ROW_HEIGHT, MAX_TABLE_HEIGHT)}
+                rowCount={displayRows.length}
                 rowHeight={ROW_HEIGHT}
                 overscanCount={10}
                 rowComponent={VirtualRow}
-                rowProps={{ items: filtered, onPriceSaved: handlePriceSaved, onMarginSaved: handleMarginSaved }}
-                style={{ height: Math.min(filtered.length * ROW_HEIGHT, MAX_TABLE_HEIGHT), minWidth: TABLE_MIN_WIDTH }}
+                rowProps={{ items: displayRows, onPriceSaved: handlePriceSaved, onMarginSaved: handleMarginSaved, expandedGroups, toggleGroup }}
+                style={{ height: Math.min(displayRows.length * ROW_HEIGHT, MAX_TABLE_HEIGHT), minWidth: TABLE_MIN_WIDTH }}
               />
             </div>
           </div>
