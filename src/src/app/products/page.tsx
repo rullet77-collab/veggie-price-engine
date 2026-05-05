@@ -577,7 +577,17 @@ const TABLE_MIN_WIDTH = 1600;
 // ── Phase 3: 그룹 매입 동조 비교 차트 ──
 const CHART_COLORS = ["#ef4444", "#3b82f6", "#10b981", "#f59e0b", "#8b5cf6", "#ec4899", "#0891b2", "#84cc16"];
 
-function GroupCompareChart({ members }: { members: Product[] }) {
+function GroupCompareChart({
+  group,
+  members,
+  onBulkApply,
+  applying,
+}: {
+  group: number;
+  members: Product[];
+  onBulkApply?: (group: number, members: Product[]) => void;
+  applying?: boolean;
+}) {
   const W = 1500, H = 90, PAD = 8;
   // 모든 멤버에서 슬롯 날짜 수집 (각 멤버 같은 8일 윈도우 가정)
   const allDates = new Set<string>();
@@ -654,6 +664,33 @@ function GroupCompareChart({ members }: { members: Product[] }) {
           </div>
         ))}
       </div>
+      {/* Phase 4-a: 그룹 일괄 액션 패널 */}
+      {(() => {
+        const candidates = members.filter((m) => (m.recommended_price ?? 0) > 0 && m.recommended_price !== m.selling_price);
+        if (candidates.length === 0 || !onBulkApply) {
+          return (
+            <div className="flex flex-col items-end gap-1 ml-auto text-[10px] text-gray-400">
+              <span>일괄 적용 대상 없음</span>
+            </div>
+          );
+        }
+        return (
+          <div className="flex flex-col items-end gap-1 ml-auto text-[10px]">
+            <span className="text-gray-500">그룹 일괄 액션</span>
+            <button
+              type="button"
+              disabled={applying}
+              onClick={() => onBulkApply(group, candidates)}
+              className={`px-2 py-1 rounded text-white whitespace-nowrap ${
+                applying ? "bg-gray-300 cursor-wait" : "bg-emerald-600 hover:bg-emerald-700"
+              }`}
+              title={candidates.map((c) => `${c.product_code} ${c.selling_price?.toLocaleString()}→${c.recommended_price?.toLocaleString()}`).join("\n")}
+            >
+              추천가 일괄 적용 ({candidates.length})
+            </button>
+          </div>
+        );
+      })()}
     </div>
   );
 }
@@ -665,22 +702,29 @@ interface VirtualRowProps {
   onMarginSaved: (code: string, margin: number) => void;
   expandedGroups: Set<number>;
   toggleGroup: (g: number) => void;
+  onGroupBulkApply?: (group: number, members: Product[]) => void;
+  applyingGroup?: number | null;
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function VirtualRow(props: any) {
-  const { index, style, items, onPriceSaved, onMarginSaved, expandedGroups, toggleGroup } = props as {
+  const { index, style, items, onPriceSaved, onMarginSaved, expandedGroups, toggleGroup, onGroupBulkApply, applyingGroup } = props as {
     index: number;
     style: React.CSSProperties;
   } & VirtualRowProps;
   const item = items[index];
   if (!item) return null;
 
-  // 차트 행: 그룹 비교 차트 렌더
+  // 차트 행: 그룹 비교 차트 + 일괄 액션 렌더
   if (isChartRow(item)) {
     return (
       <div style={style} className="overflow-hidden">
-        <GroupCompareChart members={item.members} />
+        <GroupCompareChart
+          group={item.group}
+          members={item.members}
+          onBulkApply={onGroupBulkApply}
+          applying={applyingGroup === item.group}
+        />
       </div>
     );
   }
@@ -722,6 +766,7 @@ export default function ProductsPage() {
   const [onlyKeyItems, setOnlyKeyItems] = useState(false);
   const [onlyLowMargin, setOnlyLowMargin] = useState(false);
   const [bulkApplying, setBulkApplying] = useState(false);
+  const [applyingGroup, setApplyingGroup] = useState<number | null>(null);
   const [expandedGroups, setExpandedGroups] = useState<Set<number>>(new Set());
 
   const headerRef = useRef<HTMLDivElement>(null);
@@ -1033,6 +1078,52 @@ export default function ProductsPage() {
     return ["전체", ...Array.from(cats).sort()] as string[];
   }, [products]);
 
+  // Phase 4-a: 그룹 단위 추천가 일괄 적용
+  const handleGroupBulkApply = useCallback(async (group: number, candidates: Product[]) => {
+    const targets = candidates.filter((c) => (c.recommended_price ?? 0) > 0 && c.recommended_price !== c.selling_price);
+    if (targets.length === 0) {
+      alert("적용 대상이 없습니다.");
+      return;
+    }
+    const sample = targets.slice(0, 5).map((p) => `  • ${p.product_name} (${p.product_code}): ${fmt(p.selling_price)} → ${fmt(p.recommended_price)}`).join("\n");
+    const more = targets.length > 5 ? `\n  ... 외 ${targets.length - 5}개` : "";
+    const ok = window.confirm(`그룹 ${group} 의 ${targets.length}개 상품 판매가를 추천가로 변경합니다.\n\n${sample}${more}\n\n계속하시겠습니까?`);
+    if (!ok) return;
+
+    setApplyingGroup(group);
+    try {
+      const pd = products[0]?.price_date;
+      if (!pd) throw new Error("price_date 없음");
+      const res = await fetch("/api/products/batch-update", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          updates: targets.map((p) => ({ product_code: p.product_code, selling_price: p.recommended_price! })),
+          price_date: pd,
+        }),
+      });
+      const data = await res.json();
+      if (!data.success) {
+        alert(`적용 실패: ${data.error || "오류"}`);
+        return;
+      }
+      // 로컬 state 갱신 (재요청 없이)
+      setProducts((prev) =>
+        prev.map((p) => {
+          const t = targets.find((x) => x.product_code === p.product_code);
+          if (!t) return p;
+          const newPrice = t.recommended_price!;
+          const newMargin = newPrice > 0 && (p.purchase_price || 0) > 0 ? 1 - (p.purchase_price as number) / newPrice : 0;
+          return { ...p, selling_price: newPrice, margin_rate: newMargin };
+        })
+      );
+    } catch (e) {
+      alert(`오류: ${(e as Error).message}`);
+    } finally {
+      setApplyingGroup(null);
+    }
+  }, [products]);
+
   return (
     <div className="min-h-screen bg-gray-50">
       <main className="max-w-[1800px] mx-auto px-4 py-4">
@@ -1163,7 +1254,7 @@ export default function ProductsPage() {
                 rowHeight={(idx: number) => isChartRow(displayRows[idx]) ? CHART_ROW_HEIGHT : ROW_HEIGHT}
                 overscanCount={10}
                 rowComponent={VirtualRow}
-                rowProps={{ items: displayRows, onPriceSaved: handlePriceSaved, onMarginSaved: handleMarginSaved, expandedGroups, toggleGroup }}
+                rowProps={{ items: displayRows, onPriceSaved: handlePriceSaved, onMarginSaved: handleMarginSaved, expandedGroups, toggleGroup, onGroupBulkApply: handleGroupBulkApply, applyingGroup }}
                 style={{ height: Math.min(totalListHeight, MAX_TABLE_HEIGHT), minWidth: TABLE_MIN_WIDTH }}
               />
             </div>
