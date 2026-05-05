@@ -27,6 +27,7 @@ export type GroupMember = {
   pack_meta: PackMeta | null;
   unit: string | null;                   // "박스", "봉", "통", "개", "kg" 등
   spec?: string | null;                  // 규격 ("박스/±5kg", "반박스/10kg", "1kg" 등) — Layer 4-B 단위환산용
+  learned_tier?: number | null;          // 1/2/3 (그룹·unit 내 365일 학습 tier)
   short_history: PriceHistory[];         // 8일 이력
   long_history: PriceHistory[];          // 60일 이력 (장기 참조용)
 };
@@ -48,6 +49,7 @@ export type AiRecInput = {
   unit?: string;                         // 내 단위
   product_name?: string | null;          // Layer 4-B 등급키 매칭용
   spec?: string | null;                  // Layer 4-B kg 환산용
+  learned_tier?: number | null;          // 365일 학습 tier (1=top/2=mid/3=low)
 
   short_history: PriceHistory[]; // 8일
   long_history: PriceHistory[]; // 60일 (선택)
@@ -858,7 +860,8 @@ function inferFromSameGradeMember(
   myUnit: string | null | undefined,
   mySpec: string | null | undefined,
   members: GroupMember[],
-  myReferencePrice: number = 0
+  myReferencePrice: number = 0,
+  myLearnedTier: number | null = null
 ): GroupEstimateResult | null {
   const myTokens = tokenizeName(myName);
   if (myTokens.length === 0) return null;
@@ -882,16 +885,22 @@ function inferFromSameGradeMember(
   }
   if (candidates.length === 0) return null;
 
-  const myTier = getGradeTier(myName);
+  const myKeyTier = getGradeTier(myName);
   candidates.sort((a, b) => {
     if (a.score !== b.score) return b.score - a.score;
-    // 같은 unit 우선 (박스↔박스 → 박스↔봉/반박스 보다 신뢰도 높음)
+    // 같은 unit 우선
     const aUnitMatch = a.member.unit === myUnit ? 0 : 1;
     const bUnitMatch = b.member.unit === myUnit ? 0 : 1;
     if (aUnitMatch !== bUnitMatch) return aUnitMatch - bUnitMatch;
-    // 등급 tier diff (특/상/일반/보통/파지, 1호/2호/3호 등 hierarchy)
-    const aTierDiff = Math.abs(getGradeTier(a.member.product_name) - myTier);
-    const bTierDiff = Math.abs(getGradeTier(b.member.product_name) - myTier);
+    // 학습 tier diff 우선 (양쪽 다 있을 때) — 365일 매입 데이터 기반 ranking
+    if (myLearnedTier != null && a.member.learned_tier != null && b.member.learned_tier != null) {
+      const aLD = Math.abs(a.member.learned_tier - myLearnedTier);
+      const bLD = Math.abs(b.member.learned_tier - myLearnedTier);
+      if (aLD !== bLD) return aLD - bLD;
+    }
+    // fallback: 키워드 기반 등급 tier diff
+    const aTierDiff = Math.abs(getGradeTier(a.member.product_name) - myKeyTier);
+    const bTierDiff = Math.abs(getGradeTier(b.member.product_name) - myKeyTier);
     if (aTierDiff !== bTierDiff) return aTierDiff - bTierDiff;
     if (myReferencePrice > 0) {
       const aDiff = Math.abs(a.latest.price / a.conv.ratio - myReferencePrice);
@@ -926,13 +935,14 @@ function estimateFromGroupMembers(
   myHistory: PriceHistory[],
   members: GroupMember[],
   date: Date,
-  myReferencePrice: number = 0
+  myReferencePrice: number = 0,
+  myLearnedTier: number | null = null
 ): GroupEstimateResult | null {
   if (members.length === 0) return null;
 
   // ── Layer 4-B 우선 시도: 토큰 점수 매칭 + 단위환산 (xlsx 밖 상품 간 가격 유추)
   // pack_role 없는 케이스(005045 ↔ 007751 같은 별개매입 페어)에 작동
-  const sameGrade = inferFromSameGradeMember(myName, myUnit, mySpec, members, myReferencePrice);
+  const sameGrade = inferFromSameGradeMember(myName, myUnit, mySpec, members, myReferencePrice, myLearnedTier);
   if (sameGrade) return sameGrade;
 
   // Case A: 나는 관계식 있고, 같은 그룹에 다른 관계식 품목이 최근 매입있음
@@ -1000,9 +1010,9 @@ function estimateFromGroupMembers(
   }
 
   // Case B: 관계식 환산 실패 or 나는 관계식 없음 → 변동률 교차참조
-  // 정렬: 토큰 점수 ↓ → 같은 unit 우선 → 등급 tier diff ↑ → 가격 유사도 ↑ → 이력 길이 ↓
+  // 정렬: 토큰 점수 ↓ → 같은 unit 우선 → 학습 tier diff ↑ → 키워드 tier diff ↑ → 가격 유사도 ↑ → 이력 길이 ↓
   const myTokensForSort = tokenizeName(myName);
-  const myTierForSort = getGradeTier(myName);
+  const myKeyTierForSort = getGradeTier(myName);
   const candidates = members
     .filter((m) => m.short_history.some((h) => h.price > 0))
     .sort((a, b) => {
@@ -1012,8 +1022,15 @@ function estimateFromGroupMembers(
       const aUnitMatch = a.unit === myUnit ? 0 : 1;
       const bUnitMatch = b.unit === myUnit ? 0 : 1;
       if (aUnitMatch !== bUnitMatch) return aUnitMatch - bUnitMatch;
-      const aTierDiff = Math.abs(getGradeTier(a.product_name) - myTierForSort);
-      const bTierDiff = Math.abs(getGradeTier(b.product_name) - myTierForSort);
+      // 학습 tier 우선 (양쪽 다 있을 때)
+      if (myLearnedTier != null && a.learned_tier != null && b.learned_tier != null) {
+        const aLD = Math.abs(a.learned_tier - myLearnedTier);
+        const bLD = Math.abs(b.learned_tier - myLearnedTier);
+        if (aLD !== bLD) return aLD - bLD;
+      }
+      // 키워드 tier diff fallback
+      const aTierDiff = Math.abs(getGradeTier(a.product_name) - myKeyTierForSort);
+      const bTierDiff = Math.abs(getGradeTier(b.product_name) - myKeyTierForSort);
       if (aTierDiff !== bTierDiff) return aTierDiff - bTierDiff;
       if (myReferencePrice > 0) {
         const aLatest = [...a.short_history].reverse().find((h) => h.price > 0)?.price ?? 0;
@@ -1167,7 +1184,8 @@ export function calculateAiRecommendation(input: AiRecInput): AiRecOutput {
       short_history,
       group_members || [],
       analysisDate,
-      myReferencePrice
+      myReferencePrice,
+      input.learned_tier ?? null
     );
   }
 

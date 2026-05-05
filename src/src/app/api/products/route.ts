@@ -82,7 +82,7 @@ export async function GET(request: Request) {
       (q) => q.eq("price_date", priceDate)
     );
 
-    // 3) products 마스터 (Phase 5-A: pack_role, pack_meta 포함 / Layer 4-B: spec 포함)
+    // 3) products 마스터 (Phase 5-A: pack_role, pack_meta / Layer 4-B: spec / 학습 tier)
     type ProdRow = {
       product_code: string; product_group: number | null;
       is_key_item: boolean; target_margin_rate: number | null;
@@ -91,10 +91,11 @@ export async function GET(request: Request) {
       pack_role: string | null; pack_meta: unknown;
       product_name: string | null; unit: string | null;
       spec: string | null;
+      learned_tier: number | null;
     };
     const productsData = await fetchAll<ProdRow>(
       "products",
-      "product_code,product_group,is_key_item,target_margin_rate,is_event_item,product_type,price_sensitivity,pack_role,pack_meta,product_name,unit,spec"
+      "product_code,product_group,is_key_item,target_margin_rate,is_event_item,product_type,price_sensitivity,pack_role,pack_meta,product_name,unit,spec,learned_tier"
     );
     const productMap = new Map<string, ProdRow>();
     for (const p of productsData) productMap.set(p.product_code, p);
@@ -241,7 +242,6 @@ export async function GET(request: Request) {
       const todayPurchase = ph?.todayPrice || null;
 
       // 7일 동향 슬롯 (8개 날짜) — 실제 매입(actual) + 토큰 매칭 단위환산(inferred) 병합
-      // 후보 빌드: 토큰 점수 + 단위환산 비율 + 등급 tier + 최신 매입가
       type GradeAnchor = {
         code: string;
         name: string;
@@ -249,10 +249,12 @@ export async function GET(request: Request) {
         score: number;
         latestPrice: number;
         unitMatch: number;
-        tierDiff: number;
+        keyTierDiff: number;
+        learnedTier: number | null;
       };
       const myTokens = tokenizeName(row.product_name);
-      const myTier = getGradeTier(row.product_name);
+      const myKeyTier = getGradeTier(row.product_name);
+      const myLearnedTier = prod?.learned_tier ?? null;
       const sameGradeAnchors: GradeAnchor[] = [];
       if (myTokens.length > 0 && prod?.product_group) {
         const grpMembers = groupMembersMap.get(prod.product_group) || [];
@@ -274,17 +276,25 @@ export async function GET(request: Request) {
             score,
             latestPrice,
             unitMatch: m.unit === row.unit ? 0 : 1,
-            tierDiff: Math.abs(getGradeTier(m.product_name) - myTier),
+            keyTierDiff: Math.abs(getGradeTier(m.product_name) - myKeyTier),
+            learnedTier: m.learned_tier ?? null,
           });
         }
       }
 
-      // 정렬: 토큰 점수 ↓ → 같은 unit 우선 → 등급 tier diff ↑ → 가격 유사도 ↑ → product_code ↑
+      // 정렬: 토큰 점수 ↓ → 같은 unit 우선 → 학습 tier diff ↑ → 키워드 tier diff ↑ → 가격 유사도 ↑ → product_code ↑
       const myRefPrice = purchasePrice > 0 ? purchasePrice : prevPurchase > 0 ? prevPurchase : 0;
       sameGradeAnchors.sort((a, b) => {
         if (a.score !== b.score) return b.score - a.score;
         if (a.unitMatch !== b.unitMatch) return a.unitMatch - b.unitMatch;
-        if (a.tierDiff !== b.tierDiff) return a.tierDiff - b.tierDiff;
+        // 학습 tier diff (양쪽 다 있을 때 우선)
+        if (myLearnedTier != null && a.learnedTier != null && b.learnedTier != null) {
+          const aLD = Math.abs(a.learnedTier - myLearnedTier);
+          const bLD = Math.abs(b.learnedTier - myLearnedTier);
+          if (aLD !== bLD) return aLD - bLD;
+        }
+        // 키워드 tier diff fallback
+        if (a.keyTierDiff !== b.keyTierDiff) return a.keyTierDiff - b.keyTierDiff;
         if (myRefPrice > 0 && a.latestPrice > 0 && b.latestPrice > 0) {
           const aDiff = Math.abs(a.latestPrice / a.ratio - myRefPrice);
           const bDiff = Math.abs(b.latestPrice / b.ratio - myRefPrice);
@@ -314,6 +324,33 @@ export async function GET(request: Request) {
         return { date, price: null, source: "missing" as const, anchor: null };
       });
 
+      // AI Phase 1 입력용 short_history 보강 — 같은 unit + ratio ≤ 2 (박스↔박스, 박스↔반박스)
+      // 만 사용해서 cross-unit (1kg봉 같은 ratio=10) 노이즈 제외
+      const aiInferAnchors = sameGradeAnchors.filter((a) => a.ratio >= 0.5 && a.ratio <= 2);
+      const aiShortHistory: { date: string; price: number }[] = [];
+      let inferredCount = 0;
+      for (const date of slotDates) {
+        const actual = priceByDateAndCode.get(date)?.get(row.product_code);
+        if (actual != null && actual > 0) {
+          aiShortHistory.push({ date, price: actual });
+          continue;
+        }
+        for (const a of aiInferAnchors) {
+          const ap = priceByDateAndCode.get(date)?.get(a.code);
+          if (ap != null && ap > 0) {
+            aiShortHistory.push({ date, price: ceil10(ap / a.ratio) });
+            inferredCount++;
+            break;
+          }
+        }
+      }
+      // 보강 데이터가 actualHistory 보다 풍부할 때만 사용
+      const actualHistoryEntries = shortHistoryMap.get(row.product_code) || [];
+      const aiInputShortHistory = aiShortHistory.length > actualHistoryEntries.length
+        ? aiShortHistory
+        : actualHistoryEntries;
+      void inferredCount;  // future: ai_reason 에 표기용
+
       // 수익률일괄변경용
       const targetMargin = prod?.target_margin_rate ? Number(prod.target_margin_rate) : null;
       // 수익률일괄변경시가격 = ROUNDUP(매입가 ÷ (1 - 목표수익률), -1)
@@ -340,7 +377,7 @@ export async function GET(request: Request) {
       let recommendedPrice: number | null = null;
       let recommendReason = "";
       if (platformSellingPrice > 0 || purchasePrice > 0) {
-        // Phase 5-A / Layer 4-B: 같은 그룹 멤버 데이터 구성 (나 제외, spec 포함)
+        // Phase 5-A / Layer 4-B: 같은 그룹 멤버 데이터 구성 (나 제외, spec/learned_tier 포함)
         const groupMembers = prod?.product_group
           ? (groupMembersMap.get(prod.product_group) || [])
               .filter((m) => m.product_code !== row.product_code)
@@ -351,6 +388,7 @@ export async function GET(request: Request) {
                 pack_meta: m.pack_meta as never,
                 unit: m.unit,
                 spec: m.spec,
+                learned_tier: m.learned_tier,
                 short_history: shortHistoryMap.get(m.product_code) || [],
                 long_history: longHistoryMap.get(m.product_code) || [],
               }))
@@ -371,7 +409,8 @@ export async function GET(request: Request) {
           unit: row.unit || undefined,
           product_name: row.product_name,
           spec: row.spec,
-          short_history: shortHistoryMap.get(row.product_code) || [],
+          learned_tier: prod?.learned_tier ?? null,
+          short_history: aiInputShortHistory,
           long_history: longHistoryMap.get(row.product_code) || [],
           monthly_sales: recentSalesMap.get(row.product_code) || [],
           prev_monthly_sales: prevSalesMap.get(row.product_code) || [],

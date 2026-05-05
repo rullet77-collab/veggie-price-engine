@@ -190,10 +190,24 @@ export async function POST(request: Request) {
       }
     }
 
+    // 매입 데이터 변경됨 → 학습 tier 재계산 (365일 NTILE 단일 SQL, ~1초)
+    let learned: { updated: number; tier1: number; tier2: number; tier3: number } | null = null;
+    try {
+      const { data: tierData, error: tierErr } = await supabase.rpc("learn_tiers", { days: 365 });
+      if (tierErr) {
+        console.warn("learn_tiers RPC 경고:", tierErr.message);
+      } else if (Array.isArray(tierData) && tierData.length > 0) {
+        learned = tierData[0] as { updated: number; tier1: number; tier2: number; tier3: number };
+      }
+    } catch (e) {
+      console.warn("learn_tiers 호출 실패 (학습 갱신은 다음 업로드 때 재시도):", e);
+    }
+
     return Response.json({
       success: true,
       total: rows.length,
       inserted,
+      learned_tiers: learned,
     });
   } catch (err: unknown) {
     console.error("Upload error:", err);

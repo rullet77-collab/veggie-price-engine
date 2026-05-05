@@ -627,7 +627,25 @@ export async function POST(request: Request) {
       );
     }
 
-    return Response.json({ success: true, results });
+    // 매입 데이터 영향이 있는 시트(상품별매입현황)가 처리되면 학습 tier 재계산
+    const hasPurchaseChange = results.some((r) =>
+      r.type.includes("매입현황") || r.type.includes("매입상세")
+    );
+    let learned: { updated: number; tier1: number; tier2: number; tier3: number } | null = null;
+    if (hasPurchaseChange) {
+      try {
+        const { data: tierData, error: tierErr } = await supabase.rpc("learn_tiers", { days: 365 });
+        if (tierErr) {
+          console.warn("learn_tiers RPC 경고:", tierErr.message);
+        } else if (Array.isArray(tierData) && tierData.length > 0) {
+          learned = tierData[0] as { updated: number; tier1: number; tier2: number; tier3: number };
+        }
+      } catch (e) {
+        console.warn("learn_tiers 호출 실패:", e);
+      }
+    }
+
+    return Response.json({ success: true, results, learned_tiers: learned });
   } catch (err: unknown) {
     console.error("Upload error:", err);
     const message = err instanceof Error ? err.message : "알 수 없는 오류";
