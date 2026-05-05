@@ -139,12 +139,20 @@ async function batchUpsert(
 type SheetType =
   | "기존" | "변경" | "상품별매입현황" | "월별매출현황" | "경매가평균" | "unknown";
 
-function detectSheetType(name: string): SheetType {
+function detectSheetType(name: string, sheet?: XLSX.WorkSheet): SheetType {
   if (/^기존\(\d{4}\)/.test(name)) return "기존";
   if (/^변경\(\d{4}\)/.test(name)) return "변경";
-  if (name.includes("상품별매입현황")) return "상품별매입현황";
+  if (name.includes("상품별매입현황") || name.includes("매입상세") || name.includes("매입이력")) return "상품별매입현황";
   if (/^월별매출현황/.test(name) || /^신선행월별매출현황/.test(name)) return "월별매출현황";
   if (name.includes("경매가평균")) return "경매가평균";
+
+  // 시트 이름이 "Sheet1" 같은 기본명일 때 — 헤더 (코드/일자/단가) 가 있으면 매입현황으로 인식
+  if (sheet) {
+    const headers = findHeaders(sheet, ["코드", "일자", "단가"]);
+    if (headers && headers.colMap["코드"] !== undefined && headers.colMap["일자"] !== undefined && headers.colMap["단가"] !== undefined) {
+      return "상품별매입현황";
+    }
+  }
   return "unknown";
 }
 
@@ -523,8 +531,8 @@ export async function POST(request: Request) {
     let byunData: ReturnType<typeof parseProductManagement> = null;
 
     for (const sheetName of workbook.SheetNames) {
-      const type = detectSheetType(sheetName);
       const sheet = workbook.Sheets[sheetName];
+      const type = detectSheetType(sheetName, sheet);
 
       switch (type) {
         case "기존":

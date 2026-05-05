@@ -56,18 +56,18 @@ export async function GET(request: Request) {
     const category = url.searchParams.get("category");
     const group = url.searchParams.get("group");
 
-    // 1) 최신 날짜의 daily_product_management
-    const { data: latestDate } = await supabase
-      .from("daily_product_management")
-      .select("price_date")
-      .order("price_date", { ascending: false })
-      .limit(1)
-      .single();
+    // 1) priceDate 결정 — daily_purchase_prices 의 max 와 mgmt 의 max 중 더 최근값
+    //    (mgmt 가 갱신 안되더라도 매입 이력이 들어오면 그 날짜를 기준으로 사용)
+    const [{ data: latestMgmt }, { data: latestDaily }] = await Promise.all([
+      supabase.from("daily_product_management").select("price_date").order("price_date", { ascending: false }).limit(1).maybeSingle(),
+      supabase.from("daily_purchase_prices").select("price_date").order("price_date", { ascending: false }).limit(1).maybeSingle(),
+    ]);
+    const mgmtMax = (latestMgmt as { price_date: string } | null)?.price_date ?? null;
+    const dailyMax = (latestDaily as { price_date: string } | null)?.price_date ?? null;
+    const priceDate = (mgmtMax && dailyMax) ? (mgmtMax >= dailyMax ? mgmtMax : dailyMax) : (mgmtMax || dailyMax);
+    if (!priceDate) return Response.json([]);
 
-    if (!latestDate) return Response.json([]);
-    const priceDate = latestDate.price_date;
-
-    // 2) 해당 날짜 전체 상품 (매입가 데이터)
+    // 2) 해당 날짜 (또는 가장 최근 날짜) mgmt 데이터 — outdated 일 수 있음 (fallback 으로만)
     type MgmtRow = {
       product_code: string; price_date: string;
       purchase_price: number | null; selling_price: number | null;
@@ -76,11 +76,12 @@ export async function GET(request: Request) {
       unit: string | null; category_name: string | null;
       major_category: string | null;
     };
-    const mgmtData = await fetchAll<MgmtRow>(
+    // mgmt 의 max 날짜 데이터 (priceDate 가 daily 라 mgmt 와 다를 수 있음)
+    const mgmtData = mgmtMax ? await fetchAll<MgmtRow>(
       "daily_product_management",
       "product_code,price_date,purchase_price,selling_price,prev_purchase_price,prev_selling_price,product_name,spec,unit,category_name,major_category",
-      (q) => q.eq("price_date", priceDate)
-    );
+      (q) => q.eq("price_date", mgmtMax)
+    ) : [];
 
     // 3) products 마스터 (Phase 5-A: pack_role, pack_meta / Layer 4-B: spec / 학습 tier)
     type ProdRow = {
@@ -91,11 +92,12 @@ export async function GET(request: Request) {
       pack_role: string | null; pack_meta: unknown;
       product_name: string | null; unit: string | null;
       spec: string | null;
+      category_name: string | null;
       learned_tier: number | null;
     };
     const productsData = await fetchAll<ProdRow>(
       "products",
-      "product_code,product_group,is_key_item,target_margin_rate,is_event_item,product_type,price_sensitivity,pack_role,pack_meta,product_name,unit,spec,learned_tier"
+      "product_code,product_group,is_key_item,target_margin_rate,is_event_item,product_type,price_sensitivity,pack_role,pack_meta,product_name,unit,spec,category_name,learned_tier"
     );
     const productMap = new Map<string, ProdRow>();
     for (const p of productsData) productMap.set(p.product_code, p);
@@ -233,9 +235,19 @@ export async function GET(request: Request) {
       }
     }
 
-    // 7) 결과 조합
-    let results = mgmtData.map((row) => {
-      const prod = productMap.get(row.product_code);
+    // 7) 결과 조합 — 소스: products 마스터 (mgmt 가 outdated/누락이어도 모든 상품 노출)
+    const mgmtMap = new Map<string, MgmtRow>();
+    for (const m of mgmtData) mgmtMap.set(m.product_code, m);
+
+    let results = productsData.map((prod) => {
+      const row = mgmtMap.get(prod.product_code) || {
+        product_code: prod.product_code,
+        price_date: priceDate,
+        purchase_price: null, selling_price: null,
+        prev_purchase_price: null, prev_selling_price: null,
+        product_name: prod.product_name, spec: prod.spec, unit: prod.unit,
+        category_name: prod.category_name, major_category: null,
+      } as MgmtRow;
       const selling = sellingMap.get(row.product_code);
       const ph = purchaseMap.get(row.product_code);
       const monthlyQty = salesQtyMap.get(row.product_code) || null;
@@ -456,7 +468,7 @@ export async function GET(request: Request) {
         spec: row.spec,
         unit: row.unit,
         category_name: row.category_name,
-        price_date: row.price_date,
+        price_date: priceDate,
         product_type: productType,
 
         product_group: prod?.product_group || null,
