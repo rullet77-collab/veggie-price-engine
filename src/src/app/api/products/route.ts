@@ -2,6 +2,10 @@ import { supabase } from "@/lib/supabase";
 import { calculateAiRecommendation, type AiRecInput, tokenizeName, gradeMatchScore, getGradeTier, getUnitConversionRatio, ceil10 } from "@/lib/aiRecommendation";
 import { computePrev3MonthPct } from "@/lib/salesStats";
 
+// Next.js 가 GET 응답을 캐시하지 않도록 강제 dynamic
+export const dynamic = "force-dynamic";
+export const revalidate = 0;
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 async function fetchAll<T>(table: string, select: string, filters?: (q: any) => any): Promise<T[]> {
   const PAGE = 1000;
@@ -323,11 +327,12 @@ export async function GET(request: Request) {
       const changeRate = prevPurchase > 0 ? changeAmount / prevPurchase : 0;
 
       // 플랫폼 판매가 (product_selling_prices에서)
-      const platformSellingPrice = selling?.selling_price || 0;
+      // 사용자 수동 입력값 (NULL = 추천가 자동 적용 모드). AI 입력에서는 0 처리.
+      const platformSellingPrice: number | null = (selling?.selling_price != null && selling.selling_price > 0) ? selling.selling_price : null;
       const prevPlatformSellingPrice = selling?.prev_selling_price || null;
 
-      // 수익률 = 1 - (매입가 / 판매가)
-      const marginRate = platformSellingPrice > 0 ? 1 - purchasePrice / platformSellingPrice : 0;
+      // 수익률 = 1 - (매입가 / 판매가) — selling_price NULL 시 0
+      const marginRate = (platformSellingPrice && platformSellingPrice > 0) ? 1 - purchasePrice / platformSellingPrice : 0;
 
       // 7일 매입가
       const prices7d = ph?.prices || [];
@@ -452,7 +457,7 @@ export async function GET(request: Request) {
         : null;
 
       // 신선행판매가 = MAX(식봄판매가 × 0.94, 매입가 ÷ 0.9)
-      const sinsunhangPrice = platformSellingPrice > 0
+      const sinsunhangPrice = (platformSellingPrice && platformSellingPrice > 0)
         ? Math.ceil(Math.max(platformSellingPrice * 0.94, purchasePrice / 0.9) / 10) * 10
         : null;
       const sinsunhangMargin = sinsunhangPrice && sinsunhangPrice > 0
@@ -469,7 +474,7 @@ export async function GET(request: Request) {
       // Claude 추천판매가 — Phase 1~5 통합 로직 사용 (학습 세션과 동일)
       let recommendedPrice: number | null = null;
       let recommendReason = "";
-      if (platformSellingPrice > 0 || purchasePrice > 0) {
+      if ((platformSellingPrice && platformSellingPrice > 0) || purchasePrice > 0) {
         // Phase 5-A / Layer 4-B: 같은 그룹 멤버 데이터 구성 (나 제외, spec/learned_tier 포함)
         const groupMembers = prod?.product_group
           ? (groupMembersMap.get(prod.product_group) || [])
@@ -490,7 +495,7 @@ export async function GET(request: Request) {
         const aiInput: AiRecInput = {
           purchase_price: purchasePrice,
           prev_purchase_price: prevPurchase,
-          current_selling_price: platformSellingPrice,
+          current_selling_price: platformSellingPrice ?? 0,
           prev_selling_price: prevPlatformSellingPrice || 0,
           target_margin_rate: targetMargin,
           is_key_item: prod?.is_key_item || false,
@@ -535,8 +540,8 @@ export async function GET(request: Request) {
         is_event_item: prod?.is_event_item || false,
         target_margin_rate: targetMargin,
 
-        prev_purchase_price: row.prev_purchase_price,
-        purchase_price: row.purchase_price,
+        prev_purchase_price: prevPurchase,
+        purchase_price: purchasePrice,
         change_amount: changeAmount,
         change_rate: changeRate,
 
