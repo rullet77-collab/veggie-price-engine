@@ -15,10 +15,11 @@ import * as fs from "fs";
 
 const SUPABASE_URL = "https://sxndahqadpgivvejxjtg.supabase.co";
 const XLSX_PATHS = [
-  "C:/Users/y/Videos/판매가변경영상/2025 1~4월 야채매입상세.xlsx",
-  "C:/Users/y/Videos/판매가변경영상/2025 5~8월 야채매입상세.xlsx",
-  "C:/Users/y/Videos/판매가변경영상/2025 9~12월 야채매입상세.xlsx",
-  "C:/Users/y/Videos/판매가변경영상/2026 1~5월 야채매입상세.xlsx",
+  "C:/Users/y/Videos/판매가변경영상/매입/2025 1~4월 야채매입상세.xlsx",
+  "C:/Users/y/Videos/판매가변경영상/매입/2025 5~8월 야채매입상세.xlsx",
+  "C:/Users/y/Videos/판매가변경영상/매입/2025 9~12월 야채매입상세.xlsx",
+  "C:/Users/y/Videos/판매가변경영상/매입/2026 1~5월 야채매입상세.xlsx",
+  "C:/Users/y/Videos/판매가변경영상/매입/20260506 야채매입상세.xlsx",
 ];
 const BATCH_SIZE = 500;
 

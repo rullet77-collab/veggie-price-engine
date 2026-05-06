@@ -57,6 +57,16 @@ type Product = {
   month_3_qty: number | null;
   current_month_qty: number | null;
   prev_3month_pct: string | null;
+  // 채널별 3개월대비 (식봄/신선행/온일장/배민/total)
+  prev_3month_pct_sikbom: string | null;
+  prev_3month_pct_sinsunhang: string | null;
+  prev_3month_pct_oniljang: string | null;
+  prev_3month_pct_baemin: string | null;
+  prev_3month_pct_total: string | null;
+  // 월 라벨 (priceDate 기반 동적)
+  month_1_label?: string;
+  month_2_label?: string;
+  month_3_label?: string;
   learned_tier?: number | null;
   pack_role?: "박스" | "소분" | null;
   pack_meta?: unknown;
@@ -601,24 +611,34 @@ const COLUMNS: Column[] = [
     render: (p) => <span className={marginClass(p.sinsunhang_margin || 0)}>{pct(p.sinsunhang_margin)}</span> },
   { key: "baemin_price", label: "배민", group: "플랫폼", width: "w-16", align: "right",
     render: (p) => fmt(p.baemin_price) },
-  // 매출
-  { key: "month_1_qty", label: "1월", group: "매출", width: "w-12", align: "right", sortable: true,
+  // 매출 (1/2/3월 양수 = total 기준 합산 / 이번달 = total) — 라벨은 priceDate 기반 동적 (헤더에서 별도 처리)
+  { key: "month_1_qty", label: "전3월", group: "매출", width: "w-12", align: "right", sortable: true,
     render: (p) => fmt(p.month_1_qty) },
-  { key: "month_2_qty", label: "2월", group: "매출", width: "w-12", align: "right", sortable: true,
+  { key: "month_2_qty", label: "전2월", group: "매출", width: "w-12", align: "right", sortable: true,
     render: (p) => fmt(p.month_2_qty) },
-  { key: "month_3_qty", label: "3월", group: "매출", width: "w-12", align: "right", sortable: true,
+  { key: "month_3_qty", label: "전1월", group: "매출", width: "w-12", align: "right", sortable: true,
     render: (p) => fmt(p.month_3_qty) },
   { key: "current_month_qty", label: "이번달", group: "매출", width: "w-12", align: "right", sortable: true,
     render: (p) => <span className="font-semibold">{fmt(p.current_month_qty)}</span> },
-  { key: "prev_3month_pct", label: "3개월대비", group: "매출", width: "w-16", align: "right", sortable: true,
-    render: (p) => {
-      if (!p.prev_3month_pct) return <span className="text-gray-300">-</span>;
-      const s = p.prev_3month_pct;
-      const isUp = s.includes("▲") || s.includes("+");
-      const isDown = s.includes("▼") || s.includes("-");
-      return <span className={`text-[10px] ${isUp ? "text-red-600" : isDown ? "text-blue-600" : ""}`}>{s}</span>;
-    } },
+  // 채널별 3개월대비 5개
+  { key: "prev_3month_pct_sikbom", label: "식봄", group: "3개월대비", width: "w-14", align: "right", sortable: true,
+    render: (p) => renderPctCell(p.prev_3month_pct_sikbom) },
+  { key: "prev_3month_pct_sinsunhang", label: "신선행", group: "3개월대비", width: "w-14", align: "right", sortable: true,
+    render: (p) => renderPctCell(p.prev_3month_pct_sinsunhang) },
+  { key: "prev_3month_pct_oniljang", label: "온일장", group: "3개월대비", width: "w-14", align: "right", sortable: true,
+    render: (p) => renderPctCell(p.prev_3month_pct_oniljang) },
+  { key: "prev_3month_pct_baemin", label: "배민", group: "3개월대비", width: "w-14", align: "right", sortable: true,
+    render: (p) => renderPctCell(p.prev_3month_pct_baemin) },
+  { key: "prev_3month_pct_total", label: "전체", group: "3개월대비", width: "w-14", align: "right", sortable: true,
+    render: (p) => renderPctCell(p.prev_3month_pct_total) },
 ];
+
+function renderPctCell(s: string | null) {
+  if (!s) return <span className="text-gray-300">-</span>;
+  const isUp = s.includes("▲") || s.startsWith("+");
+  const isDown = s.includes("▼") || s.startsWith("-");
+  return <span className={`text-[10px] ${isUp ? "text-red-600" : isDown ? "text-blue-600" : "text-gray-700"}`}>{s}</span>;
+}
 
 // ── Column pixel widths (matching tailwind w-XX classes) ──
 const COL_WIDTHS: Record<string, number> = {
@@ -650,6 +670,11 @@ const COL_WIDTHS: Record<string, number> = {
   month_3_qty: 48,
   current_month_qty: 48,
   prev_3month_pct: 64,
+  prev_3month_pct_sikbom: 56,
+  prev_3month_pct_sinsunhang: 56,
+  prev_3month_pct_oniljang: 56,
+  prev_3month_pct_baemin: 56,
+  prev_3month_pct_total: 56,
 };
 
 const COL_GROUPS: { label: string; group: string; color: string }[] = [
@@ -660,6 +685,7 @@ const COL_GROUPS: { label: string; group: string; color: string }[] = [
   { label: "Claude 추천", group: "추천", color: "bg-violet-50" },
   { label: "플랫폼", group: "플랫폼", color: "bg-purple-50" },
   { label: "매출", group: "매출", color: "bg-amber-50" },
+  { label: "3개월대비", group: "3개월대비", color: "bg-rose-50" },
 ];
 
 // 그룹별 합산 너비 (px)
@@ -1323,17 +1349,27 @@ export default function ProductsPage() {
                 </div>
                 {/* 컬럼 헤더 */}
                 <div className="flex border-b border-gray-300 bg-gray-50">
-                  {COLUMNS.map((col) => (
-                    <div
-                      key={col.key}
-                      className={`flex-shrink-0 px-2 py-1.5 text-[10px] font-medium text-gray-600 ${col.align === "right" ? "text-right" : col.align === "center" ? "text-center" : "text-left"} ${col.sortable ? "cursor-pointer hover:bg-gray-100 select-none" : ""}`}
-                      style={{ width: COL_WIDTHS[col.key] || 60 }}
-                      onClick={() => col.sortable && handleSort(col.key as SortKey)}
-                    >
-                      {col.label}
-                      {sortKey === col.key && <span className="ml-0.5">{sortDir === "asc" ? "▲" : "▼"}</span>}
-                    </div>
-                  ))}
+                  {COLUMNS.map((col) => {
+                    // 월 컬럼 동적 라벨 (priceDate 기반)
+                    let label = col.label;
+                    const sample = products[0];
+                    if (sample) {
+                      if (col.key === "month_1_qty" && sample.month_1_label) label = sample.month_1_label;
+                      else if (col.key === "month_2_qty" && sample.month_2_label) label = sample.month_2_label;
+                      else if (col.key === "month_3_qty" && sample.month_3_label) label = sample.month_3_label;
+                    }
+                    return (
+                      <div
+                        key={col.key}
+                        className={`flex-shrink-0 px-2 py-1.5 text-[10px] font-medium text-gray-600 ${col.align === "right" ? "text-right" : col.align === "center" ? "text-center" : "text-left"} ${col.sortable ? "cursor-pointer hover:bg-gray-100 select-none" : ""}`}
+                        style={{ width: COL_WIDTHS[col.key] || 60 }}
+                        onClick={() => col.sortable && handleSort(col.key as SortKey)}
+                      >
+                        {label}
+                        {sortKey === col.key && <span className="ml-0.5">{sortDir === "asc" ? "▲" : "▼"}</span>}
+                      </div>
+                    );
+                  })}
                 </div>
               </div>
             </div>

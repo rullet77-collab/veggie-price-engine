@@ -212,28 +212,87 @@ export async function GET(request: Request) {
       (q) => q.gte("sale_month", prevMonthStart.toISOString().slice(0, 10))
     );
 
-    const salesQtyMap = new Map<string, number>();  // 현재월 UI용
+    // 채널별 데이터 인덱싱 — (code, source) → Map<sale_month, qty>
+    type ChannelMap = Map<string, Map<string, Map<string, number>>>;  // code → source → month → qty
+    const channelData: ChannelMap = new Map();
+    const totalData = new Map<string, Map<string, number>>();          // code → month → total qty (4채널 합)
+
+    const CHANNELS = ["식봄", "신선행", "온일장", "배민"] as const;
+
+    for (const ms of monthlySales) {
+      const src = ms.source;
+      if (!src) continue;
+      if (!CHANNELS.includes(src as typeof CHANNELS[number])) continue;
+      const qty = ms.quantity || 0;
+      // 채널별
+      if (!channelData.has(ms.product_code)) channelData.set(ms.product_code, new Map());
+      const sm = channelData.get(ms.product_code)!;
+      if (!sm.has(src)) sm.set(src, new Map());
+      sm.get(src)!.set(ms.sale_month, qty);
+      // total 합산
+      if (!totalData.has(ms.product_code)) totalData.set(ms.product_code, new Map());
+      const tm = totalData.get(ms.product_code)!;
+      tm.set(ms.sale_month, (tm.get(ms.sale_month) || 0) + qty);
+    }
+
+    // 기존 total 기반 호환용 (Phase 3 매출 판정 / UI 1/2/3월 양수)
+    const salesQtyMap = new Map<string, number>();  // 이번달 total
     const recentSalesMap = new Map<string, { sale_month: string; quantity: number }[]>();
     const prevSalesMap = new Map<string, { sale_month: string; quantity: number }[]>();
     const recentStartStr = recentMonthStart.toISOString().slice(0, 10);
     const prevStartStr = prevMonthStart.toISOString().slice(0, 10);
     const prevEndStr = prevMonthEnd.toISOString().slice(0, 10);
 
-    for (const ms of monthlySales) {
-      if (ms.source && ms.source !== "전체") continue;
-      const entry = { sale_month: ms.sale_month, quantity: ms.quantity || 0 };
-
-      if (ms.sale_month === monthStr) {
-        salesQtyMap.set(ms.product_code, ms.quantity);
-      }
-      if (ms.sale_month >= recentStartStr) {
-        if (!recentSalesMap.has(ms.product_code)) recentSalesMap.set(ms.product_code, []);
-        recentSalesMap.get(ms.product_code)!.push(entry);
-      } else if (ms.sale_month >= prevStartStr && ms.sale_month < prevEndStr) {
-        if (!prevSalesMap.has(ms.product_code)) prevSalesMap.set(ms.product_code, []);
-        prevSalesMap.get(ms.product_code)!.push(entry);
+    for (const [code, monthMap] of totalData.entries()) {
+      for (const [sm, qty] of monthMap.entries()) {
+        if (sm === monthStr) salesQtyMap.set(code, qty);
+        const entry = { sale_month: sm, quantity: qty };
+        if (sm >= recentStartStr) {
+          if (!recentSalesMap.has(code)) recentSalesMap.set(code, []);
+          recentSalesMap.get(code)!.push(entry);
+        } else if (sm >= prevStartStr && sm < prevEndStr) {
+          if (!prevSalesMap.has(code)) prevSalesMap.set(code, []);
+          prevSalesMap.get(code)!.push(entry);
+        }
       }
     }
+
+    // priceDate 기반 m1/m2/m3 month 키 산출 (priceDate 기준 -3, -2, -1 개월)
+    // 시간대 무관 — 직접 문자열 합성 (toISOString 은 UTC 변환되어 1일 밀릴 수 있음)
+    const monthDate = (offset: number): string => {
+      const y = priceDateObj.getFullYear();
+      const m0 = priceDateObj.getMonth() - offset;
+      const targetY = y + Math.floor(m0 / 12);
+      const targetM = ((m0 % 12) + 12) % 12;
+      return `${targetY}-${String(targetM + 1).padStart(2, "0")}-01`;
+    };
+    const m1Month = monthDate(3);  // 3개월 전
+    const m2Month = monthDate(2);  // 2개월 전
+    const m3Month = monthDate(1);  // 1개월 전
+    const curMonth = monthStr;     // 이번달
+
+    // 채널별 prev_3month_pct 산출 helper
+    const computePct = (m1: number | null, m2: number | null, m3: number | null, cur: number | null): string | null => {
+      const v1 = m1 || 0, v2 = m2 || 0, v3 = m3 || 0;
+      const valCur = cur || 0;
+      const months = [
+        { value: v1, days: new Date(priceDateObj.getFullYear(), priceDateObj.getMonth() - 2, 0).getDate() },
+        { value: v2, days: new Date(priceDateObj.getFullYear(), priceDateObj.getMonth() - 1, 0).getDate() },
+        { value: v3, days: new Date(priceDateObj.getFullYear(), priceDateObj.getMonth(), 0).getDate() },
+      ];
+      const nMo = months.filter((m) => m.value > 0).length;
+      if (nMo === 0) return valCur > 0 ? "신규매출" : null;
+      let sumDaily = 0;
+      for (const m of months) if (m.value > 0) sumDaily += m.value / m.days;
+      const aDaily = sumDaily / nMo;
+      const dayOfMonth = priceDateObj.getDate();
+      const eBase = aDaily * dayOfMonth;
+      if (eBase < 0.1) return valCur > 0 ? "▲기준치미달" : "0.00%";
+      const dRate = (valCur - eBase) / eBase;
+      if (dRate > 0) return `▲${(dRate * 100).toFixed(2)}%`;
+      if (dRate < 0) return `▼${(Math.abs(dRate) * 100).toFixed(2)}%`;
+      return "0.00%";
+    };
 
     // 7) 결과 조합 — 소스: products 마스터 (mgmt 가 outdated/누락이어도 모든 상품 노출)
     const mgmtMap = new Map<string, MgmtRow>();
@@ -506,19 +565,56 @@ export async function GET(request: Request) {
         baemin_margin: baeminMargin,
 
         monthly_qty: monthlyQty,
-        month_1_qty: selling?.month_1_qty || null,
-        month_2_qty: selling?.month_2_qty || null,
-        month_3_qty: selling?.month_3_qty || null,
-        // 이번달 = monthly_sales_quantity(전체, 현재월) 원본 기준
+        // m1/m2/m3 = monthly_sales_quantity 동적 산출 (4채널 합계 기준) — priceDate 기준 -3/-2/-1 월
+        month_1_qty: (() => {
+          const t = totalData.get(row.product_code);
+          return (t?.get(m1Month) ?? null) as number | null;
+        })(),
+        month_2_qty: (() => {
+          const t = totalData.get(row.product_code);
+          return (t?.get(m2Month) ?? null) as number | null;
+        })(),
+        month_3_qty: (() => {
+          const t = totalData.get(row.product_code);
+          return (t?.get(m3Month) ?? null) as number | null;
+        })(),
+        // 이번달 = total 4채널 합산 현재월
         current_month_qty: monthlyQty,
-        // 3개월대비 = (월말 예상 - avg(1~3월)) / avg(1~3월)
+        // 3개월대비 — total 합계 기준 (기존 호환)
         prev_3month_pct: computePrev3MonthPct(
-          selling?.month_1_qty || null,
-          selling?.month_2_qty || null,
-          selling?.month_3_qty || null,
+          (totalData.get(row.product_code)?.get(m1Month) ?? null),
+          (totalData.get(row.product_code)?.get(m2Month) ?? null),
+          (totalData.get(row.product_code)?.get(m3Month) ?? null),
           monthlyQty,
           priceDate
         ),
+        // 채널별 3개월대비 — 5개 (식봄/신선행/온일장/배민/total)
+        prev_3month_pct_sikbom: (() => {
+          const c = channelData.get(row.product_code)?.get("식봄");
+          return computePct(c?.get(m1Month) ?? null, c?.get(m2Month) ?? null, c?.get(m3Month) ?? null, c?.get(curMonth) ?? null);
+        })(),
+        prev_3month_pct_sinsunhang: (() => {
+          const c = channelData.get(row.product_code)?.get("신선행");
+          return computePct(c?.get(m1Month) ?? null, c?.get(m2Month) ?? null, c?.get(m3Month) ?? null, c?.get(curMonth) ?? null);
+        })(),
+        prev_3month_pct_oniljang: (() => {
+          const c = channelData.get(row.product_code)?.get("온일장");
+          return computePct(c?.get(m1Month) ?? null, c?.get(m2Month) ?? null, c?.get(m3Month) ?? null, c?.get(curMonth) ?? null);
+        })(),
+        prev_3month_pct_baemin: (() => {
+          const c = channelData.get(row.product_code)?.get("배민");
+          return computePct(c?.get(m1Month) ?? null, c?.get(m2Month) ?? null, c?.get(m3Month) ?? null, c?.get(curMonth) ?? null);
+        })(),
+        prev_3month_pct_total: computePct(
+          totalData.get(row.product_code)?.get(m1Month) ?? null,
+          totalData.get(row.product_code)?.get(m2Month) ?? null,
+          totalData.get(row.product_code)?.get(m3Month) ?? null,
+          monthlyQty,
+        ),
+        // 월 라벨 (UI 동적 표시용) — "2월", "3월" 형태 (앞 0 제거)
+        month_1_label: parseInt(m1Month.slice(5, 7)) + "월",
+        month_2_label: parseInt(m2Month.slice(5, 7)) + "월",
+        month_3_label: parseInt(m3Month.slice(5, 7)) + "월",
       };
     });
 
