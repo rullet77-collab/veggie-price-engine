@@ -1311,15 +1311,13 @@ export function calculateAiRecommendation(input: AiRecInput): AiRecOutput {
       `[이상치-상승] 매입 +${(riseRate * 100).toFixed(1)}% (적정가 ${basePP.toLocaleString()}→${pp.toLocaleString()}원, 기존판매가 기준 수익률이 기준보다 -${(marginDeviation * 100).toFixed(1)}%p 낮음) → 수익률 ${newMarginPct.toFixed(1)}%로 재조정(max(15%, 기준${targetMargin}% − 0.25×${(riseRate * 100).toFixed(1)}%)) → 판매가 ${aiPrice.toLocaleString()}원`
     );
   }
-  // (A-2) 하락 이상치 — 매입 급락 → 판매가 소극적 인하 (매입하락률 × 0.1)
-  else if (isAbnormal && purchaseChangeFromBase < 0 && prev > 0) {
-    const dropRate = Math.abs(purchaseChangeFromBase);
-    const priceDropRate = dropRate * MARGIN_LOWER_PROTECT_RATIO;
-    aiPrice = Math.ceil((prev * (1 - priceDropRate)) / 10) * 10;
-    // marginDeviation < 0 (실제 수익률이 기준보다 높아짐) → 표기는 절대값으로
-    reasons.push(
-      `[이상치-하락] 매입 -${(dropRate * 100).toFixed(1)}% (적정가 ${basePP.toLocaleString()}→${pp.toLocaleString()}원, 기존판매가 기준 수익률이 기준보다 +${Math.abs(marginDeviation * 100).toFixed(1)}%p 높음) → 판매가 소극적 인하 -${(priceDropRate * 100).toFixed(1)}% (${prev.toLocaleString()}→${aiPrice.toLocaleString()}원)`
-    );
+  // (A-2) 하락 이상치 — 비활성화 (사용자 의도: prev_selling_price 영향 제거)
+  //   원래 의도: 매입 급락 시 prev × (1 - 매입하락률 × 0.1) 로 보수적 인하
+  //   부작용: prev 가 stale 한 경우 잘못된 anchor 사용. 자기 추천가가 prev 로 롤오버되는
+  //   새 운영 모델에선 self-loop 위험. (B/C/D/E) 의 마진 보정으로 충분.
+  // else if (isAbnormal && purchaseChangeFromBase < 0 && prev > 0) { ... }
+  else if (false /* (A-2) deactivated */) {
+    void MARGIN_LOWER_PROTECT_RATIO;  // 변수 보존 (다른 곳에서 사용 가능)
   }
   // (B) 8일간 큰 폭 상승 (>5%) + 최근 가속
   else if (totalTrend > 0.05 && trendDetail.label === "상승" && trendDetail.consecutive_up >= 2) {
