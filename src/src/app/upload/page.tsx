@@ -155,9 +155,9 @@ function DropZone({
               >
                 <p className="font-medium">{r.type}</p>
                 <p className="text-xs mt-0.5">
-                  {r.sheetName} — {r.total.toLocaleString()}건 처리, <strong>{r.inserted.toLocaleString()}건 신규 저장</strong>
+                  {r.sheetName} — {r.total.toLocaleString()}건 처리, <strong>{r.inserted.toLocaleString()}건 저장</strong>
                   {r.skipped !== undefined && r.skipped > 0 && (
-                    <span className="text-gray-500"> ({r.skipped.toLocaleString()}건 이미 존재 → 스킵)</span>
+                    <span className="text-gray-500"> ({r.skipped.toLocaleString()}건 변경 없음)</span>
                   )}
                 </p>
                 {r.errors && r.errors.length > 0 && (

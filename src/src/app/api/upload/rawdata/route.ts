@@ -108,7 +108,7 @@ async function batchUpsert(
   let inserted = 0;
   const errors: string[] = [];
   const total = rows.length;
-  // skipDuplicates: 신규 행만 INSERT, 기존은 건드리지 않음 (월별매출상세용)
+  // skipDuplicates: true → INSERT IGNORE (기존 보존), false → UPSERT (정정 반영)
   const ignoreDup = opts.skipDuplicates === true;
 
   for (let i = 0; i < rows.length; i += BATCH_SIZE) {
@@ -119,10 +119,11 @@ async function batchUpsert(
       .select();
 
     if (error) {
+      // 행단위 fallback — 호출 정책 그대로 유지
       for (const row of batch) {
         const { data: d, error: e } = await supabase
           .from(table)
-          .upsert([row as never], { onConflict, ignoreDuplicates: true })
+          .upsert([row as never], { onConflict, ignoreDuplicates: ignoreDup })
           .select();
         if (!e && d) inserted += d.length;
         else if (e) errors.push(`${table}: ${e.message}`);
@@ -494,8 +495,9 @@ export async function POST(request: Request) {
     const results: SheetResult[] = [];
 
     // 1) 월별매출상세 (별도 파일) 감지
-    //    누적 업로드: 같은 row_key 가 이미 있으면 스킵 → 신규 행만 INSERT
-    //    덕분에 사용자가 매일 전체 파일을 올려도 중복 저장이 없음
+    //    UPSERT 정책: 같은 row_key 가 다시 들어오면 정정으로 간주하고 갱신
+    //    이유: 천년경영에서 거래 정정 시 같은 ROWKEY 재발행 — selling_price/qty 변경 반영 필요
+    //    매일 전체 파일을 올려도 ROWKEY UNIQUE 제약 + 동일값 UPSERT 라 부작용 없음
     if (detectSalesDetail(workbook)) {
       const sheet = workbook.Sheets[workbook.SheetNames[0]];
       const rows = parseSalesDetail(sheet);
@@ -504,7 +506,7 @@ export async function POST(request: Request) {
           "sales_detail",
           rows,
           "row_key",
-          { skipDuplicates: true }
+          { skipDuplicates: false }
         );
         results.push({
           sheetName: workbook.SheetNames[0],
