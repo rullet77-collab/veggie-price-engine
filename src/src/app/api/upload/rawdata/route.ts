@@ -161,12 +161,30 @@ function getMonthlySource(sheetName: string): string {
   return sheetName.includes("신선행") ? "신선행" : "전체";
 }
 
-/** 월별매출상세 파일 감지 — ROWKEY 컬럼 + 거래처 컬럼 존재 */
+/** 월별매출상세 파일 감지
+ *  두 형식 모두 인식:
+ *    A. RAW (일자별) — ROWKEY + 거래처 + 그룹명 컬럼
+ *    B. 통합 (월/주말/누락분) — 코드 + 일자 + 단가 + 수량 + 공급가액 (ROWKEY 없음)
+ */
 function detectSalesDetail(workbook: XLSX.WorkBook): boolean {
   const sheet = workbook.Sheets[workbook.SheetNames[0]];
   if (!sheet) return false;
-  const headers = findHeaders(sheet, ["일자", "거래처", "기본코드", "ROWKEY", "수량", "단가"], 4);
-  return headers !== null && headers.colMap["ROWKEY"] !== undefined;
+  // A. RAW
+  const raw = findHeaders(sheet, ["일자", "기본코드", "ROWKEY", "수량", "단가"], 4);
+  if (raw && raw.colMap["ROWKEY"] !== undefined) return true;
+  // B. 통합 — "코드"+"일자"+"단가"+"수량"+"공급가액" 모두 있으면 매출상세
+  const integ = findHeaders(sheet, ["코드", "일자", "단가", "수량", "공급가액"], 4);
+  return integ !== null;
+}
+
+/** 파일명에서 채널 추출 (통합 파일용) */
+function detectChannelFromFilename(filename: string | null | undefined): string | null {
+  if (!filename) return null;
+  if (filename.includes("식봄")) return "식봄";
+  if (filename.includes("신선행")) return "신선행";
+  if (filename.includes("온일장")) return "온일장";
+  if (filename.includes("배민")) return "배민";
+  return null;
 }
 
 // ── 각 시트 타입별 파서 ──
@@ -400,24 +418,41 @@ function parseAuctionPrices(sheet: XLSX.WorkSheet): Record<string, unknown>[] {
   return rows;
 }
 
+/** 그룹명 → 채널 (식봄/신선행/온일장/배민) 매핑 */
+function detectChannel(groupName: string | null): string | null {
+  if (!groupName) return null;
+  const g = groupName.replace(/▣/g, "").trim();
+  if (g.startsWith("식봄")) return "식봄";
+  if (g.startsWith("신선행")) return "신선행";
+  if (g.startsWith("온일장")) return "온일장";
+  if (g.startsWith("배민")) return "배민";
+  return null;
+}
+
 /** 월별매출상세 (별도 파일) → sales_detail
- *  헤더: 일자, 거래처코드, 거래처, 기본코드, 상품명, 규격, 단위, 수량,
- *        단가, 공급가액, 합계액, 매입가, 매출가, 이익률, ROWKEY */
-function parseSalesDetail(sheet: XLSX.WorkSheet): Record<string, unknown>[] {
+ *  RAW 형식: 일자, 거래처코드, 거래처, 기본코드, 상품명, 규격, 단위, 수량,
+ *           단가, 공급가액, 합계액, 매입가, 매출가, 이익률, ROWKEY, 그룹명
+ *  통합 형식: 코드, 상품명, 규격, 거래처, 일자, 단가, 수량, 단위, 공급가액, 합계액 (ROWKEY 없음)
+ *
+ *  fileChannel: 통합파일에서 ROWKEY/그룹명이 없을 때 채널 fallback 으로 사용 (파일명 기반)
+ */
+function parseSalesDetail(sheet: XLSX.WorkSheet, fileChannel: string | null = null): Record<string, unknown>[] {
   const targetKeys = [
-    "일자", "기본코드", "상품명", "규격", "단위",
+    "일자", "기본코드", "코드", "상품명", "규격", "단위",
     "수량", "단가", "공급가액", "합계액",
-    "거래처", "매입가", "매출가", "이익률", "ROWKEY",
+    "거래처", "매입가", "매출가", "이익률", "ROWKEY", "그룹명",
   ];
   const headers = findHeaders(sheet, targetKeys, 5);
-  if (!headers || headers.colMap["기본코드"] === undefined) return [];
+  // 코드 컬럼 (기본코드 또는 코드)
+  const codeCol = headers?.colMap["기본코드"] ?? headers?.colMap["코드"];
+  if (!headers || codeCol === undefined) return [];
 
   const { headerRow, colMap } = headers;
   const range = XLSX.utils.decode_range(sheet["!ref"] || "A1");
   const rows: Record<string, unknown>[] = [];
 
   for (let r = headerRow + 1; r <= range.e.r; r++) {
-    const codeRaw = getCellValue(sheet, r, colMap["기본코드"]!);
+    const codeRaw = getCellValue(sheet, r, codeCol);
     const dateRaw = colMap["일자"] !== undefined ? getCellValue(sheet, r, colMap["일자"]!) : null;
     if (!codeRaw || !dateRaw) continue;
 
@@ -438,17 +473,21 @@ function parseSalesDetail(sheet: XLSX.WorkSheet): Record<string, unknown>[] {
 
     const qty = colMap["수량"] !== undefined ? Number(getCellValue(sheet, r, colMap["수량"]!) || 0) : 0;
     const platform = getStr("거래처");
+    const groupNameForKey = getStr("그룹명");
+    const channelForKey = detectChannel(groupNameForKey) ?? fileChannel;
 
-    // ROWKEY가 있으면 그대로 사용, 없으면 생성
+    // ROWKEY가 있으면 그대로 사용, 없으면 생성 (통합파일 채널별 충돌 방지)
     let rowKey = getStr("ROWKEY");
     if (!rowKey) {
-      rowKey = `${saleDate}_${productCode}_${platform || ""}_${qty}_${getNum("단가") || 0}`;
+      rowKey = `${saleDate}_${productCode}_${channelForKey || platform || ""}_${qty}_${getNum("단가") || 0}`;
     }
 
     const marginRaw = colMap["이익률"] !== undefined
       ? getCellValue(sheet, r, colMap["이익률"]!)
       : null;
     const marginRate = marginRaw != null ? Number(Number(marginRaw).toFixed(6)) : null;
+
+    const channel = channelForKey;
 
     rows.push({
       sale_date: saleDate,
@@ -465,6 +504,7 @@ function parseSalesDetail(sheet: XLSX.WorkSheet): Record<string, unknown>[] {
       margin_rate: marginRate,
       platform,
       row_key: rowKey,
+      channel,
     });
   }
   return rows;
@@ -500,7 +540,11 @@ export async function POST(request: Request) {
     //    매일 전체 파일을 올려도 ROWKEY UNIQUE 제약 + 동일값 UPSERT 라 부작용 없음
     if (detectSalesDetail(workbook)) {
       const sheet = workbook.Sheets[workbook.SheetNames[0]];
-      const rows = parseSalesDetail(sheet);
+      // 통합파일은 그룹명이 없으니 파일명에서 채널 추출 (RAW면 그룹명 우선이라 무해)
+      const fileChannel = detectChannelFromFilename(file.name);
+      const rows = parseSalesDetail(sheet, fileChannel);
+      let monthlyTouched: { touched_months: number; total_rows: number } | null = null;
+      let rolled: { prev_rolled: number; recommended_set: number; duration_ms: number } | null = null;
       if (rows.length > 0) {
         const { inserted, skipped, errors } = await batchUpsert(
           "sales_detail",
@@ -516,8 +560,31 @@ export async function POST(request: Request) {
           skipped,
           errors: errors.length > 0 ? errors.slice(0, 5) : undefined,
         });
+
+        // 영향받은 가장 이른 월부터 monthly_sales_quantity 재집계
+        const minDate = rows
+          .map((r) => r.sale_date as string)
+          .filter(Boolean)
+          .sort()[0];
+        if (minDate) {
+          const sinceMonth = `${minDate.slice(0, 7)}-01`;
+          try {
+            const { data, error } = await supabase.rpc("recompute_monthly_sales", { since_month: sinceMonth });
+            if (error) console.warn("recompute_monthly_sales RPC 경고:", error.message);
+            else if (Array.isArray(data) && data.length > 0) monthlyTouched = data[0];
+          } catch (e) {
+            console.warn("recompute_monthly_sales 호출 실패:", e);
+          }
+        }
+
+        // 매출 변경은 추천가에 영향 → rollSellingPrices 한번 더
+        try {
+          rolled = await rollSellingPrices(supabase);
+        } catch (e) {
+          console.warn("rollSellingPrices 실패:", e);
+        }
       }
-      return Response.json({ success: true, results });
+      return Response.json({ success: true, results, monthly_touched: monthlyTouched, rolled_selling: rolled });
     }
 
     // 2) RAW DATA 파일 — 시트별 처리
