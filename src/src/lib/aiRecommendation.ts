@@ -631,8 +631,8 @@ function subdivToBox(subdivPrice: number, subdivMeta: PackMeta, boxMeta: PackMet
   if (subdivMeta.half_box) {
     return subdivPrice * 2;
   }
-  // 소분가 ÷ 수량 × 공식수 = 박스가
-  return Math.round(subdivPrice / subdivMeta.quantity * divisor);
+  // 소분가 ÷ 수량 × 공식수 = 박스가 (10원 단위 올림 — 박스↔소분 일관성)
+  return ceil10(subdivPrice / subdivMeta.quantity * divisor);
 }
 
 // 단위 민감도 계수 (다른 단위 간 변동률 전파 시)
@@ -1241,7 +1241,8 @@ export function calculateAiRecommendation(input: AiRecInput): AiRecOutput {
     pp = estimatedFromGroup.estimated_price;
   }
 
-  const targetMargin = targetM || 20;
+  // 목표마진 = null/undefined → 20% fallback. 0 은 명시적 0% 로 보존 (?? vs ||)
+  const targetMargin = targetM ?? 20;
   const currentMargin = cur > 0 ? 1 - pp / cur : 0;
   const purchaseChange = prevPP > 0 ? (pp - prevPP) / prevPP : 0;
 
@@ -1431,8 +1432,7 @@ export function calculateAiRecommendation(input: AiRecInput): AiRecOutput {
   // 보정 신호 (매출량 기반 가격 조정, 지지선, 그룹, 경쟁품목)
   // ─────────────────────────────────────
 
-  // 저수익 경고 — 적정매입가 기준 수익률 체크
-  const baseMargin = aiPrice > 0 ? 1 - basePP / aiPrice : 0;
+  // 저수익 경고 — 현재 판매가 기준 실 수익률 체크 (currentMargin 만 사용, basePP 기준은 아래에서 별도)
   if (cur > basePP && currentMargin < 0.1) {
     reasons.push(
       `현재 수익률 ${(currentMargin * 100).toFixed(1)}%로 낮음 — 수익률일괄변경가 ${targetPrice.toLocaleString()}원(${targetMargin}%)까지 상향 가능`

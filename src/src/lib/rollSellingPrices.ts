@@ -151,21 +151,27 @@ export async function rollSellingPrices(supabase: SupabaseClient): Promise<RollR
   }
 
   // 매입 이력 60일
-  const sevenDaysAgo = new Date(priceDate); sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
-  const eightDaysAgo = new Date(priceDate); eightDaysAgo.setDate(eightDaysAgo.getDate() - 8);
-  const sixtyDaysAgo = new Date(priceDate); sixtyDaysAgo.setDate(sixtyDaysAgo.getDate() - 60);
+  // KST 안전: 'YYYY-MM-DD' 문자열 직접 산술 (UTC 변환 회피)
+  const addDays = (yyyymmdd: string, days: number): string => {
+    const [y, m, d] = yyyymmdd.split("-").map(Number);
+    // 로컬 timezone 영향 없이 UTC 시점에서 산술 후 같은 형식으로 반환
+    const t = Date.UTC(y, m - 1, d) + days * 86_400_000;
+    const dt = new Date(t);
+    return `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, "0")}-${String(dt.getUTCDate()).padStart(2, "0")}`;
+  };
+  const eightDaysAgoStr = addDays(priceDate, -8);
+  const sixtyDaysAgoStr = addDays(priceDate, -60);
   type PurchRow = { product_code: string; price_date: string; purchase_price: number };
   const purchaseHistory60 = await fetchAll<PurchRow>(
     supabase, "daily_purchase_prices",
     "product_code,price_date,purchase_price",
-    (q) => q.gte("price_date", sixtyDaysAgo.toISOString().slice(0, 10))
+    (q) => q.gte("price_date", sixtyDaysAgoStr)
       .lte("price_date", priceDate)
       .order("price_date", { ascending: true })
   );
   const shortHistoryMap = new Map<string, { date: string; price: number }[]>();
   const longHistoryMap = new Map<string, { date: string; price: number }[]>();
   const datePriceByCode = new Map<string, Map<string, number>>();
-  const eightDaysAgoStr = eightDaysAgo.toISOString().slice(0, 10);
   for (const ph of purchaseHistory60) {
     const e = { date: ph.price_date, price: ph.purchase_price };
     if (!longHistoryMap.has(ph.product_code)) longHistoryMap.set(ph.product_code, []);
@@ -185,23 +191,28 @@ export async function rollSellingPrices(supabase: SupabaseClient): Promise<RollR
     if (sd[1]) dailyPrevMap.set(code, dp.get(sd[1])!);
   }
 
-  // 월별 매출
-  const priceDateObj = new Date(priceDate);
-  const recentMonthStart = new Date(priceDateObj.getFullYear(), priceDateObj.getMonth() - 2, 1);
-  const prevMonthStart = new Date(priceDateObj.getFullYear(), priceDateObj.getMonth() - 5, 1);
-  const prevMonthEnd = new Date(priceDateObj.getFullYear(), priceDateObj.getMonth() - 2, 1);
+  // 월별 매출 — 월 단위 산술도 KST 안전 (priceDate.slice(0,7) 기준)
+  const monthStart = (yyyymm: string, deltaMonths: number): string => {
+    const [y, m] = yyyymm.split("-").map(Number);
+    let nm = m + deltaMonths;
+    let ny = y;
+    while (nm <= 0) { nm += 12; ny -= 1; }
+    while (nm > 12) { nm -= 12; ny += 1; }
+    return `${ny}-${String(nm).padStart(2, "0")}-01`;
+  };
+  const yyyymm = priceDate.slice(0, 7);
+  const recentStartStr = monthStart(yyyymm, -2);
+  const prevStartStr = monthStart(yyyymm, -5);
+  const prevEndStr = monthStart(yyyymm, -2);
   type SalesQtyRow = { product_code: string; sale_month: string; quantity: number; source: string | null };
   const monthlySales = await fetchAll<SalesQtyRow>(
     supabase, "monthly_sales_quantity", "product_code,sale_month,quantity,source",
-    (q) => q.gte("sale_month", prevMonthStart.toISOString().slice(0, 10))
+    (q) => q.gte("sale_month", prevStartStr)
   );
-  const monthStr = priceDate.slice(0, 7) + "-01";
+  const monthStr = yyyymm + "-01";
   const salesQtyMap = new Map<string, number>();
   const recentSalesMap = new Map<string, { sale_month: string; quantity: number }[]>();
   const prevSalesMap = new Map<string, { sale_month: string; quantity: number }[]>();
-  const recentStartStr = recentMonthStart.toISOString().slice(0, 10);
-  const prevStartStr = prevMonthStart.toISOString().slice(0, 10);
-  const prevEndStr = prevMonthEnd.toISOString().slice(0, 10);
   for (const ms of monthlySales) {
     if (ms.source && ms.source !== "전체") continue;
     const e = { sale_month: ms.sale_month, quantity: ms.quantity || 0 };
@@ -216,27 +227,32 @@ export async function rollSellingPrices(supabase: SupabaseClient): Promise<RollR
   }
   void computePrev3MonthPct; // 사용안함 (api/products와 동일 흐름 보존용)
 
-  // ── Step 3: 838개 상품 추천가 산출
-  const recUpdates: { product_code: string; recommended_price: number }[] = [];
-  for (const row of mgmtData) {
-    const prod = productMap.get(row.product_code);
-    const selling = sellingMap.get(row.product_code);
-    const monthlyQty = salesQtyMap.get(row.product_code) || null;
+  // mgmt 행 인덱스 (priceDate 기준 1행씩) — products 전 상품 순회용
+  const mgmtMap = new Map<string, MgmtRow>();
+  for (const row of mgmtData) mgmtMap.set(row.product_code, row);
 
-    const dailyToday = dailyTodayMap.get(row.product_code);
-    const dailyPrev = dailyPrevMap.get(row.product_code);
-    const purchasePrice = (dailyToday != null && dailyToday > 0) ? dailyToday : (row.purchase_price || 0);
-    const prevPurchase = (dailyPrev != null && dailyPrev > 0) ? dailyPrev : (row.prev_purchase_price || 0);
+  // ── Step 3: 838개 전 상품 추천가 산출 (products 기준 — mgmt 누락 상품도 포함)
+  const recUpdates: { product_code: string; recommended_price: number }[] = [];
+  for (const prod of productsData) {
+    const code = prod.product_code;
+    const row = mgmtMap.get(code) ?? null;
+    const selling = sellingMap.get(code);
+    const monthlyQty = salesQtyMap.get(code) || null;
+
+    const dailyToday = dailyTodayMap.get(code);
+    const dailyPrev = dailyPrevMap.get(code);
+    const purchasePrice = (dailyToday != null && dailyToday > 0) ? dailyToday : (row?.purchase_price || 0);
+    const prevPurchase = (dailyPrev != null && dailyPrev > 0) ? dailyPrev : (row?.prev_purchase_price || 0);
 
     const platformSellingPrice = (selling?.selling_price ?? selling?.recommended_price ?? 0);
     const prevPlatformSellingPrice = selling?.prev_selling_price || null;
-    const targetMargin = prod?.target_margin_rate ? Number(prod.target_margin_rate) : null;
+    const targetMargin = prod.target_margin_rate != null ? Number(prod.target_margin_rate) : null;
 
     if (purchasePrice <= 0 && platformSellingPrice <= 0) continue;
 
-    const groupMembers: GroupMember[] = prod?.product_group
+    const groupMembers: GroupMember[] = prod.product_group
       ? (groupMembersMap.get(prod.product_group) || [])
-          .filter((m) => m.product_code !== row.product_code)
+          .filter((m) => m.product_code !== code)
           .map((m) => ({
             product_code: m.product_code,
             product_name: m.product_name || "",
@@ -254,32 +270,32 @@ export async function rollSellingPrices(supabase: SupabaseClient): Promise<RollR
       current_selling_price: platformSellingPrice,
       prev_selling_price: prevPlatformSellingPrice || 0,
       target_margin_rate: targetMargin,
-      is_key_item: prod?.is_key_item || false,
-      price_sensitivity: (prod?.price_sensitivity as "예민" | "고정" | "일반" | null) || "일반",
-      pack_role: (prod?.pack_role as "박스" | "소분" | null) || null,
-      pack_meta: prod?.pack_meta as never,
+      is_key_item: prod.is_key_item || false,
+      price_sensitivity: (prod.price_sensitivity as "예민" | "고정" | "일반" | null) || "일반",
+      pack_role: (prod.pack_role as "박스" | "소분" | null) || null,
+      pack_meta: prod.pack_meta as never,
       group_members: groupMembers,
       price_date: priceDate,
-      unit: row.unit || undefined,
-      product_name: row.product_name,
-      spec: row.spec,
-      learned_tier: prod?.learned_tier ?? null,
-      short_history: shortHistoryMap.get(row.product_code) || [],
-      long_history: longHistoryMap.get(row.product_code) || [],
-      monthly_sales: recentSalesMap.get(row.product_code) || [],
-      prev_monthly_sales: prevSalesMap.get(row.product_code) || [],
+      unit: (row?.unit ?? prod.unit) || undefined,
+      product_name: row?.product_name ?? prod.product_name,
+      spec: row?.spec ?? prod.spec,
+      learned_tier: prod.learned_tier ?? null,
+      short_history: shortHistoryMap.get(code) || [],
+      long_history: longHistoryMap.get(code) || [],
+      monthly_sales: recentSalesMap.get(code) || [],
+      prev_monthly_sales: prevSalesMap.get(code) || [],
       month_1_qty: selling?.month_1_qty || null,
       month_2_qty: selling?.month_2_qty || null,
       month_3_qty: selling?.month_3_qty || null,
       current_month_qty: monthlyQty,
       group_trend: null,
-      product_group: prod?.product_group ?? null,
+      product_group: prod.product_group ?? null,
       tier_ratios: tierRatios,
     };
 
     const ai = calculateAiRecommendation(aiInput);
     if (ai.ai_price > 0) {
-      recUpdates.push({ product_code: row.product_code, recommended_price: ai.ai_price });
+      recUpdates.push({ product_code: code, recommended_price: ai.ai_price });
     }
   }
 
