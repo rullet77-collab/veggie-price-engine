@@ -32,21 +32,23 @@ async function main() {
   console.log("★ 플랫폼시트에서 컬럼별 데이터 가져오는 중...");
 
   // 각 컬럼 별도 fetch
-  const [codes, prevSelling, selling, targetMargin] = await Promise.all([
+  const [codes, groups, prevSelling, selling, targetMargin] = await Promise.all([
     fetchColumn("A2:A740"),          // 상품코드
+    fetchColumn("U2:U740"),          // 상품그룹 (col 21)
     fetchColumn("AG2:AG740"),        // 기존판매가 (col 32)
     fetchColumn("AH2:AH740"),        // 판매가 (col 33)
     fetchColumn("AR2:AR740"),        // 수익률일괄변경용 (col 43)
   ]);
 
   console.log(`상품코드: ${codes.length}개`);
+  console.log(`상품그룹: ${groups.length}개`);
   console.log(`기존판매가: ${prevSelling.length}개`);
   console.log(`판매가: ${selling.length}개`);
   console.log(`수익률일괄변경용: ${targetMargin.length}개`);
 
   // 샘플 확인
   for (let i = 0; i < 5; i++) {
-    console.log(`  ${codes[i]}: 기존=${prevSelling[i]}, 판매가=${selling[i]}, 일괄변경=${targetMargin[i]}`);
+    console.log(`  ${codes[i]}: 그룹=${groups[i]} 기존=${prevSelling[i]}, 판매가=${selling[i]}, 일괄변경=${targetMargin[i]}`);
   }
 
   // Supabase 키 읽기
@@ -135,19 +137,30 @@ async function main() {
 
   console.log(`\nproduct_selling_prices: ${sellingUpdated}건 업데이트, ${sellingInserted}건 신규, ${sellingSkipped}건 스킵`);
 
-  // 2) products 테이블 target_margin_rate 업데이트
+  // 2) products 테이블 target_margin_rate + product_group 업데이트
   let marginUpdated = 0;
-  let marginSkipped = 0;
+  let groupUpdated = 0;
+  let bothSkipped = 0;
 
   for (let i = 0; i < codes.length; i++) {
     const code = codes[i];
     if (!code || code.length > 6) continue;
 
     const margin = parseNum(targetMargin[i] || "");
-    if (margin == null) {
-      marginSkipped++;
+    const groupStr = (groups[i] || "").trim();
+    const group = groupStr ? parseInt(groupStr, 10) : null;
+    const hasValidGroup = group != null && !isNaN(group) && group > 0;
+
+    if (margin == null && !hasValidGroup) {
+      bothSkipped++;
       continue;
     }
+
+    const body: Record<string, unknown> = {
+      updated_at: new Date().toISOString(),
+    };
+    if (margin != null) body.target_margin_rate = margin;
+    if (hasValidGroup) body.product_group = group;
 
     const res = await fetch(
       `${SUPABASE_URL}/rest/v1/products?product_code=eq.${code}`,
@@ -159,19 +172,19 @@ async function main() {
           Authorization: `Bearer ${supabaseKey}`,
           Prefer: "return=minimal",
         },
-        body: JSON.stringify({
-          target_margin_rate: margin,
-          updated_at: new Date().toISOString(),
-        }),
+        body: JSON.stringify(body),
       }
     );
 
     if (res.ok) {
-      marginUpdated++;
+      if (margin != null) marginUpdated++;
+      if (hasValidGroup) groupUpdated++;
     }
   }
 
-  console.log(`products target_margin_rate: ${marginUpdated}건 업데이트, ${marginSkipped}건 스킵`);
+  console.log(`products target_margin_rate: ${marginUpdated}건 업데이트`);
+  console.log(`products product_group: ${groupUpdated}건 업데이트`);
+  console.log(`둘 다 없어서 스킵: ${bothSkipped}건`);
   console.log("\n완료!");
 }
 
