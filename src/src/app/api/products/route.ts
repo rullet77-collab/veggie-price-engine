@@ -115,6 +115,16 @@ export async function GET(request: Request) {
       }
     }
 
+    // B-3: group_tier_ratios 로드 (등급 페어별 가격비)
+    type TierRatioRow = { product_group: number; tier_a: number; tier_b: number; ratio: number };
+    const tierRatioRows = await fetchAll<TierRatioRow>(
+      "group_tier_ratios", "product_group,tier_a,tier_b,ratio"
+    );
+    const tierRatios = new Map<string, number>();
+    for (const r of tierRatioRows) {
+      tierRatios.set(`${r.product_group}-${r.tier_a}-${r.tier_b}`, Number(r.ratio));
+    }
+
     // 4) 플랫폼 판매가 + 월별 매출 통계
     // current_month_qty, prev_3month_pct 는 DB에 저장하지 않고 매번 계산 (single source of truth: monthly_sales_quantity)
     type SellingRow = {
@@ -518,6 +528,8 @@ export async function GET(request: Request) {
           month_3_qty: selling?.month_3_qty || null,
           current_month_qty: monthlyQty,
           group_trend: null,
+          product_group: prod?.product_group ?? null,
+          tier_ratios: tierRatios,
         };
         const ai = calculateAiRecommendation(aiInput);
         recommendedPrice = ai.ai_price;

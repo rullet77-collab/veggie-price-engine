@@ -130,6 +130,16 @@ export async function rollSellingPrices(supabase: SupabaseClient): Promise<RollR
     supabase, "products",
     "product_code,product_group,is_key_item,target_margin_rate,is_event_item,product_type,price_sensitivity,pack_role,pack_meta,product_name,unit,spec,learned_tier"
   );
+
+  // group_tier_ratios 로드 (B-3) — Map<"groupId-tierA-tierB", ratio>
+  type TierRatioRow = { product_group: number; tier_a: number; tier_b: number; ratio: number };
+  const tierRatioRows = await fetchAll<TierRatioRow>(
+    supabase, "group_tier_ratios", "product_group,tier_a,tier_b,ratio"
+  );
+  const tierRatios = new Map<string, number>();
+  for (const r of tierRatioRows) {
+    tierRatios.set(`${r.product_group}-${r.tier_a}-${r.tier_b}`, Number(r.ratio));
+  }
   const productMap = new Map<string, ProdRow>();
   for (const p of productsData) productMap.set(p.product_code, p);
   const groupMembersMap = new Map<number, ProdRow[]>();
@@ -263,6 +273,8 @@ export async function rollSellingPrices(supabase: SupabaseClient): Promise<RollR
       month_3_qty: selling?.month_3_qty || null,
       current_month_qty: monthlyQty,
       group_trend: null,
+      product_group: prod?.product_group ?? null,
+      tier_ratios: tierRatios,
     };
 
     const ai = calculateAiRecommendation(aiInput);

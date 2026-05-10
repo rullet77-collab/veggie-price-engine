@@ -1,5 +1,6 @@
 import { createClient } from "@supabase/supabase-js";
 import { rollSellingPrices } from "@/lib/rollSellingPrices";
+import { learnTierRatios } from "@/lib/tierRatios";
 import * as XLSX from "xlsx";
 
 const supabase = createClient(
@@ -163,16 +164,21 @@ function getMonthlySource(sheetName: string): string {
 
 /** 월별매출상세 파일 감지
  *  두 형식 모두 인식:
- *    A. RAW (일자별) — ROWKEY + 거래처 + 그룹명 컬럼
- *    B. 통합 (월/주말/누락분) — 코드 + 일자 + 단가 + 수량 + 공급가액 (ROWKEY 없음)
+ *    A. RAW (일자별) — ROWKEY 컬럼 (천년경영 거래번호) → 시트만으로 식별
+ *    B. 통합 (월/주말/누락분) — 파일명에 "매출" + 채널 키워드 (식봄/신선행/온일장/배민) 동시 존재
+ *       (매입상세 파일도 같은 컬럼 셋이라 시트만으론 구분 불가 → 파일명 가드)
  */
-function detectSalesDetail(workbook: XLSX.WorkBook): boolean {
+function detectSalesDetail(workbook: XLSX.WorkBook, fileName: string | null = null): boolean {
   const sheet = workbook.Sheets[workbook.SheetNames[0]];
   if (!sheet) return false;
   // A. RAW
   const raw = findHeaders(sheet, ["일자", "기본코드", "ROWKEY", "수량", "단가"], 4);
   if (raw && raw.colMap["ROWKEY"] !== undefined) return true;
-  // B. 통합 — "코드"+"일자"+"단가"+"수량"+"공급가액" 모두 있으면 매출상세
+  // B. 통합 — 파일명 가드
+  if (!fileName) return false;
+  const hasSales = fileName.includes("매출");
+  const hasChannel = detectChannelFromFilename(fileName) != null;
+  if (!hasSales || !hasChannel) return false;
   const integ = findHeaders(sheet, ["코드", "일자", "단가", "수량", "공급가액"], 4);
   return integ !== null;
 }
@@ -538,7 +544,7 @@ export async function POST(request: Request) {
     //    UPSERT 정책: 같은 row_key 가 다시 들어오면 정정으로 간주하고 갱신
     //    이유: 천년경영에서 거래 정정 시 같은 ROWKEY 재발행 — selling_price/qty 변경 반영 필요
     //    매일 전체 파일을 올려도 ROWKEY UNIQUE 제약 + 동일값 UPSERT 라 부작용 없음
-    if (detectSalesDetail(workbook)) {
+    if (detectSalesDetail(workbook, file.name)) {
       const sheet = workbook.Sheets[workbook.SheetNames[0]];
       // 통합파일은 그룹명이 없으니 파일명에서 채널 추출 (RAW면 그룹명 우선이라 무해)
       const fileChannel = detectChannelFromFilename(file.name);
@@ -710,6 +716,7 @@ export async function POST(request: Request) {
       r.type.includes("매입현황") || r.type.includes("매입상세")
     );
     let learned: { updated: number; tier1: number; tier2: number; tier3: number } | null = null;
+    let learnedRatios: { learnedPairs: number; totalSamples: number } | null = null;
     let rolled: { prev_rolled: number; recommended_set: number; duration_ms: number } | null = null;
     if (hasPurchaseChange) {
       try {
@@ -722,13 +729,21 @@ export async function POST(request: Request) {
         console.warn("learn_tiers 호출 실패:", e);
       }
       try {
+        // B-3: 등급별 가격비율 학습 (group_tier_ratios)
+        const r = await learnTierRatios(365);
+        learnedRatios = { learnedPairs: r.learnedPairs, totalSamples: r.totalSamples };
+      } catch (e) {
+        console.warn("learnTierRatios 호출 실패:", e);
+      }
+      try {
+        // rollSellingPrices 는 group_tier_ratios 를 자동 로드해서 추천에 사용
         rolled = await rollSellingPrices(supabase);
       } catch (e) {
         console.warn("rollSellingPrices 실패:", e);
       }
     }
 
-    return Response.json({ success: true, results, learned_tiers: learned, rolled_selling: rolled });
+    return Response.json({ success: true, results, learned_tiers: learned, learned_tier_ratios: learnedRatios, rolled_selling: rolled });
   } catch (err: unknown) {
     console.error("Upload error:", err);
     const message = err instanceof Error ? err.message : "알 수 없는 오류";

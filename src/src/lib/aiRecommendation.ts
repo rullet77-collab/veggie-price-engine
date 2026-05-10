@@ -50,6 +50,8 @@ export type AiRecInput = {
   product_name?: string | null;          // Layer 4-B 등급키 매칭용
   spec?: string | null;                  // Layer 4-B kg 환산용
   learned_tier?: number | null;          // 365일 학습 tier (1=top/2=mid/3=low)
+  product_group?: number | null;         // 그룹별 tier ratio 조회용
+  tier_ratios?: Map<string, number> | null; // "groupId-tierA-tierB" → ratio (B-3)
 
   short_history: PriceHistory[]; // 8일
   long_history: PriceHistory[]; // 60일 (선택)
@@ -855,13 +857,37 @@ export function getUnitConversionRatio(
  *  - 정렬: 공통 토큰 점수 ↓ → 자기 기준가 유사도 ↑ → 최신 매입일 ↓
  *  - myReferencePrice 가 있으면 가격 유사도 동점처리에 활용 (자기 매입가 기준)
  */
+/**
+ * tier 페어 비율 조회 (B-3)
+ *  - direct: (groupId, tierA, tierB) → 그대로
+ *  - reverse: (groupId, tierB, tierA) 학습됐으면 1/그값
+ *  - 미학습이면 null (보정 안 함)
+ *  - 의미: target(tierA) = anchor(tierB) × ratio
+ */
+function lookupTierRatio(
+  ratios: Map<string, number> | null | undefined,
+  productGroup: number | null | undefined,
+  tierA: number,
+  tierB: number
+): number | null {
+  if (!ratios || !productGroup) return null;
+  if (tierA === tierB) return 1;
+  const direct = ratios.get(`${productGroup}-${tierA}-${tierB}`);
+  if (direct != null && direct > 0) return direct;
+  const reverse = ratios.get(`${productGroup}-${tierB}-${tierA}`);
+  if (reverse != null && reverse > 0) return 1 / reverse;
+  return null;
+}
+
 function inferFromSameGradeMember(
   myName: string,
   myUnit: string | null | undefined,
   mySpec: string | null | undefined,
   members: GroupMember[],
   myReferencePrice: number = 0,
-  myLearnedTier: number | null = null
+  myLearnedTier: number | null = null,
+  myProductGroup: number | null | undefined = null,
+  tierRatios: Map<string, number> | null | undefined = null
 ): GroupEstimateResult | null {
   const myTokens = tokenizeName(myName);
   if (myTokens.length === 0) return null;
@@ -912,15 +938,23 @@ function inferFromSameGradeMember(
   });
 
   const w = candidates[0];
-  const estimatedPrice = ceil10(w.latest.price / w.conv.ratio);
+  // 단위 환산 후 1차 가격
+  const unitConverted = w.latest.price / w.conv.ratio;
+  // 등급 비율 보정 (B-3): 다른 등급이면 학습된 ratio 적용
+  const anchorTier = getGradeTier(w.member.product_name);
+  const tierRatio = lookupTierRatio(tierRatios, myProductGroup, myKeyTier, anchorTier);
+  const estimatedPrice = ceil10(tierRatio != null ? unitConverted * tierRatio : unitConverted);
   if (estimatedPrice <= 0) return null;
 
+  const tierNote = tierRatio != null && tierRatio !== 1
+    ? ` × 등급비율 ${tierRatio.toFixed(3)}(t${anchorTier}→t${myKeyTier})`
+    : "";
   return {
     estimated_price: estimatedPrice,
-    method: "동일등급 단위환산",
+    method: "동일등급 단위환산" + (tierRatio != null && tierRatio !== 1 ? " + 등급보정" : ""),
     anchor_code: w.member.product_code,
     anchor_name: w.member.product_name,
-    reason: `[동일등급 추론] 토큰 ${w.score}개 공유: ${w.member.product_name}(${w.member.product_code}) ${w.latest.price.toLocaleString()}원 (${w.member.unit}, ${w.latest.date.slice(5)}) → ${w.conv.note} → ${myUnit} 환산 ${estimatedPrice.toLocaleString()}원`,
+    reason: `[동일등급 추론] 토큰 ${w.score}개 공유: ${w.member.product_name}(${w.member.product_code}) ${w.latest.price.toLocaleString()}원 (${w.member.unit}, ${w.latest.date.slice(5)}) → ${w.conv.note}${tierNote} → ${myUnit} 환산 ${estimatedPrice.toLocaleString()}원`,
     confidence: "high",
   };
 }
@@ -936,13 +970,15 @@ function estimateFromGroupMembers(
   members: GroupMember[],
   date: Date,
   myReferencePrice: number = 0,
-  myLearnedTier: number | null = null
+  myLearnedTier: number | null = null,
+  myProductGroup: number | null | undefined = null,
+  tierRatios: Map<string, number> | null | undefined = null
 ): GroupEstimateResult | null {
   if (members.length === 0) return null;
 
   // ── Layer 4-B 우선 시도: 토큰 점수 매칭 + 단위환산 (xlsx 밖 상품 간 가격 유추)
   // pack_role 없는 케이스(005045 ↔ 007751 같은 별개매입 페어)에 작동
-  const sameGrade = inferFromSameGradeMember(myName, myUnit, mySpec, members, myReferencePrice, myLearnedTier);
+  const sameGrade = inferFromSameGradeMember(myName, myUnit, mySpec, members, myReferencePrice, myLearnedTier, myProductGroup, tierRatios);
   if (sameGrade) return sameGrade;
 
   // Case A: 나는 관계식 있고, 같은 그룹에 다른 관계식 품목이 최근 매입있음
@@ -1185,7 +1221,9 @@ export function calculateAiRecommendation(input: AiRecInput): AiRecOutput {
       group_members || [],
       analysisDate,
       myReferencePrice,
-      input.learned_tier ?? null
+      input.learned_tier ?? null,
+      input.product_group ?? null,
+      input.tier_ratios ?? null
     );
   }
 
