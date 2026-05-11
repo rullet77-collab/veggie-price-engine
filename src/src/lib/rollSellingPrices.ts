@@ -91,18 +91,19 @@ export async function rollSellingPrices(supabase: SupabaseClient): Promise<RollR
 
   // ── Step 2: 추천가 일괄 산출
   // 추천가 산출에 필요한 데이터 (api/products/route.ts 와 동일하게 모음)
+  // priceDate = max(mgmt.max, daily_purchase.max) — RAW DATA "기존/변경" 시트가
+  // 매일 안 올라와도 daily_purchase 만 갱신되면 그 날짜 기준으로 추천 산출
+  const [mgmtMaxRes, dailyMaxRes] = await Promise.all([
+    supabase.from("daily_product_management").select("price_date").order("price_date", { ascending: false }).limit(1).maybeSingle(),
+    supabase.from("daily_purchase_prices").select("price_date").order("price_date", { ascending: false }).limit(1).maybeSingle(),
+  ]);
+  const mgmtMax = (mgmtMaxRes.data as { price_date: string } | null)?.price_date ?? null;
+  const dailyMax = (dailyMaxRes.data as { price_date: string } | null)?.price_date ?? null;
+  const priceDate = (mgmtMax && dailyMax) ? (mgmtMax >= dailyMax ? mgmtMax : dailyMax) : (mgmtMax || dailyMax);
 
-  const { data: latestDate } = await supabase
-    .from("daily_product_management")
-    .select("price_date")
-    .order("price_date", { ascending: false })
-    .limit(1)
-    .single();
-
-  if (!latestDate) {
+  if (!priceDate) {
     return { prev_rolled: prevRolled, recommended_set: 0, duration_ms: Date.now() - start };
   }
-  const priceDate = (latestDate as { price_date: string }).price_date;
 
   type MgmtRow = {
     product_code: string; price_date: string;
@@ -111,10 +112,13 @@ export async function rollSellingPrices(supabase: SupabaseClient): Promise<RollR
     product_name: string | null; spec: string | null;
     unit: string | null; category_name: string | null;
   };
+  // mgmt 는 priceDate 가 daily 의 max 일 수도 있으므로 mgmt.max 행을 가져옴
+  // (해당 날짜 mgmt 데이터가 없어도 productsData 순회로 모든 838 상품 처리됨)
+  const mgmtFetchDate = mgmtMax || priceDate;
   const mgmtData = await fetchAll<MgmtRow>(
     supabase, "daily_product_management",
     "product_code,price_date,purchase_price,prev_purchase_price,product_name,spec,unit,category_name",
-    (q) => q.eq("price_date", priceDate)
+    (q) => q.eq("price_date", mgmtFetchDate)
   );
 
   type ProdRow = {
