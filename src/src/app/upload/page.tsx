@@ -17,6 +17,12 @@ type UploadResult = {
   error?: string;
 };
 
+type FileEntry = {
+  file: File;
+  status: "pending" | "uploading" | "done" | "error";
+  result?: UploadResult;
+};
+
 function isExcelFile(file: File): boolean {
   return (
     file.type ===
@@ -27,208 +33,270 @@ function isExcelFile(file: File): boolean {
   );
 }
 
-function DropZone({
-  label,
-  description,
-  file,
-  onFileSelect,
-  onUpload,
-  uploading,
-  result,
-}: {
-  label: string;
-  description: string;
-  file: File | null;
-  onFileSelect: (file: File) => void;
-  onUpload: () => void;
-  uploading: boolean;
-  result: UploadResult | null;
-}) {
-  const inputRef = useRef<HTMLInputElement>(null);
-  const [dragOver, setDragOver] = useState(false);
+function entryKey(f: File): string {
+  return `${f.name}__${f.size}__${f.lastModified}`;
+}
 
+export default function UploadPage() {
+  const [entries, setEntries] = useState<FileEntry[]>([]);
+  const [uploading, setUploading] = useState(false);
+  const [dragOver, setDragOver] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  // 파일 추가 — 같은 파일은 무시
+  const addFiles = useCallback((files: FileList | File[] | null) => {
+    if (!files) return;
+    const incoming = Array.from(files).filter(isExcelFile);
+    if (incoming.length === 0) return;
+    setEntries((prev) => {
+      const existing = new Set(prev.map((e) => entryKey(e.file)));
+      const fresh: FileEntry[] = [];
+      for (const f of incoming) {
+        if (!existing.has(entryKey(f))) {
+          fresh.push({ file: f, status: "pending" });
+          existing.add(entryKey(f));
+        }
+      }
+      return [...prev, ...fresh];
+    });
+  }, []);
+
+  const removeEntry = useCallback((key: string) => {
+    setEntries((prev) => prev.filter((e) => entryKey(e.file) !== key));
+  }, []);
+
+  const clearAll = useCallback(() => setEntries([]), []);
+
+  // 한 파일 업로드
+  const uploadOne = async (entry: FileEntry): Promise<UploadResult> => {
+    const fd = new FormData();
+    fd.append("file", entry.file);
+    try {
+      const res = await fetch("/api/upload/rawdata", { method: "POST", body: fd });
+      const data = await res.json();
+      if (res.ok && data.success) {
+        return { success: true, results: data.results };
+      }
+      return { success: false, error: data.error || "서버 오류" };
+    } catch {
+      return { success: false, error: "네트워크 오류" };
+    }
+  };
+
+  // 전체 업로드 — 순차 처리 (각 파일에서 RPC + rolling 돌기 때문)
+  const uploadAll = async () => {
+    if (entries.length === 0 || uploading) return;
+    setUploading(true);
+    // pending / error 만 다시 시도
+    for (let i = 0; i < entries.length; i++) {
+      if (entries[i].status === "done") continue;
+      setEntries((prev) => prev.map((e, idx) => (idx === i ? { ...e, status: "uploading" } : e)));
+      // 순간 entries 는 stale 일 수 있어서 직접 file 참조
+      const result = await uploadOne(entries[i]);
+      setEntries((prev) =>
+        prev.map((e, idx) =>
+          idx === i ? { ...e, status: result.success ? "done" : "error", result } : e
+        )
+      );
+    }
+    setUploading(false);
+  };
+
+  // 드래그앤드롭 — append
   const handleDragOver = useCallback((e: DragEvent) => {
     e.preventDefault();
     setDragOver(true);
   }, []);
-
   const handleDragLeave = useCallback((e: DragEvent) => {
     e.preventDefault();
     setDragOver(false);
   }, []);
-
   const handleDrop = useCallback(
     (e: DragEvent) => {
       e.preventDefault();
       setDragOver(false);
-      const f = e.dataTransfer.files[0];
-      if (f && isExcelFile(f)) onFileSelect(f);
+      addFiles(e.dataTransfer.files);
     },
-    [onFileSelect]
+    [addFiles]
   );
 
+  // 파일 추가 — input change
   const handleChange = useCallback(
     (e: ChangeEvent<HTMLInputElement>) => {
-      const f = e.target.files?.[0];
-      if (f) onFileSelect(f);
+      addFiles(e.target.files);
+      // 같은 파일을 다시 선택할 수 있도록 input 초기화
+      if (e.target) e.target.value = "";
     },
-    [onFileSelect]
+    [addFiles]
   );
 
-  return (
-    <div className="bg-white rounded-lg border border-gray-200 shadow-sm p-6">
-      <h2 className="text-lg font-semibold text-gray-800 mb-1">{label}</h2>
-      <p className="text-xs text-gray-500 mb-4">{description}</p>
-
-      <div
-        onDragOver={handleDragOver}
-        onDragLeave={handleDragLeave}
-        onDrop={handleDrop}
-        onClick={() => inputRef.current?.click()}
-        className={`
-          border-2 border-dashed rounded-lg p-8 text-center cursor-pointer transition-colors
-          ${
-            dragOver
-              ? "border-blue-400 bg-blue-50"
-              : file
-              ? "border-green-300 bg-green-50"
-              : "border-gray-300 bg-gray-50 hover:border-gray-400 hover:bg-gray-100"
-          }
-        `}
-      >
-        <input
-          ref={inputRef}
-          type="file"
-          accept=".xlsx,.xls"
-          onChange={handleChange}
-          className="hidden"
-        />
-        {file ? (
-          <div>
-            <svg className="mx-auto h-8 w-8 text-green-500 mb-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
-            </svg>
-            <p className="text-sm font-medium text-gray-900">{file.name}</p>
-            <p className="text-xs text-gray-500 mt-1">{(file.size / 1024).toFixed(1)} KB</p>
-            <p className="text-xs text-blue-600 mt-1">클릭하여 다른 파일 선택</p>
-          </div>
-        ) : (
-          <div>
-            <svg className="mx-auto h-8 w-8 text-gray-400 mb-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
-            </svg>
-            <p className="text-sm text-gray-600">끌어다 놓거나 클릭</p>
-            <p className="text-xs text-gray-400 mt-1">.xlsx, .xls</p>
-          </div>
-        )}
-      </div>
-
-      <button
-        onClick={onUpload}
-        disabled={!file || uploading}
-        className={`mt-4 w-full py-2.5 rounded-lg font-medium text-sm transition-colors ${
-          !file || uploading
-            ? "bg-gray-200 text-gray-400 cursor-not-allowed"
-            : "bg-blue-600 text-white hover:bg-blue-700 active:bg-blue-800"
-        }`}
-      >
-        {uploading ? (
-          <span className="flex items-center justify-center gap-2">
-            <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none">
-              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-            </svg>
-            처리 중...
-          </span>
-        ) : (
-          "업로드"
-        )}
-      </button>
-
-      {result && (
-        <div className="mt-4 space-y-2">
-          {result.success && result.results ? (
-            result.results.map((r, i) => (
-              <div
-                key={i}
-                className="p-3 rounded-lg text-sm bg-green-50 border border-green-200 text-green-800"
-              >
-                <p className="font-medium">{r.type}</p>
-                <p className="text-xs mt-0.5">
-                  {r.sheetName} — {r.total.toLocaleString()}건 처리, <strong>{r.inserted.toLocaleString()}건 저장</strong>
-                  {r.skipped !== undefined && r.skipped > 0 && (
-                    <span className="text-gray-500"> ({r.skipped.toLocaleString()}건 변경 없음)</span>
-                  )}
-                </p>
-                {r.errors && r.errors.length > 0 && (
-                  <p className="text-xs text-amber-700 mt-1">
-                    일부 오류: {r.errors[0]}
-                  </p>
-                )}
-              </div>
-            ))
-          ) : (
-            <div className="p-3 rounded-lg text-sm bg-red-50 border border-red-200 text-red-800">
-              <p>{result.error || "업로드 중 오류가 발생했습니다."}</p>
-            </div>
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
-
-export default function UploadPage() {
-  const [file, setFile] = useState<File | null>(null);
-  const [uploading, setUploading] = useState(false);
-  const [result, setResult] = useState<UploadResult | null>(null);
-
-  const upload = async () => {
-    if (!file) return;
-    setUploading(true);
-    setResult(null);
-
-    try {
-      const formData = new FormData();
-      formData.append("file", file);
-
-      const res = await fetch("/api/upload/rawdata", {
-        method: "POST",
-        body: formData,
-      });
-      const data = await res.json();
-
-      if (res.ok && data.success) {
-        setResult({ success: true, results: data.results });
-      } else {
-        setResult({ success: false, error: data.error || "서버 오류" });
-      }
-    } catch {
-      setResult({ success: false, error: "네트워크 오류가 발생했습니다." });
-    } finally {
-      setUploading(false);
-    }
-  };
+  const pendingCount = entries.filter((e) => e.status === "pending" || e.status === "error").length;
 
   return (
     <div className="min-h-screen bg-gray-50">
       <main className="max-w-3xl mx-auto px-6 py-8">
-        <h1 className="text-2xl font-bold text-gray-900 mb-2">
-          데이터 업로드
-        </h1>
+        <h1 className="text-2xl font-bold text-gray-900 mb-2">데이터 업로드</h1>
         <p className="text-sm text-gray-500 mb-8">
-          엑셀 파일을 업로드하면 내용을 자동으로 인식하여 알맞은 테이블에 저장합니다.
+          매입·매출 파일을 한 번에 여러 개 선택하거나 끌어다 놓으세요. 서로 다른 폴더의 파일도 추가 선택으로 합칠 수 있습니다.
         </p>
 
-        <DropZone
-          label="엑셀 파일 업로드"
-          description="RAW DATA · 월별매출상세 자동 인식"
-          file={file}
-          onFileSelect={(f) => { setFile(f); setResult(null); }}
-          onUpload={upload}
-          uploading={uploading}
-          result={result}
-        />
+        <div className="bg-white rounded-lg border border-gray-200 shadow-sm p-6">
+          <h2 className="text-lg font-semibold text-gray-800 mb-1">엑셀 파일 업로드</h2>
+          <p className="text-xs text-gray-500 mb-4">RAW DATA · 월별매출상세 자동 인식</p>
+
+          <div
+            onDragOver={handleDragOver}
+            onDragLeave={handleDragLeave}
+            onDrop={handleDrop}
+            onClick={() => inputRef.current?.click()}
+            className={`
+              border-2 border-dashed rounded-lg p-8 text-center cursor-pointer transition-colors
+              ${
+                dragOver
+                  ? "border-blue-400 bg-blue-50"
+                  : entries.length > 0
+                  ? "border-green-300 bg-green-50"
+                  : "border-gray-300 bg-gray-50 hover:border-gray-400 hover:bg-gray-100"
+              }
+            `}
+          >
+            <input
+              ref={inputRef}
+              type="file"
+              accept=".xlsx,.xls"
+              multiple
+              onChange={handleChange}
+              className="hidden"
+            />
+            <svg className="mx-auto h-8 w-8 text-gray-400 mb-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+            </svg>
+            {entries.length === 0 ? (
+              <>
+                <p className="text-sm text-gray-600">끌어다 놓거나 클릭해서 파일 선택 (여러 개 가능)</p>
+                <p className="text-xs text-gray-400 mt-1">.xlsx, .xls</p>
+              </>
+            ) : (
+              <>
+                <p className="text-sm text-gray-700"><strong>{entries.length}개</strong> 파일 선택됨</p>
+                <p className="text-xs text-blue-600 mt-1">클릭하거나 끌어다 놓아 추가</p>
+              </>
+            )}
+          </div>
+
+          {entries.length > 0 && (
+            <ul className="mt-4 divide-y divide-gray-100 border border-gray-200 rounded-lg overflow-hidden">
+              {entries.map((e) => {
+                const k = entryKey(e.file);
+                return (
+                  <li key={k} className="px-3 py-2 flex items-center gap-3 text-sm bg-white">
+                    <span
+                      className={`shrink-0 w-2 h-2 rounded-full ${
+                        e.status === "done"
+                          ? "bg-green-500"
+                          : e.status === "uploading"
+                          ? "bg-blue-500 animate-pulse"
+                          : e.status === "error"
+                          ? "bg-red-500"
+                          : "bg-gray-300"
+                      }`}
+                    />
+                    <span className="flex-1 truncate text-gray-800">{e.file.name}</span>
+                    <span className="text-xs text-gray-400">{(e.file.size / 1024).toFixed(1)} KB</span>
+                    <span className="text-xs w-16 text-right">
+                      {e.status === "done" && <span className="text-green-600">완료</span>}
+                      {e.status === "uploading" && <span className="text-blue-600">처리 중</span>}
+                      {e.status === "error" && <span className="text-red-600">실패</span>}
+                      {e.status === "pending" && <span className="text-gray-400">대기</span>}
+                    </span>
+                    {!uploading && (
+                      <button
+                        onClick={(ev) => {
+                          ev.stopPropagation();
+                          removeEntry(k);
+                        }}
+                        className="text-xs text-gray-400 hover:text-red-600"
+                        title="제거"
+                      >
+                        ✕
+                      </button>
+                    )}
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+
+          <div className="mt-4 flex items-center gap-2">
+            <button
+              onClick={uploadAll}
+              disabled={pendingCount === 0 || uploading}
+              className={`flex-1 py-2.5 rounded-lg font-medium text-sm transition-colors ${
+                pendingCount === 0 || uploading
+                  ? "bg-gray-200 text-gray-400 cursor-not-allowed"
+                  : "bg-blue-600 text-white hover:bg-blue-700 active:bg-blue-800"
+              }`}
+            >
+              {uploading ? (
+                <span className="flex items-center justify-center gap-2">
+                  <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                  </svg>
+                  처리 중...
+                </span>
+              ) : entries.length === 0 ? (
+                "파일을 추가하세요"
+              ) : pendingCount === entries.length ? (
+                `${entries.length}개 업로드`
+              ) : (
+                `남은 ${pendingCount}개 업로드`
+              )}
+            </button>
+            {entries.length > 0 && !uploading && (
+              <button
+                onClick={clearAll}
+                className="px-4 py-2.5 rounded-lg text-sm text-gray-600 border border-gray-200 hover:bg-gray-50"
+              >
+                전체 비우기
+              </button>
+            )}
+          </div>
+
+          {entries.some((e) => e.result) && (
+            <div className="mt-4 space-y-2">
+              {entries.map((e) => {
+                if (!e.result) return null;
+                const k = entryKey(e.file);
+                if (!e.result.success) {
+                  return (
+                    <div key={k} className="p-3 rounded-lg text-sm bg-red-50 border border-red-200 text-red-800">
+                      <p className="font-medium text-xs text-gray-600">{e.file.name}</p>
+                      <p>{e.result.error || "업로드 중 오류가 발생했습니다."}</p>
+                    </div>
+                  );
+                }
+                return (
+                  <div key={k} className="p-3 rounded-lg text-sm bg-green-50 border border-green-200 text-green-800">
+                    <p className="font-medium text-xs text-gray-600 mb-1">{e.file.name}</p>
+                    {(e.result.results || []).map((r, i) => (
+                      <div key={i} className="text-xs">
+                        <span className="font-medium">{r.type}</span> — {r.sheetName} · {r.total.toLocaleString()}건 처리,{" "}
+                        <strong>{r.inserted.toLocaleString()}건 저장</strong>
+                        {r.skipped !== undefined && r.skipped > 0 && (
+                          <span className="text-gray-500"> ({r.skipped.toLocaleString()}건 변경 없음)</span>
+                        )}
+                        {r.errors && r.errors.length > 0 && (
+                          <span className="block text-amber-700">일부 오류: {r.errors[0]}</span>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
 
         <div className="mt-8 bg-amber-50 border border-amber-200 rounded-lg p-4 text-sm text-amber-800">
           <p className="font-medium mb-2">자동 인식되는 파일/시트</p>
@@ -250,12 +318,12 @@ export default function UploadPage() {
               <span className="text-gray-500">→ 경매가</span>
             </div>
             <div className="flex justify-between col-span-2">
-              <span>월별매출상세 (ROWKEY 컬럼 포함 별도 파일)</span>
-              <span className="text-gray-500">→ 매출 상세 (누적, 신규만 INSERT)</span>
+              <span>월별매출상세 (RAW + 채널 통합)</span>
+              <span className="text-gray-500">→ 매출 상세 (UPSERT, 정정 반영)</span>
             </div>
           </div>
           <p className="text-xs text-gray-500 mt-3">
-            중복 데이터는 자동으로 처리됩니다. 데이터는 누적 저장됩니다.
+            여러 파일은 순차 처리됩니다. 각 파일 처리 직후 추천가 / 매출 집계가 자동 갱신됩니다.
           </p>
         </div>
       </main>
