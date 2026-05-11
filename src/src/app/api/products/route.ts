@@ -125,6 +125,10 @@ export async function GET(request: Request) {
       tierRatios.set(`${r.product_group}-${r.tier_a}-${r.tier_b}`, Number(r.ratio));
     }
 
+    // 그룹별 reference 상품 — 60일 매입 카운트 최다 (안정된 변동률 시그널 제공)
+    // (purchaseHistory60 은 아래에서 조회되므로 빈 Map 으로 시작하고 매입 이력 적재 후 산출)
+    const groupReferenceCode = new Map<number, string>();
+
     // 4) 플랫폼 판매가 + 월별 매출 통계
     // current_month_qty, prev_3month_pct 는 DB에 저장하지 않고 매번 계산 (single source of truth: monthly_sales_quantity)
     type SellingRow = {
@@ -200,6 +204,19 @@ export async function GET(request: Request) {
       const sortedDates = [...dPrices.keys()].sort().reverse();  // desc
       if (sortedDates[0]) dailyTodayMap.set(code, dPrices.get(sortedDates[0])!);
       if (sortedDates[1]) dailyPrevMap.set(code, dPrices.get(sortedDates[1])!);
+    }
+
+    // 그룹별 reference 상품 산출 — 60일 distinct 매입일 수가 가장 많은 멤버
+    // (조림용 같이 매입 띄엄띄엄한 상품의 변동률 추정 anchor 로 사용)
+    {
+      const byGroup = new Map<number, { code: string; cnt: number }>();
+      for (const [code, dates] of datePriceByCode.entries()) {
+        const p = productMap.get(code);
+        if (!p?.product_group) continue;
+        const cur = byGroup.get(p.product_group);
+        if (!cur || dates.size > cur.cnt) byGroup.set(p.product_group, { code, cnt: dates.size });
+      }
+      for (const [groupId, info] of byGroup) groupReferenceCode.set(groupId, info.code);
     }
 
     // 7일 동향 슬롯 날짜 배열 (sevenDaysAgo ~ priceDate, 8일 inclusive)
@@ -413,51 +430,77 @@ export async function GET(request: Request) {
         return a.code.localeCompare(b.code);
       });
 
-      const purchaseHistory8d = slotDates.map((date) => {
+      // 7일동향 빈 슬롯 보강 — 2단계
+      //   1차: 동일 등급 anchor (score == myTokens.length) → 단위환산
+      //   2차: 그룹 reference 의 (인접 known date → slot date) 변동률을 내 known price 에 적용
+      //
+      // 의도: 다른 등급(1점) anchor 의 매입가를 그대로 가져오지 않음 → basePP 부풀림 방지
+      type SlotEntry = {
+        date: string;
+        price: number | null;
+        source: "actual" | "inferred" | "ref_change" | "missing";
+        anchor: string | null;
+      };
+      const exactGradeAnchors = sameGradeAnchors.filter((a) => a.score === myTokens.length);
+
+      // 1차 패스 — actual + 동일 등급 anchor
+      const slots: SlotEntry[] = slotDates.map((date) => {
         const actual = priceByDateAndCode.get(date)?.get(row.product_code);
         if (actual != null && actual > 0) {
-          return { date, price: actual, source: "actual" as const, anchor: null };
+          return { date, price: actual, source: "actual", anchor: null };
         }
-        // 빈 슬롯 → 정렬된 후보 순으로 첫 매칭 anchor 사용
-        for (const a of sameGradeAnchors) {
-          const anchorPrice = priceByDateAndCode.get(date)?.get(a.code);
-          if (anchorPrice == null || anchorPrice <= 0) continue;
-          return {
-            date,
-            price: ceil10(anchorPrice / a.ratio),
-            source: "inferred" as const,
-            anchor: a.name,
-          };
+        for (const a of exactGradeAnchors) {
+          const ap = priceByDateAndCode.get(date)?.get(a.code);
+          if (ap == null || ap <= 0) continue;
+          return { date, price: ceil10(ap / a.ratio), source: "inferred", anchor: a.name };
         }
-        return { date, price: null, source: "missing" as const, anchor: null };
+        return { date, price: null, source: "missing", anchor: null };
       });
 
-      // AI Phase 1 입력용 short_history 보강 — 같은 unit + ratio ≤ 2 (박스↔박스, 박스↔반박스)
-      // 만 사용해서 cross-unit (1kg봉 같은 ratio=10) 노이즈 제외
-      const aiInferAnchors = sameGradeAnchors.filter((a) => a.ratio >= 0.5 && a.ratio <= 2);
-      const aiShortHistory: { date: string; price: number }[] = [];
-      let inferredCount = 0;
-      for (const date of slotDates) {
-        const actual = priceByDateAndCode.get(date)?.get(row.product_code);
-        if (actual != null && actual > 0) {
-          aiShortHistory.push({ date, price: actual });
-          continue;
-        }
-        for (const a of aiInferAnchors) {
-          const ap = priceByDateAndCode.get(date)?.get(a.code);
-          if (ap != null && ap > 0) {
-            aiShortHistory.push({ date, price: ceil10(ap / a.ratio) });
-            inferredCount++;
-            break;
+      // 2차 패스 — reference 변동률 (1차 후 여전히 빈 슬롯)
+      const refCode = prod?.product_group ? groupReferenceCode.get(prod.product_group) ?? null : null;
+      if (refCode && refCode !== row.product_code) {
+        const refName = productMap.get(refCode)?.product_name || refCode;
+        const knownIdx: { idx: number; price: number }[] = [];
+        slots.forEach((s, i) => {
+          if (s.price != null) knownIdx.push({ idx: i, price: s.price });
+        });
+        if (knownIdx.length > 0) {
+          for (let i = 0; i < slots.length; i++) {
+            if (slots[i].price != null) continue;
+            // 가장 가까운 known slot (인덱스 거리 최소)
+            let nearest = knownIdx[0];
+            let dist = Math.abs(nearest.idx - i);
+            for (const k of knownIdx) {
+              const d = Math.abs(k.idx - i);
+              if (d < dist) { nearest = k; dist = d; }
+            }
+            const refAtNearest = priceByDateAndCode.get(slots[nearest.idx].date)?.get(refCode);
+            const refAtSlot = priceByDateAndCode.get(slots[i].date)?.get(refCode);
+            if (refAtNearest != null && refAtNearest > 0 && refAtSlot != null && refAtSlot > 0) {
+              const changeRate = refAtSlot / refAtNearest;
+              slots[i] = {
+                date: slots[i].date,
+                price: ceil10(nearest.price * changeRate),
+                source: "ref_change",
+                anchor: refName,
+              };
+            }
           }
         }
       }
-      // 보강 데이터가 actualHistory 보다 풍부할 때만 사용
+
+      const purchaseHistory8d = slots;
+
+      // AI Phase 1 입력용 short_history — slots 의 actual+inferred+ref_change 모두 사용
+      const aiShortHistory: { date: string; price: number }[] = [];
+      for (const s of slots) {
+        if (s.price != null && s.price > 0) aiShortHistory.push({ date: s.date, price: s.price });
+      }
       const actualHistoryEntries = shortHistoryMap.get(row.product_code) || [];
       const aiInputShortHistory = aiShortHistory.length > actualHistoryEntries.length
         ? aiShortHistory
         : actualHistoryEntries;
-      void inferredCount;  // future: ai_reason 에 표기용
 
       // 수익률일괄변경용
       const targetMargin = prod?.target_margin_rate ? Number(prod.target_margin_rate) : null;
