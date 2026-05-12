@@ -539,6 +539,9 @@ const COLUMNS: Column[] = [
       <span className={p.is_key_item ? "font-semibold text-blue-700" : ""}>
         {p.product_name}
         {p.is_event_item && <span className="ml-1 text-orange-500 text-[10px]">행사</span>}
+        {p.platform_status === "판매중지" && (
+          <span className="ml-1 inline-block px-1 text-[9px] font-medium text-zinc-700 bg-zinc-300 rounded">판매중지</span>
+        )}
       </span>
     ) },
   { key: "spec", label: "규격", group: "기본", width: "w-24",
@@ -877,12 +880,15 @@ function VirtualRow(props: any) {
   }
 
   const p = item;
+  const isInactive = p.platform_status === "판매중지";
   const childBg = p._isChild ? "bg-violet-50/40" : (index % 2 === 0 ? "bg-white" : "bg-gray-50/30");
   return (
     <div
       style={style}
-      className={`flex items-center border-b border-gray-100 hover:bg-blue-50/30 text-xs whitespace-nowrap ${childBg} ${
-        p.change_amount !== 0 && !p._isChild ? "bg-yellow-50/40" : ""
+      className={`flex items-center border-b border-gray-100 hover:bg-blue-50/30 text-xs whitespace-nowrap ${
+        isInactive ? "bg-zinc-200/60 text-gray-500 line-through" : childBg
+      } ${
+        p.change_amount !== 0 && !p._isChild && !isInactive ? "bg-yellow-50/40" : ""
       }`}
     >
       {COLUMNS.map((col) => (
@@ -1190,7 +1196,9 @@ export default function ProductsPage() {
     const up = filtered.filter((p) => p.change_amount > 0).length;
     const down = filtered.filter((p) => p.change_amount < 0).length;
     const lowMargin = filtered.filter((p) => p.margin_rate > 0 && p.margin_rate < 0.1).length;
-    return { total, changed, up, down, lowMargin };
+    const active = filtered.filter((p) => p.platform_status !== "판매중지").length;
+    const inactive = filtered.filter((p) => p.platform_status === "판매중지").length;
+    return { total, changed, up, down, lowMargin, active, inactive };
   }, [filtered]);
 
   const handleSort = (key: SortKey) => {
@@ -1312,7 +1320,12 @@ export default function ProductsPage() {
         <div className="flex items-center justify-between mb-4">
           <div>
             <h1 className="text-xl font-bold text-gray-900">전체상품 (야채용)</h1>
-            <p className="text-xs text-gray-500">{priceDate && `기준일: ${priceDate}`} | {stats.total}개 상품</p>
+            <p className="text-xs text-gray-500">
+              {priceDate && `기준일: ${priceDate}`} |{" "}
+              {stats.inactive > 0
+                ? `${stats.total}개 (판매중 ${stats.active} / 판매중지 ${stats.inactive})`
+                : `판매중 ${stats.active}개`}
+            </p>
           </div>
           <div className="flex items-center gap-3 text-xs">
             <span className="px-2 py-1 bg-red-50 text-red-700 rounded">상승 {stats.up}</span>
@@ -1369,41 +1382,50 @@ export default function ProductsPage() {
             판매중지 포함
           </label>
 
-          {/* 판매중지 등록 / 복원 */}
-          {selected.size > 0 && (
-            <div className="ml-auto flex items-center gap-2">
+          {/* 판매중지 등록 / 복원 — 항상 노출 (선택 0개면 비활성) */}
+          <div className="ml-auto flex items-center gap-2">
+            {selected.size > 0 && (
               <span className="text-sm text-gray-600">{selected.size}개 선택</span>
-              <button
-                onClick={() => handleSetPlatformStatus("판매중지")}
-                disabled={statusApplying}
-                className="px-3 py-1.5 text-sm font-medium rounded-lg border bg-amber-600 text-white border-amber-700 hover:bg-amber-700 disabled:opacity-50"
-                title="선택한 상품을 판매중지로 등록 (화면에서 숨김)"
-              >
-                {statusApplying ? "처리 중..." : "판매중지 등록"}
-              </button>
-              {includeInactive && (
-                <button
-                  onClick={() => handleSetPlatformStatus("판매중")}
-                  disabled={statusApplying}
-                  className="px-3 py-1.5 text-sm font-medium rounded-lg border bg-emerald-600 text-white border-emerald-700 hover:bg-emerald-700 disabled:opacity-50"
-                >
-                  판매중 복원
-                </button>
-              )}
+            )}
+            <button
+              onClick={() => handleSetPlatformStatus("판매중지")}
+              disabled={statusApplying || selected.size === 0}
+              className={`px-3 py-1.5 text-sm font-medium rounded-lg border ${
+                statusApplying || selected.size === 0
+                  ? "bg-gray-100 text-gray-400 border-gray-200 cursor-not-allowed"
+                  : "bg-amber-600 text-white border-amber-700 hover:bg-amber-700"
+              }`}
+              title="선택한 상품을 판매중지로 등록 (화면에서 숨김)"
+            >
+              판매중지 등록
+            </button>
+            <button
+              onClick={() => handleSetPlatformStatus("판매중")}
+              disabled={statusApplying || selected.size === 0}
+              className={`px-3 py-1.5 text-sm font-medium rounded-lg border ${
+                statusApplying || selected.size === 0
+                  ? "bg-gray-100 text-gray-400 border-gray-200 cursor-not-allowed"
+                  : "bg-emerald-600 text-white border-emerald-700 hover:bg-emerald-700"
+              }`}
+              title="선택한 상품을 판매중으로 복원"
+            >
+              판매중 복원
+            </button>
+            {selected.size > 0 && (
               <button
                 onClick={() => setSelected(new Set())}
                 className="px-2 py-1.5 text-xs text-gray-500 hover:text-gray-700"
               >
                 해제
               </button>
-            </div>
-          )}
+            )}
+          </div>
 
           {/* 수익률일괄변경 실행 — 역마진/긴급 상황용 수동 버튼 */}
           <button
             onClick={handleBulkApplyTarget}
             disabled={bulkApplying || filtered.length === 0}
-            className={`${selected.size === 0 ? "ml-auto" : ""} px-3 py-1.5 text-sm font-medium rounded-lg border transition-colors ${
+            className={`px-3 py-1.5 text-sm font-medium rounded-lg border transition-colors ${
               bulkApplying || filtered.length === 0
                 ? "bg-gray-100 text-gray-400 border-gray-200 cursor-not-allowed"
                 : "bg-red-600 text-white border-red-700 hover:bg-red-700 active:bg-red-800"
