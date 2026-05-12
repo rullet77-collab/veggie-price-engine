@@ -687,11 +687,11 @@ export async function GET(request: Request) {
     if (group) {
       results = results.filter((r) => r.product_group === Number(group));
     }
-    // 판매중지 포함 여부 — 기본은 판매중만 노출, ?includeInactive=1 일 때만 전체
-    const includeInactive = url.searchParams.get("includeInactive") === "1";
-    if (!includeInactive) {
-      results = results.filter((r) => r.platform_status !== "판매중지");
-    }
+    // 기본: 판매중만 / ?onlyInactive=1: 판매중지만 (둘 중 하나, 합쳐서 보지 않음)
+    const onlyInactive = url.searchParams.get("onlyInactive") === "1";
+    results = onlyInactive
+      ? results.filter((r) => r.platform_status === "판매중지")
+      : results.filter((r) => r.platform_status !== "판매중지");
 
     return Response.json(results);
   } catch (err: unknown) {

@@ -539,9 +539,6 @@ const COLUMNS: Column[] = [
       <span className={p.is_key_item ? "font-semibold text-blue-700" : ""}>
         {p.product_name}
         {p.is_event_item && <span className="ml-1 text-orange-500 text-[10px]">행사</span>}
-        {p.platform_status === "판매중지" && (
-          <span className="ml-1 inline-block px-1 text-[9px] font-medium text-zinc-700 bg-zinc-300 rounded">판매중지</span>
-        )}
       </span>
     ) },
   { key: "spec", label: "규격", group: "기본", width: "w-24",
@@ -880,15 +877,12 @@ function VirtualRow(props: any) {
   }
 
   const p = item;
-  const isInactive = p.platform_status === "판매중지";
   const childBg = p._isChild ? "bg-violet-50/40" : (index % 2 === 0 ? "bg-white" : "bg-gray-50/30");
   return (
     <div
       style={style}
-      className={`flex items-center border-b border-gray-100 hover:bg-blue-50/30 text-xs whitespace-nowrap ${
-        isInactive ? "bg-zinc-200/60 text-gray-500 line-through" : childBg
-      } ${
-        p.change_amount !== 0 && !p._isChild && !isInactive ? "bg-yellow-50/40" : ""
+      className={`flex items-center border-b border-gray-100 hover:bg-blue-50/30 text-xs whitespace-nowrap ${childBg} ${
+        p.change_amount !== 0 && !p._isChild ? "bg-yellow-50/40" : ""
       }`}
     >
       {COLUMNS.map((col) => (
@@ -921,7 +915,7 @@ export default function ProductsPage() {
   const [bulkApplying, setBulkApplying] = useState(false);
   const [applyingGroup, setApplyingGroup] = useState<number | null>(null);
   const [expandedGroups, setExpandedGroups] = useState<Set<number>>(new Set());
-  const [includeInactive, setIncludeInactive] = useState(false);
+  const [onlyInactive, setOnlyInactive] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [statusApplying, setStatusApplying] = useState(false);
 
@@ -958,7 +952,7 @@ export default function ProductsPage() {
     try {
       const params = new URLSearchParams();
       if (category && category !== "전체") params.set("category", category);
-      if (includeInactive) params.set("includeInactive", "1");
+      if (onlyInactive) params.set("onlyInactive", "1");
       const res = await fetch(`/api/products?${params}`);
       const data = await res.json();
       if (Array.isArray(data)) setProducts(data);
@@ -967,7 +961,7 @@ export default function ProductsPage() {
     } finally {
       setLoading(false);
     }
-  }, [category, includeInactive]);
+  }, [category, onlyInactive]);
 
   // 판매중지 등록 (또는 해제)
   const handleSetPlatformStatus = useCallback(async (status: "판매중" | "판매중지") => {
@@ -1196,9 +1190,7 @@ export default function ProductsPage() {
     const up = filtered.filter((p) => p.change_amount > 0).length;
     const down = filtered.filter((p) => p.change_amount < 0).length;
     const lowMargin = filtered.filter((p) => p.margin_rate > 0 && p.margin_rate < 0.1).length;
-    const active = filtered.filter((p) => p.platform_status !== "판매중지").length;
-    const inactive = filtered.filter((p) => p.platform_status === "판매중지").length;
-    return { total, changed, up, down, lowMargin, active, inactive };
+    return { total, changed, up, down, lowMargin };
   }, [filtered]);
 
   const handleSort = (key: SortKey) => {
@@ -1321,10 +1313,7 @@ export default function ProductsPage() {
           <div>
             <h1 className="text-xl font-bold text-gray-900">전체상품 (야채용)</h1>
             <p className="text-xs text-gray-500">
-              {priceDate && `기준일: ${priceDate}`} |{" "}
-              {stats.inactive > 0
-                ? `${stats.total}개 (판매중 ${stats.active} / 판매중지 ${stats.inactive})`
-                : `판매중 ${stats.active}개`}
+              {priceDate && `기준일: ${priceDate}`} | {onlyInactive ? "판매중지" : "판매중"} {stats.total}개
             </p>
           </div>
           <div className="flex items-center gap-3 text-xs">
@@ -1378,8 +1367,8 @@ export default function ProductsPage() {
             19.5%미만
           </label>
           <label className="flex items-center gap-1 text-sm text-gray-600 cursor-pointer">
-            <input type="checkbox" checked={includeInactive} onChange={(e) => setIncludeInactive(e.target.checked)} className="rounded" />
-            판매중지 포함
+            <input type="checkbox" checked={onlyInactive} onChange={(e) => setOnlyInactive(e.target.checked)} className="rounded" />
+            판매중지건
           </label>
 
           {/* 판매중지 등록 / 복원 — 항상 노출 (선택 0개면 비활성) */}
