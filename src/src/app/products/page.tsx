@@ -20,6 +20,8 @@ type Product = {
   is_key_item: boolean;
   is_event_item: boolean;
   target_margin_rate: number | null;
+  platform_status?: string | null;
+  price_fixed?: boolean;
 
   prev_purchase_price: number | null;
   purchase_price: number | null;
@@ -566,11 +568,9 @@ const COLUMNS: Column[] = [
     ) },
   { key: "margin_rate", label: "수익률", group: "판매가", width: "w-14", align: "right", sortable: true,
     render: (p) => <span className={marginClass(p.margin_rate)}>{pct(p.margin_rate)}</span> },
-  // 수익률일괄변경
-  { key: "target_margin_rate", label: "일괄변경용", group: "일괄변경", width: "w-14", align: "right", sortable: true,
+  // 수익률일괄변경 — 기본수익률 1개 컬럼만
+  { key: "target_margin_rate", label: "기본수익률", group: "일괄변경", width: "w-16", align: "right", sortable: true,
     render: (p, { onMarginSaved }) => <EditableCell value={p.target_margin_rate || 0} productCode={p.product_code} apiUrl="/api/products/update-target-margin" fieldName="target_margin_rate" onSaved={onMarginSaved} isPercent /> },
-  { key: "target_price", label: "변경시가격", group: "일괄변경", width: "w-16", align: "right", sortable: true,
-    render: (p) => fmt(p.target_price) },
   // Claude 추천
   { key: "recommended_price", label: "추천가", group: "추천", width: "w-16", align: "right", sortable: true,
     render: (p) => {
@@ -916,10 +916,16 @@ export default function ProductsPage() {
   const [applyingGroup, setApplyingGroup] = useState<number | null>(null);
   const [expandedGroups, setExpandedGroups] = useState<Set<number>>(new Set());
   const [onlyInactive, setOnlyInactive] = useState(false);
+  const [fixedOnly, setFixedOnly] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [statusApplying, setStatusApplying] = useState(false);
-  type StatusStats = { 야채: { active: number; inactive: number; total: number }; 공산: { active: number; inactive: number; total: number } };
+  const [fixedApplying, setFixedApplying] = useState(false);
+  type StatusStats = { 야채: { active: number; inactive: number; fixed: number; total: number }; 공산: { active: number; inactive: number; fixed: number; total: number } };
   const [statusStats, setStatusStats] = useState<StatusStats | null>(null);
+  // 수익률일괄변경 실행 직전 selling_price 스냅샷 (실행취소용, 세션 단위)
+  type BulkSnapshotEntry = { product_code: string; prev_selling_price: number | null };
+  const [bulkSnapshot, setBulkSnapshot] = useState<BulkSnapshotEntry[] | null>(null);
+  const [reverting, setReverting] = useState(false);
 
   const toggleSelect = useCallback((code: string) => {
     setSelected((prev) => {
@@ -955,6 +961,7 @@ export default function ProductsPage() {
       const params = new URLSearchParams();
       if (category && category !== "전체") params.set("category", category);
       if (onlyInactive) params.set("onlyInactive", "1");
+      else if (fixedOnly) params.set("fixedOnly", "1");
       const res = await fetch(`/api/products?${params}`);
       const data = await res.json();
       if (Array.isArray(data)) setProducts(data);
@@ -963,7 +970,7 @@ export default function ProductsPage() {
     } finally {
       setLoading(false);
     }
-  }, [category, onlyInactive]);
+  }, [category, onlyInactive, fixedOnly]);
 
   // 카운트 (총/판매중/판매중지) — products API 와 별도, 변동 시점만 갱신
   const fetchStatusStats = useCallback(async () => {
@@ -1215,16 +1222,17 @@ export default function ProductsPage() {
   // 수익률일괄변경 실행 — 현재 필터된 상품들의 판매가를 target_price 로 일괄 변경
   // (역마진/긴급 상황용. 판매가가 수익률일괄변경용 값과 불일치하더라도 사용자가 수동으로 실행)
   const handleBulkApplyTarget = useCallback(async () => {
-    // target_price 가 있고 현재 판매가와 다른 상품만 대상
+    // target_price 가 있고 현재 판매가와 다른 상품 + 판매가고정 아닌 것만
     const candidates = filtered.filter(
       (p) =>
+        !p.price_fixed &&
         p.target_price != null &&
         p.target_price > 0 &&
         p.selling_price !== p.target_price
     );
 
     if (candidates.length === 0) {
-      alert("일괄변경 대상이 없습니다. (필터를 확인해주세요)");
+      alert("일괄변경 대상이 없습니다. (필터/판매가고정 확인)");
       return;
     }
 
@@ -1238,12 +1246,18 @@ export default function ProductsPage() {
     const more = candidates.length > 5 ? `\n  ... 외 ${candidates.length - 5}개` : "";
 
     const confirmed = window.confirm(
-      `현재 필터된 ${candidates.length}개 상품의 판매가를 '수익률일괄변경용' 기준 가격으로 즉시 변경합니다.\n\n${sampleLines}${more}\n\n이 작업은 역마진/긴급 상황용입니다. 계속하시겠습니까?`
+      `현재 필터된 ${candidates.length}개 상품의 판매가를 기본수익률 기준 가격으로 즉시 변경합니다.\n\n${sampleLines}${more}\n\n실행 후 "실행 취소" 버튼으로 되돌릴 수 있습니다.`
     );
     if (!confirmed) return;
 
     setBulkApplying(true);
     try {
+      // 스냅샷 — 실행 직전 selling_price 저장 (취소용)
+      const snapshot: BulkSnapshotEntry[] = candidates.map((p) => ({
+        product_code: p.product_code,
+        prev_selling_price: p.selling_price,
+      }));
+
       const res = await fetch("/api/products/bulk-apply-target", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1256,10 +1270,10 @@ export default function ProductsPage() {
         alert(`오류: ${data.error || "일괄변경 실패"}`);
         return;
       }
+      setBulkSnapshot(snapshot);
       alert(
-        `완료: ${data.applied}건 적용${data.skipped ? `, ${data.skipped}건 스킵` : ""}`
+        `완료: ${data.applied}건 적용${data.skipped ? `, ${data.skipped}건 스킵` : ""}\n\n잘못 적용했으면 "실행 취소" 버튼으로 되돌릴 수 있습니다.`
       );
-      // 목록 갱신
       await fetchData();
     } catch (err) {
       console.error(err);
@@ -1268,6 +1282,59 @@ export default function ProductsPage() {
       setBulkApplying(false);
     }
   }, [filtered, fetchData]);
+
+  // 수익률일괄변경 실행 취소 — 가장 최근 스냅샷으로 복원
+  const handleRevertBulk = useCallback(async () => {
+    if (!bulkSnapshot || bulkSnapshot.length === 0) return;
+    if (!confirm(`수익률일괄변경 실행 직전 상태로 ${bulkSnapshot.length}개 상품의 판매가를 되돌립니다. 진행할까요?`)) return;
+    setReverting(true);
+    try {
+      const res = await fetch("/api/products/bulk-set-selling-prices", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ entries: bulkSnapshot }),
+      });
+      const data = await res.json();
+      if (!data?.success) {
+        alert(`실패: ${data?.error || "복원 실패"}`);
+        return;
+      }
+      setBulkSnapshot(null);
+      await fetchData();
+      alert(`복원 완료: ${data.updated}건`);
+    } catch (err) {
+      alert(`네트워크 오류: ${err}`);
+    } finally {
+      setReverting(false);
+    }
+  }, [bulkSnapshot, fetchData]);
+
+  // 판매가 고정 등록/해제
+  const handleSetPriceFixed = useCallback(async (fixed: boolean) => {
+    if (selected.size === 0) return;
+    const codes = [...selected];
+    const label = fixed ? "판매가 고정" : "판매가 고정 해제";
+    if (!confirm(`${codes.length}개 상품을 ${label} 하시겠습니까?`)) return;
+    setFixedApplying(true);
+    try {
+      const res = await fetch("/api/products/set-price-fixed", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ codes, fixed }),
+      });
+      const data = await res.json();
+      if (!data?.success) {
+        alert(`실패: ${data?.error || "알 수 없는 오류"}`);
+        return;
+      }
+      setSelected(new Set());
+      await Promise.all([fetchData(), fetchStatusStats()]);
+    } catch (err) {
+      alert(`네트워크 오류: ${err}`);
+    } finally {
+      setFixedApplying(false);
+    }
+  }, [selected, fetchData, fetchStatusStats]);
 
   const categories = useMemo(() => {
     const cats = new Set(products.map((p) => p.category_name).filter(Boolean));
@@ -1328,18 +1395,22 @@ export default function ProductsPage() {
             <h1 className="text-xl font-bold text-gray-900">전체상품 (야채용)</h1>
             <p className="text-xs text-gray-500">
               {priceDate && `기준일: ${priceDate}`}
-              {statusStats && productType !== "전체" && (
-                <>
-                  {" | "}
-                  총 {statusStats[productType].total}개 / 판매중 {statusStats[productType].active}개 / 판매중지 {statusStats[productType].inactive}개
-                </>
-              )}
-              {statusStats && productType === "전체" && (
-                <>
-                  {" | "}
-                  총 {statusStats.야채.total + statusStats.공산.total}개 / 판매중 {statusStats.야채.active + statusStats.공산.active}개 / 판매중지 {statusStats.야채.inactive + statusStats.공산.inactive}개
-                </>
-              )}
+              {statusStats && (() => {
+                const s = productType === "전체"
+                  ? {
+                      total: statusStats.야채.total + statusStats.공산.total,
+                      active: statusStats.야채.active + statusStats.공산.active,
+                      inactive: statusStats.야채.inactive + statusStats.공산.inactive,
+                      fixed: statusStats.야채.fixed + statusStats.공산.fixed,
+                    }
+                  : statusStats[productType];
+                return (
+                  <>
+                    {" | "}
+                    총 {s.total}개 / 판매중 {s.active}개 (판매가고정 {s.fixed}개) / 판매중지 {s.inactive}개
+                  </>
+                );
+              })()}
             </p>
           </div>
           <div className="flex items-center gap-3 text-xs">
@@ -1393,15 +1464,41 @@ export default function ProductsPage() {
             19.5%미만
           </label>
           <label className="flex items-center gap-1 text-sm text-gray-600 cursor-pointer">
-            <input type="checkbox" checked={onlyInactive} onChange={(e) => setOnlyInactive(e.target.checked)} className="rounded" />
+            <input
+              type="checkbox"
+              checked={onlyInactive}
+              onChange={(e) => { setOnlyInactive(e.target.checked); if (e.target.checked) setFixedOnly(false); }}
+              className="rounded"
+            />
             판매중지건
           </label>
+          <label className="flex items-center gap-1 text-sm text-gray-600 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={fixedOnly}
+              onChange={(e) => { setFixedOnly(e.target.checked); if (e.target.checked) setOnlyInactive(false); }}
+              className="rounded"
+            />
+            판매가고정건
+          </label>
 
-          {/* 판매중지 등록 / 복원 — 항상 노출 (선택 0개면 비활성) */}
+          {/* 액션 버튼들 — 항상 노출 (선택 0개면 비활성) */}
           <div className="ml-auto flex items-center gap-2">
             {selected.size > 0 && (
               <span className="text-sm text-gray-600">{selected.size}개 선택</span>
             )}
+            <button
+              onClick={() => handleSetPriceFixed(!fixedOnly)}
+              disabled={fixedApplying || selected.size === 0}
+              className={`px-3 py-1.5 text-sm font-medium rounded-lg border ${
+                fixedApplying || selected.size === 0
+                  ? "bg-gray-100 text-gray-400 border-gray-200 cursor-not-allowed"
+                  : "bg-sky-600 text-white border-sky-700 hover:bg-sky-700"
+              }`}
+              title={fixedOnly ? "선택한 상품의 판매가 고정 해제" : "선택한 상품을 판매가 고정 (자동 변경 제외)"}
+            >
+              {fixedOnly ? "고정 해제" : "판매가 고정"}
+            </button>
             <button
               onClick={() => handleSetPlatformStatus("판매중지")}
               disabled={statusApplying || selected.size === 0}
@@ -1436,7 +1533,17 @@ export default function ProductsPage() {
             )}
           </div>
 
-          {/* 수익률일괄변경 실행 — 역마진/긴급 상황용 수동 버튼 */}
+          {/* 수익률일괄변경 실행 + 실행 취소 */}
+          {bulkSnapshot && bulkSnapshot.length > 0 && (
+            <button
+              onClick={handleRevertBulk}
+              disabled={reverting}
+              className="px-3 py-1.5 text-sm font-medium rounded-lg border bg-yellow-500 text-white border-yellow-600 hover:bg-yellow-600 disabled:opacity-50"
+              title="가장 최근 수익률일괄변경 실행을 취소"
+            >
+              {reverting ? "복원 중..." : `실행 취소 (${bulkSnapshot.length})`}
+            </button>
+          )}
           <button
             onClick={handleBulkApplyTarget}
             disabled={bulkApplying || filtered.length === 0}
@@ -1445,7 +1552,7 @@ export default function ProductsPage() {
                 ? "bg-gray-100 text-gray-400 border-gray-200 cursor-not-allowed"
                 : "bg-red-600 text-white border-red-700 hover:bg-red-700 active:bg-red-800"
             }`}
-            title="현재 필터된 상품들의 판매가를 수익률일괄변경가(target_price)로 즉시 변경합니다. 역마진/긴급 상황용."
+            title="현재 필터된 상품들의 판매가를 기본수익률 기준 가격으로 즉시 변경합니다."
           >
             {bulkApplying ? "적용 중..." : `수익률일괄변경 실행 (${filtered.length})`}
           </button>

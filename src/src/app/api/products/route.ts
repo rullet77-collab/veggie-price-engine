@@ -99,10 +99,11 @@ export async function GET(request: Request) {
       category_name: string | null;
       learned_tier: number | null;
       platform_status: string | null;
+      price_fixed: boolean | null;
     };
     const productsData = await fetchAll<ProdRow>(
       "products",
-      "product_code,product_group,is_key_item,target_margin_rate,is_event_item,product_type,price_sensitivity,pack_role,pack_meta,product_name,unit,spec,category_name,learned_tier,platform_status"
+      "product_code,product_group,is_key_item,target_margin_rate,is_event_item,product_type,price_sensitivity,pack_role,pack_meta,product_name,unit,spec,category_name,learned_tier,platform_status,price_fixed"
     );
     const productMap = new Map<string, ProdRow>();
     for (const p of productsData) productMap.set(p.product_code, p);
@@ -591,6 +592,7 @@ export async function GET(request: Request) {
         price_date: priceDate,
         product_type: productType,
         platform_status: prod?.platform_status || null,
+        price_fixed: !!prod?.price_fixed,
 
         product_group: prod?.product_group || null,
         is_key_item: prod?.is_key_item || false,
@@ -687,11 +689,16 @@ export async function GET(request: Request) {
     if (group) {
       results = results.filter((r) => r.product_group === Number(group));
     }
-    // 기본: 판매중만 / ?onlyInactive=1: 판매중지만 (둘 중 하나, 합쳐서 보지 않음)
+    // 기본: 판매중만 / ?onlyInactive=1: 판매중지만 / ?fixedOnly=1: 판매가고정만
     const onlyInactive = url.searchParams.get("onlyInactive") === "1";
-    results = onlyInactive
-      ? results.filter((r) => r.platform_status === "판매중지")
-      : results.filter((r) => r.platform_status !== "판매중지");
+    const fixedOnly = url.searchParams.get("fixedOnly") === "1";
+    if (onlyInactive) {
+      results = results.filter((r) => r.platform_status === "판매중지");
+    } else if (fixedOnly) {
+      results = results.filter((r) => r.platform_status !== "판매중지" && r.price_fixed);
+    } else {
+      results = results.filter((r) => r.platform_status !== "판매중지");
+    }
 
     return Response.json(results);
   } catch (err: unknown) {
