@@ -1587,6 +1587,38 @@ export default function ProductsPage() {
                 {/* 컬럼 헤더 */}
                 <div className="flex border-b border-gray-300 bg-gray-50">
                   {COLUMNS.map((col) => {
+                    // _select 헤더에 전체선택 체크박스
+                    if (col.key === "_select") {
+                      const visibleCodes = filtered.filter((p) => !p._isChild).map((p) => p.product_code);
+                      const allChecked = visibleCodes.length > 0 && visibleCodes.every((c) => selected.has(c));
+                      const someChecked = visibleCodes.some((c) => selected.has(c));
+                      return (
+                        <div
+                          key={col.key}
+                          className="flex-shrink-0 px-2 py-1.5 text-center"
+                          style={{ width: COL_WIDTHS[col.key] || 32 }}
+                        >
+                          <input
+                            type="checkbox"
+                            ref={(el) => { if (el) el.indeterminate = !allChecked && someChecked; }}
+                            checked={allChecked}
+                            onChange={() => {
+                              setSelected((prev) => {
+                                const next = new Set(prev);
+                                if (allChecked) {
+                                  for (const c of visibleCodes) next.delete(c);
+                                } else {
+                                  for (const c of visibleCodes) next.add(c);
+                                }
+                                return next;
+                              });
+                            }}
+                            className="rounded cursor-pointer"
+                            title={allChecked ? "전체 해제" : "전체 선택"}
+                          />
+                        </div>
+                      );
+                    }
                     // 월 컬럼 동적 라벨 (priceDate 기반)
                     let label = col.label;
                     const sample = products[0];

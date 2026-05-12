@@ -129,10 +129,11 @@ export async function rollSellingPrices(supabase: SupabaseClient): Promise<RollR
     pack_role: string | null; pack_meta: unknown;
     product_name: string | null; unit: string | null; spec: string | null;
     learned_tier: number | null;
+    price_fixed: boolean | null;
   };
   const productsData = await fetchAll<ProdRow>(
     supabase, "products",
-    "product_code,product_group,is_key_item,target_margin_rate,is_event_item,product_type,price_sensitivity,pack_role,pack_meta,product_name,unit,spec,learned_tier"
+    "product_code,product_group,is_key_item,target_margin_rate,is_event_item,product_type,price_sensitivity,pack_role,pack_meta,product_name,unit,spec,learned_tier,price_fixed"
   );
 
   // group_tier_ratios 로드 (B-3) — Map<"groupId-tierA-tierB", ratio>
@@ -253,6 +254,14 @@ export async function rollSellingPrices(supabase: SupabaseClient): Promise<RollR
     const targetMargin = prod.target_margin_rate != null ? Number(prod.target_margin_rate) : null;
 
     if (purchasePrice <= 0 && platformSellingPrice <= 0) continue;
+
+    // 판매가 고정 — 자동 추천 산출 skip, selling_price 를 recommended 로 유지
+    if (prod.price_fixed) {
+      if (selling?.selling_price != null && selling.selling_price > 0) {
+        recUpdates.push({ product_code: code, recommended_price: selling.selling_price });
+      }
+      continue;
+    }
 
     const groupMembers: GroupMember[] = prod.product_group
       ? (groupMembersMap.get(prod.product_group) || [])

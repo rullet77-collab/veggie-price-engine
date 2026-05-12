@@ -529,7 +529,12 @@ export async function GET(request: Request) {
       // Claude 추천판매가 — Phase 1~5 통합 로직 사용 (학습 세션과 동일)
       let recommendedPrice: number | null = null;
       let recommendReason = "";
-      if ((platformSellingPrice && platformSellingPrice > 0) || purchasePrice > 0) {
+
+      // 판매가 고정 — 자동 산출 skip, selling_price 를 추천가로 표시
+      if (prod?.price_fixed) {
+        recommendedPrice = selling?.selling_price ?? null;
+        recommendReason = "판매가고정";
+      } else if ((platformSellingPrice && platformSellingPrice > 0) || purchasePrice > 0) {
         // Phase 5-A / Layer 4-B: 같은 그룹 멤버 데이터 구성 (나 제외, spec/learned_tier 포함)
         const groupMembers = prod?.product_group
           ? (groupMembersMap.get(prod.product_group) || [])
