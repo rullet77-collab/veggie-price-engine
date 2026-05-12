@@ -918,6 +918,8 @@ export default function ProductsPage() {
   const [onlyInactive, setOnlyInactive] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [statusApplying, setStatusApplying] = useState(false);
+  type StatusStats = { 야채: { active: number; inactive: number; total: number }; 공산: { active: number; inactive: number; total: number } };
+  const [statusStats, setStatusStats] = useState<StatusStats | null>(null);
 
   const toggleSelect = useCallback((code: string) => {
     setSelected((prev) => {
@@ -963,6 +965,20 @@ export default function ProductsPage() {
     }
   }, [category, onlyInactive]);
 
+  // 카운트 (총/판매중/판매중지) — products API 와 별도, 변동 시점만 갱신
+  const fetchStatusStats = useCallback(async () => {
+    try {
+      const res = await fetch("/api/products/stats");
+      const data = await res.json();
+      if (data?.야채 && data?.공산) setStatusStats(data);
+    } catch (err) {
+      console.error("Stats fetch error:", err);
+    }
+  }, []);
+
+  useEffect(() => { fetchData(); }, [fetchData]);
+  useEffect(() => { fetchStatusStats(); }, [fetchStatusStats]);
+
   // 판매중지 등록 (또는 해제)
   const handleSetPlatformStatus = useCallback(async (status: "판매중" | "판매중지") => {
     if (selected.size === 0) return;
@@ -982,15 +998,13 @@ export default function ProductsPage() {
         return;
       }
       setSelected(new Set());
-      await fetchData();
+      await Promise.all([fetchData(), fetchStatusStats()]);
     } catch (err) {
       alert(`네트워크 오류: ${err}`);
     } finally {
       setStatusApplying(false);
     }
-  }, [selected, fetchData]);
-
-  useEffect(() => { fetchData(); }, [fetchData]);
+  }, [selected, fetchData, fetchStatusStats]);
 
   // 판매가 수정 콜백
   const handlePriceSaved = useCallback((code: string, newPrice: number) => {
@@ -1313,7 +1327,19 @@ export default function ProductsPage() {
           <div>
             <h1 className="text-xl font-bold text-gray-900">전체상품 (야채용)</h1>
             <p className="text-xs text-gray-500">
-              {priceDate && `기준일: ${priceDate}`} | {onlyInactive ? "판매중지" : "판매중"} {stats.total}개
+              {priceDate && `기준일: ${priceDate}`}
+              {statusStats && productType !== "전체" && (
+                <>
+                  {" | "}
+                  총 {statusStats[productType].total}개 / 판매중 {statusStats[productType].active}개 / 판매중지 {statusStats[productType].inactive}개
+                </>
+              )}
+              {statusStats && productType === "전체" && (
+                <>
+                  {" | "}
+                  총 {statusStats.야채.total + statusStats.공산.total}개 / 판매중 {statusStats.야채.active + statusStats.공산.active}개 / 판매중지 {statusStats.야채.inactive + statusStats.공산.inactive}개
+                </>
+              )}
             </p>
           </div>
           <div className="flex items-center gap-3 text-xs">
