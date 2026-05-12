@@ -98,10 +98,11 @@ export async function GET(request: Request) {
       spec: string | null;
       category_name: string | null;
       learned_tier: number | null;
+      platform_status: string | null;
     };
     const productsData = await fetchAll<ProdRow>(
       "products",
-      "product_code,product_group,is_key_item,target_margin_rate,is_event_item,product_type,price_sensitivity,pack_role,pack_meta,product_name,unit,spec,category_name,learned_tier"
+      "product_code,product_group,is_key_item,target_margin_rate,is_event_item,product_type,price_sensitivity,pack_role,pack_meta,product_name,unit,spec,category_name,learned_tier,platform_status"
     );
     const productMap = new Map<string, ProdRow>();
     for (const p of productsData) productMap.set(p.product_code, p);
@@ -589,6 +590,7 @@ export async function GET(request: Request) {
         category_name: row.category_name,
         price_date: priceDate,
         product_type: productType,
+        platform_status: prod?.platform_status || null,
 
         product_group: prod?.product_group || null,
         is_key_item: prod?.is_key_item || false,
@@ -684,6 +686,11 @@ export async function GET(request: Request) {
     }
     if (group) {
       results = results.filter((r) => r.product_group === Number(group));
+    }
+    // 판매중지 포함 여부 — 기본은 판매중만 노출, ?includeInactive=1 일 때만 전체
+    const includeInactive = url.searchParams.get("includeInactive") === "1";
+    if (!includeInactive) {
+      results = results.filter((r) => r.platform_status !== "판매중지");
     }
 
     return Response.json(results);

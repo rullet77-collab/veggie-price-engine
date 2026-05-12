@@ -475,11 +475,27 @@ type Column = {
     onMarginSaved: (code: string, margin: number) => void;
     expandedGroups?: Set<number>;
     toggleGroup?: (g: number) => void;
+    selected?: Set<string>;
+    toggleSelect?: (code: string) => void;
   }) => React.ReactNode;
   sortable?: boolean;
 };
 
 const COLUMNS: Column[] = [
+  { key: "_select", label: "", group: "기본", width: "w-8", align: "center",
+    render: (p, ctx) => {
+      if (p._isChild) return null;
+      const checked = ctx.selected?.has(p.product_code) || false;
+      return (
+        <input
+          type="checkbox"
+          checked={checked}
+          onChange={(e) => { e.stopPropagation(); ctx.toggleSelect?.(p.product_code); }}
+          onClick={(e) => e.stopPropagation()}
+          className="rounded cursor-pointer"
+        />
+      );
+    } },
   { key: "product_group", label: "그룹", group: "기본", width: "w-12", align: "center", sortable: true,
     render: (p, ctx) => {
       if (!p.product_group) return <span className="text-gray-300">-</span>;
@@ -642,6 +658,7 @@ function renderPctCell(s: string | null) {
 
 // ── Column pixel widths (matching tailwind w-XX classes) ──
 const COL_WIDTHS: Record<string, number> = {
+  _select: 32,
   product_group: 48,
   product_code: 64,
   product_name: 176,
@@ -832,11 +849,13 @@ interface VirtualRowProps {
   toggleGroup: (g: number) => void;
   onGroupBulkApply?: (group: number, members: Product[]) => void;
   applyingGroup?: number | null;
+  selected?: Set<string>;
+  toggleSelect?: (code: string) => void;
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function VirtualRow(props: any) {
-  const { index, style, items, onPriceSaved, onMarginSaved, expandedGroups, toggleGroup, onGroupBulkApply, applyingGroup } = props as {
+  const { index, style, items, onPriceSaved, onMarginSaved, expandedGroups, toggleGroup, onGroupBulkApply, applyingGroup, selected, toggleSelect } = props as {
     index: number;
     style: React.CSSProperties;
   } & VirtualRowProps;
@@ -872,7 +891,7 @@ function VirtualRow(props: any) {
           className={`flex-shrink-0 px-2 py-1 ${col.align === "right" ? "text-right" : col.align === "center" ? "text-center" : "text-left"}`}
           style={{ width: COL_WIDTHS[col.key] || 60 }}
         >
-          {col.render(p, { onPriceSaved, onMarginSaved, expandedGroups, toggleGroup })}
+          {col.render(p, { onPriceSaved, onMarginSaved, expandedGroups, toggleGroup, selected, toggleSelect })}
         </div>
       ))}
     </div>
@@ -896,6 +915,18 @@ export default function ProductsPage() {
   const [bulkApplying, setBulkApplying] = useState(false);
   const [applyingGroup, setApplyingGroup] = useState<number | null>(null);
   const [expandedGroups, setExpandedGroups] = useState<Set<number>>(new Set());
+  const [includeInactive, setIncludeInactive] = useState(false);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [statusApplying, setStatusApplying] = useState(false);
+
+  const toggleSelect = useCallback((code: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(code)) next.delete(code);
+      else next.add(code);
+      return next;
+    });
+  }, []);
 
   const headerRef = useRef<HTMLDivElement>(null);
   const bodyRef = useRef<HTMLDivElement>(null);
@@ -921,6 +952,7 @@ export default function ProductsPage() {
     try {
       const params = new URLSearchParams();
       if (category && category !== "전체") params.set("category", category);
+      if (includeInactive) params.set("includeInactive", "1");
       const res = await fetch(`/api/products?${params}`);
       const data = await res.json();
       if (Array.isArray(data)) setProducts(data);
@@ -929,7 +961,34 @@ export default function ProductsPage() {
     } finally {
       setLoading(false);
     }
-  }, [category]);
+  }, [category, includeInactive]);
+
+  // 판매중지 등록 (또는 해제)
+  const handleSetPlatformStatus = useCallback(async (status: "판매중" | "판매중지") => {
+    if (selected.size === 0) return;
+    const codes = [...selected];
+    const label = status === "판매중지" ? "판매중지 등록" : "판매중 복원";
+    if (!confirm(`${codes.length}개 상품을 ${label} 하시겠습니까?`)) return;
+    setStatusApplying(true);
+    try {
+      const res = await fetch("/api/products/set-platform-status", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ codes, status }),
+      });
+      const data = await res.json();
+      if (!data.success) {
+        alert(`실패: ${data.error || "알 수 없는 오류"}`);
+        return;
+      }
+      setSelected(new Set());
+      await fetchData();
+    } catch (err) {
+      alert(`네트워크 오류: ${err}`);
+    } finally {
+      setStatusApplying(false);
+    }
+  }, [selected, fetchData]);
 
   useEffect(() => { fetchData(); }, [fetchData]);
 
@@ -1305,12 +1364,46 @@ export default function ProductsPage() {
             <input type="checkbox" checked={onlyLowMargin} onChange={(e) => setOnlyLowMargin(e.target.checked)} className="rounded border-orange-400" />
             19.5%미만
           </label>
+          <label className="flex items-center gap-1 text-sm text-gray-600 cursor-pointer">
+            <input type="checkbox" checked={includeInactive} onChange={(e) => setIncludeInactive(e.target.checked)} className="rounded" />
+            판매중지 포함
+          </label>
+
+          {/* 판매중지 등록 / 복원 */}
+          {selected.size > 0 && (
+            <div className="ml-auto flex items-center gap-2">
+              <span className="text-sm text-gray-600">{selected.size}개 선택</span>
+              <button
+                onClick={() => handleSetPlatformStatus("판매중지")}
+                disabled={statusApplying}
+                className="px-3 py-1.5 text-sm font-medium rounded-lg border bg-amber-600 text-white border-amber-700 hover:bg-amber-700 disabled:opacity-50"
+                title="선택한 상품을 판매중지로 등록 (화면에서 숨김)"
+              >
+                {statusApplying ? "처리 중..." : "판매중지 등록"}
+              </button>
+              {includeInactive && (
+                <button
+                  onClick={() => handleSetPlatformStatus("판매중")}
+                  disabled={statusApplying}
+                  className="px-3 py-1.5 text-sm font-medium rounded-lg border bg-emerald-600 text-white border-emerald-700 hover:bg-emerald-700 disabled:opacity-50"
+                >
+                  판매중 복원
+                </button>
+              )}
+              <button
+                onClick={() => setSelected(new Set())}
+                className="px-2 py-1.5 text-xs text-gray-500 hover:text-gray-700"
+              >
+                해제
+              </button>
+            </div>
+          )}
 
           {/* 수익률일괄변경 실행 — 역마진/긴급 상황용 수동 버튼 */}
           <button
             onClick={handleBulkApplyTarget}
             disabled={bulkApplying || filtered.length === 0}
-            className={`ml-auto px-3 py-1.5 text-sm font-medium rounded-lg border transition-colors ${
+            className={`${selected.size === 0 ? "ml-auto" : ""} px-3 py-1.5 text-sm font-medium rounded-lg border transition-colors ${
               bulkApplying || filtered.length === 0
                 ? "bg-gray-100 text-gray-400 border-gray-200 cursor-not-allowed"
                 : "bg-red-600 text-white border-red-700 hover:bg-red-700 active:bg-red-800"
@@ -1387,7 +1480,7 @@ export default function ProductsPage() {
                 rowHeight={(idx: number) => isChartRow(displayRows[idx]) ? CHART_ROW_HEIGHT : ROW_HEIGHT}
                 overscanCount={10}
                 rowComponent={VirtualRow}
-                rowProps={{ items: displayRows, onPriceSaved: handlePriceSaved, onMarginSaved: handleMarginSaved, expandedGroups, toggleGroup, onGroupBulkApply: handleGroupBulkApply, applyingGroup }}
+                rowProps={{ items: displayRows, onPriceSaved: handlePriceSaved, onMarginSaved: handleMarginSaved, expandedGroups, toggleGroup, onGroupBulkApply: handleGroupBulkApply, applyingGroup, selected, toggleSelect }}
                 style={{ height: Math.min(totalListHeight, MAX_TABLE_HEIGHT), minWidth: TABLE_MIN_WIDTH }}
               />
             </div>
