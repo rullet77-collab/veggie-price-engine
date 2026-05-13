@@ -1293,14 +1293,26 @@ export default function ProductsPage() {
     }
   }, [filtered, products, selected, fetchData]);
 
-  // 일괄변경 버튼 라벨용 — filtered ∪ selected 합집합 카운트
+  // 일괄변경 버튼 라벨용 — filtered ∪ selected 중 실제 적용 가능 상품만 카운트
+  // (판매가고정 제외, target_price 존재 + 현재 판매가와 다른 것만)
   const bulkTargetCount = useMemo(() => {
-    const codes = new Set<string>();
-    for (const p of filtered) codes.add(p.product_code);
+    const byCode = new Map<string, Product>();
+    for (const p of filtered) byCode.set(p.product_code, p);
     for (const p of products) {
-      if (selected.has(p.product_code)) codes.add(p.product_code);
+      if (selected.has(p.product_code) && !byCode.has(p.product_code)) {
+        byCode.set(p.product_code, p);
+      }
     }
-    return codes.size;
+    let cnt = 0;
+    for (const p of byCode.values()) {
+      if (
+        !p.price_fixed &&
+        p.target_price != null &&
+        p.target_price > 0 &&
+        p.selling_price !== p.target_price
+      ) cnt++;
+    }
+    return cnt;
   }, [filtered, products, selected]);
 
   // 수익률일괄변경 실행 취소 — 가장 최근 스냅샷으로 복원
