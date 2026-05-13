@@ -1219,21 +1219,16 @@ export default function ProductsPage() {
     else { setSortKey(key); setSortDir("asc"); }
   };
 
-  // 수익률일괄변경 실행 — filtered ∪ selected (체크박스) 합집합 대상
-  // (역마진/긴급 상황용. 토글 5개로 좁힌 결과 + 체크박스 추가 선택까지 한 번에 적용)
+  // 수익률일괄변경 실행 — 체크박스 우선
+  //   selected.size > 0 → 선택된 상품만 (토글 무시)
+  //   selected.size === 0 → 현재 토글 결과 (filtered)
   const handleBulkApplyTarget = useCallback(async () => {
-    // filtered + selected (체크박스, products 전체 중) 합집합 (product_code 기준)
-    const byCode = new Map<string, Product>();
-    for (const p of filtered) byCode.set(p.product_code, p);
-    for (const p of products) {
-      if (selected.has(p.product_code) && !byCode.has(p.product_code)) {
-        byCode.set(p.product_code, p);
-      }
-    }
-    const union = [...byCode.values()];
+    const pool: Product[] = selected.size > 0
+      ? products.filter((p) => selected.has(p.product_code))
+      : filtered;
 
     // target_price 가 있고 현재 판매가와 다른 상품 + 판매가고정 아닌 것만
-    const candidates = union.filter(
+    const candidates = pool.filter(
       (p) =>
         !p.price_fixed &&
         p.target_price != null &&
@@ -1293,18 +1288,14 @@ export default function ProductsPage() {
     }
   }, [filtered, products, selected, fetchData]);
 
-  // 일괄변경 버튼 라벨용 — filtered ∪ selected 중 실제 적용 가능 상품만 카운트
-  // (판매가고정 제외, target_price 존재 + 현재 판매가와 다른 것만)
+  // 일괄변경 버튼 라벨용 — 체크박스 우선 (selected.size > 0 면 선택만, else filtered)
+  // 실제 적용 가능한 상품만 카운트 (판매가고정 제외, target 존재, selling != target)
   const bulkTargetCount = useMemo(() => {
-    const byCode = new Map<string, Product>();
-    for (const p of filtered) byCode.set(p.product_code, p);
-    for (const p of products) {
-      if (selected.has(p.product_code) && !byCode.has(p.product_code)) {
-        byCode.set(p.product_code, p);
-      }
-    }
+    const pool: Product[] = selected.size > 0
+      ? products.filter((p) => selected.has(p.product_code))
+      : filtered;
     let cnt = 0;
-    for (const p of byCode.values()) {
+    for (const p of pool) {
       if (
         !p.price_fixed &&
         p.target_price != null &&
