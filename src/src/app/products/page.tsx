@@ -1219,11 +1219,21 @@ export default function ProductsPage() {
     else { setSortKey(key); setSortDir("asc"); }
   };
 
-  // 수익률일괄변경 실행 — 현재 필터된 상품들의 판매가를 target_price 로 일괄 변경
-  // (역마진/긴급 상황용. 판매가가 수익률일괄변경용 값과 불일치하더라도 사용자가 수동으로 실행)
+  // 수익률일괄변경 실행 — filtered ∪ selected (체크박스) 합집합 대상
+  // (역마진/긴급 상황용. 토글 5개로 좁힌 결과 + 체크박스 추가 선택까지 한 번에 적용)
   const handleBulkApplyTarget = useCallback(async () => {
+    // filtered + selected (체크박스, products 전체 중) 합집합 (product_code 기준)
+    const byCode = new Map<string, Product>();
+    for (const p of filtered) byCode.set(p.product_code, p);
+    for (const p of products) {
+      if (selected.has(p.product_code) && !byCode.has(p.product_code)) {
+        byCode.set(p.product_code, p);
+      }
+    }
+    const union = [...byCode.values()];
+
     // target_price 가 있고 현재 판매가와 다른 상품 + 판매가고정 아닌 것만
-    const candidates = filtered.filter(
+    const candidates = union.filter(
       (p) =>
         !p.price_fixed &&
         p.target_price != null &&
@@ -1281,7 +1291,17 @@ export default function ProductsPage() {
     } finally {
       setBulkApplying(false);
     }
-  }, [filtered, fetchData]);
+  }, [filtered, products, selected, fetchData]);
+
+  // 일괄변경 버튼 라벨용 — filtered ∪ selected 합집합 카운트
+  const bulkTargetCount = useMemo(() => {
+    const codes = new Set<string>();
+    for (const p of filtered) codes.add(p.product_code);
+    for (const p of products) {
+      if (selected.has(p.product_code)) codes.add(p.product_code);
+    }
+    return codes.size;
+  }, [filtered, products, selected]);
 
   // 수익률일괄변경 실행 취소 — 가장 최근 스냅샷으로 복원
   const handleRevertBulk = useCallback(async () => {
@@ -1546,15 +1566,15 @@ export default function ProductsPage() {
           )}
           <button
             onClick={handleBulkApplyTarget}
-            disabled={bulkApplying || filtered.length === 0}
+            disabled={bulkApplying || bulkTargetCount === 0}
             className={`px-3 py-1.5 text-sm font-medium rounded-lg border transition-colors ${
-              bulkApplying || filtered.length === 0
+              bulkApplying || bulkTargetCount === 0
                 ? "bg-gray-100 text-gray-400 border-gray-200 cursor-not-allowed"
                 : "bg-red-600 text-white border-red-700 hover:bg-red-700 active:bg-red-800"
             }`}
-            title="현재 필터된 상품들의 판매가를 기본수익률 기준 가격으로 즉시 변경합니다."
+            title="필터 결과 + 체크박스로 추가 선택한 상품의 판매가를 기본수익률 기준으로 즉시 변경합니다."
           >
-            {bulkApplying ? "적용 중..." : `수익률일괄변경 실행 (${filtered.length})`}
+            {bulkApplying ? "적용 중..." : `수익률일괄변경 실행 (${bulkTargetCount})`}
           </button>
         </div>
 
