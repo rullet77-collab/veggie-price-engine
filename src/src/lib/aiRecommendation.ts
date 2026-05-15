@@ -28,6 +28,7 @@ export type GroupMember = {
   unit: string | null;                   // "박스", "봉", "통", "개", "kg" 등
   spec?: string | null;                  // 규격 ("박스/±5kg", "반박스/10kg", "1kg" 등) — Layer 4-B 단위환산용
   learned_tier?: number | null;          // 1/2/3 (그룹·unit 내 365일 학습 tier)
+  purchase_source?: string | null;       // 매입처 풀 — 다른 source 끼리는 직접 매입가 환산 X (변동률만)
   short_history: PriceHistory[];         // 8일 이력
   long_history: PriceHistory[];          // 60일 이력 (장기 참조용)
 };
@@ -51,6 +52,7 @@ export type AiRecInput = {
   spec?: string | null;                  // Layer 4-B kg 환산용
   learned_tier?: number | null;          // 365일 학습 tier (1=top/2=mid/3=low)
   product_group?: number | null;         // 그룹별 tier ratio 조회용
+  purchase_source?: string | null;       // 매입처 풀 — 다른 source 멤버는 1차 anchor 제외
   tier_ratios?: Map<string, number> | null; // "groupId-tierA-tierB" → ratio (B-3)
 
   short_history: PriceHistory[]; // 8일
@@ -893,8 +895,17 @@ function inferFromSameGradeMember(
   myReferencePrice: number = 0,
   myLearnedTier: number | null = null,
   myProductGroup: number | null | undefined = null,
-  tierRatios: Map<string, number> | null | undefined = null
+  tierRatios: Map<string, number> | null | undefined = null,
+  myPurchaseSource: string | null | undefined = null
 ): GroupEstimateResult | null {
+  // 매입처 풀 분리 — 다른 source 멤버는 1차 anchor 후보에서 제외
+  // (사용자가 같은 그룹이지만 다른 매입처라 명시한 케이스 — 직접 단위환산 부적절)
+  const sourceFiltered = members.filter((m) => {
+    const ms = m.purchase_source ?? null;
+    const my = myPurchaseSource ?? null;
+    return ms === my;
+  });
+  members = sourceFiltered.length > 0 ? sourceFiltered : []; // 같은 source 없으면 1차 anchor 없음 → 2차로
   const myTokens = tokenizeName(myName);
   if (myTokens.length === 0) return null;
 
@@ -978,14 +989,20 @@ function estimateFromGroupMembers(
   myReferencePrice: number = 0,
   myLearnedTier: number | null = null,
   myProductGroup: number | null | undefined = null,
-  tierRatios: Map<string, number> | null | undefined = null
+  tierRatios: Map<string, number> | null | undefined = null,
+  myPurchaseSource: string | null | undefined = null
 ): GroupEstimateResult | null {
   if (members.length === 0) return null;
 
   // ── Layer 4-B 우선 시도: 토큰 점수 매칭 + 단위환산 (xlsx 밖 상품 간 가격 유추)
   // pack_role 없는 케이스(005045 ↔ 007751 같은 별개매입 페어)에 작동
-  const sameGrade = inferFromSameGradeMember(myName, myUnit, mySpec, members, myReferencePrice, myLearnedTier, myProductGroup, tierRatios);
+  const sameGrade = inferFromSameGradeMember(myName, myUnit, mySpec, members, myReferencePrice, myLearnedTier, myProductGroup, tierRatios, myPurchaseSource);
   if (sameGrade) return sameGrade;
+
+  // pack_role / 변동률 교차참조도 같은 매입처 풀로 한정 (다른 풀 매입가 직접 환산 방지)
+  const sourceSame = members.filter((m) => (m.purchase_source ?? null) === (myPurchaseSource ?? null));
+  members = sourceSame;
+  if (members.length === 0) return null;
 
   // Case A: 나는 관계식 있고, 같은 그룹에 다른 관계식 품목이 최근 매입있음
   if (myPackRole && myPackMeta) {
@@ -1229,7 +1246,8 @@ export function calculateAiRecommendation(input: AiRecInput): AiRecOutput {
       myReferencePrice,
       input.learned_tier ?? null,
       input.product_group ?? null,
-      input.tier_ratios ?? null
+      input.tier_ratios ?? null,
+      input.purchase_source ?? null
     );
   }
 

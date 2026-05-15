@@ -130,10 +130,11 @@ export async function rollSellingPrices(supabase: SupabaseClient): Promise<RollR
     product_name: string | null; unit: string | null; spec: string | null;
     learned_tier: number | null;
     price_fixed: boolean | null;
+    purchase_source: string | null;
   };
   const productsData = await fetchAll<ProdRow>(
     supabase, "products",
-    "product_code,product_group,is_key_item,target_margin_rate,is_event_item,product_type,price_sensitivity,pack_role,pack_meta,product_name,unit,spec,learned_tier,price_fixed"
+    "product_code,product_group,is_key_item,target_margin_rate,is_event_item,product_type,price_sensitivity,pack_role,pack_meta,product_name,unit,spec,learned_tier,price_fixed,purchase_source"
   );
 
   // group_tier_ratios 로드 (B-3) — Map<"groupId-tierA-tierB", ratio>
@@ -272,6 +273,7 @@ export async function rollSellingPrices(supabase: SupabaseClient): Promise<RollR
             pack_role: (m.pack_role as "박스" | "소분" | null),
             pack_meta: m.pack_meta as never,
             unit: m.unit, spec: m.spec, learned_tier: m.learned_tier,
+            purchase_source: m.purchase_source,
             short_history: shortHistoryMap.get(m.product_code) || [],
             long_history: longHistoryMap.get(m.product_code) || [],
           }))
@@ -304,6 +306,7 @@ export async function rollSellingPrices(supabase: SupabaseClient): Promise<RollR
       group_trend: null,
       product_group: prod.product_group ?? null,
       tier_ratios: tierRatios,
+      purchase_source: prod.purchase_source ?? null,
     };
 
     const ai = calculateAiRecommendation(aiInput);

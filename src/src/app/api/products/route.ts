@@ -100,10 +100,11 @@ export async function GET(request: Request) {
       learned_tier: number | null;
       platform_status: string | null;
       price_fixed: boolean | null;
+      purchase_source: string | null;
     };
     const productsData = await fetchAll<ProdRow>(
       "products",
-      "product_code,product_group,is_key_item,target_margin_rate,is_event_item,product_type,price_sensitivity,pack_role,pack_meta,product_name,unit,spec,category_name,learned_tier,platform_status,price_fixed"
+      "product_code,product_group,is_key_item,target_margin_rate,is_event_item,product_type,price_sensitivity,pack_role,pack_meta,product_name,unit,spec,category_name,learned_tier,platform_status,price_fixed,purchase_source"
     );
     const productMap = new Map<string, ProdRow>();
     for (const p of productsData) productMap.set(p.product_code, p);
@@ -383,10 +384,13 @@ export async function GET(request: Request) {
       const myKeyTier = getGradeTier(row.product_name);
       const myLearnedTier = prod?.learned_tier ?? null;
       const sameGradeAnchors: GradeAnchor[] = [];
+      const myPurchaseSource = prod?.purchase_source ?? null;
       if (myTokens.length > 0 && prod?.product_group) {
         const grpMembers = groupMembersMap.get(prod.product_group) || [];
         for (const m of grpMembers) {
           if (m.product_code === row.product_code) continue;
+          // 매입처 풀 분리 — 다른 source 멤버는 1차 anchor 제외 (변동률은 2차에서 처리)
+          if ((m.purchase_source ?? null) !== myPurchaseSource) continue;
           const conv = getUnitConversionRatio(m.unit, m.spec, row.unit, row.spec);
           if (!conv) continue;
           const score = gradeMatchScore(myTokens, tokenizeName(m.product_name));
@@ -547,6 +551,7 @@ export async function GET(request: Request) {
                 unit: m.unit,
                 spec: m.spec,
                 learned_tier: m.learned_tier,
+                purchase_source: m.purchase_source,
                 short_history: shortHistoryMap.get(m.product_code) || [],
                 long_history: longHistoryMap.get(m.product_code) || [],
               }))
@@ -580,6 +585,7 @@ export async function GET(request: Request) {
           group_trend: null,
           product_group: prod?.product_group ?? null,
           tier_ratios: tierRatios,
+          purchase_source: prod?.purchase_source ?? null,
         };
         const ai = calculateAiRecommendation(aiInput);
         recommendedPrice = ai.ai_price;
