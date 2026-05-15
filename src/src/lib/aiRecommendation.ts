@@ -377,8 +377,14 @@ function calcBasePP_v3(sp: number[]): V3Result {
       basePP = Math.max(modePrice, wavg, Math.round(today * 0.95));
       basis = "상승→max(최빈,가중,오늘가×0.95)";
     } else if (trend === "하락") {
-      basePP = Math.max(modePrice, wavg);
-      basis = "하락→완충(최빈/가중 높은값)";
+      // 안정 신호: 최근 2일 동가 → 최빈값과 오늘가의 평균 (점진 수렴, 완충 약화)
+      if (sp.length >= 2 && sp[0] === sp[1]) {
+        basePP = v3MedianOf2(modePrice, today);
+        basis = "하락안정(최근2일동가)→MEDIAN(최빈,오늘가)";
+      } else {
+        basePP = Math.max(modePrice, wavg);
+        basis = "하락→완충(최빈/가중 높은값)";
+      }
     } else {
       basePP = v3MedianOf2(modePrice, wavg);
       basis = "횡보→MEDIAN(최빈,가중)";
