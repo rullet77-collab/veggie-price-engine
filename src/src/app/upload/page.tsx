@@ -87,12 +87,14 @@ export default function UploadPage() {
   const uploadAll = async () => {
     if (entries.length === 0 || uploading) return;
     setUploading(true);
+    let anySuccess = false;
     // pending / error 만 다시 시도
     for (let i = 0; i < entries.length; i++) {
       if (entries[i].status === "done") continue;
       setEntries((prev) => prev.map((e, idx) => (idx === i ? { ...e, status: "uploading" } : e)));
       // 순간 entries 는 stale 일 수 있어서 직접 file 참조
       const result = await uploadOne(entries[i]);
+      if (result.success) anySuccess = true;
       setEntries((prev) =>
         prev.map((e, idx) =>
           idx === i ? { ...e, status: result.success ? "done" : "error", result } : e
@@ -100,6 +102,10 @@ export default function UploadPage() {
       );
     }
     setUploading(false);
+    // 업로드 후 /products 페이지 열려있으면 자동 갱신 신호
+    if (anySuccess) {
+      try { localStorage.setItem("products:invalidate", String(Date.now())); } catch {}
+    }
   };
 
   // 드래그앤드롭 — append

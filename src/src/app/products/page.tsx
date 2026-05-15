@@ -986,6 +986,22 @@ export default function ProductsPage() {
   useEffect(() => { fetchData(); }, [fetchData]);
   useEffect(() => { fetchStatusStats(); }, [fetchStatusStats]);
 
+  // 페이지 focus / 탭 visible 시 자동 갱신 (업로드 페이지 다녀온 후 데이터 stale 방지)
+  // 추가: 다른 탭에서 localStorage "products:invalidate" 발화 → 즉시 갱신
+  useEffect(() => {
+    const refresh = () => { fetchData(); fetchStatusStats(); };
+    const onVisible = () => { if (document.visibilityState === "visible") refresh(); };
+    const onStorage = (e: StorageEvent) => { if (e.key === "products:invalidate") refresh(); };
+    window.addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("storage", onStorage);
+    return () => {
+      window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("storage", onStorage);
+    };
+  }, [fetchData, fetchStatusStats]);
+
   // 판매중지 등록 (또는 해제)
   const handleSetPlatformStatus = useCallback(async (status: "판매중" | "판매중지") => {
     if (selected.size === 0) return;
