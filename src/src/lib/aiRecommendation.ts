@@ -814,13 +814,19 @@ export function extractGradeKey(name: string | null | undefined): string | null 
 }
 
 /**
- * spec 문자열에서 kg 무게 추출
- *  "박스/±5kg" → 5,  "반박스/10kg" → 10,  "1kg" → 1,  "박스/12개" → null
+ * spec 문자열에서 kg 무게 추출 (그램도 kg 로 환산)
+ *  "박스/±5kg" → 5,  "반박스/10kg" → 10,  "1kg" → 1,
+ *  "500g" → 0.5,  "2kg(반박스)" → 2,  "박스/12개" → null
  */
 function extractKgFromSpec(spec: string | null | undefined): number | null {
   if (!spec) return null;
-  const m = spec.match(/(\d+\.?\d*)\s*[kK][gG]/);
-  return m ? parseFloat(m[1]) : null;
+  // kg 우선 매치 (2kg 의 g 를 그램으로 오인식 방지)
+  const kg = spec.match(/(\d+\.?\d*)\s*[kK][gG]/);
+  if (kg) return parseFloat(kg[1]);
+  // 그램 — 앞에 k 가 없는 g (단어 경계)
+  const g = spec.match(/(\d+\.?\d*)\s*[gG]\b/);
+  if (g) return parseFloat(g[1]) / 1000;
+  return null;
 }
 
 /**
@@ -842,19 +848,23 @@ export function getUnitConversionRatio(
   const t = (myUnit || "").trim();
   if (!a || !t) return null;
 
-  // 같은 단위
-  if (a === t) return { ratio: 1, note: "동일 단위" };
-
-  // 박스 ↔ 반박스
-  if (a === "박스" && t === "반박스") return { ratio: 2, note: "박스→반박스 ÷2" };
-  if (a === "반박스" && t === "박스") return { ratio: 0.5, note: "반박스→박스 ×2" };
-
-  // kg 기반 비례 환산 (박스↔봉, 반박스↔봉 등)
   const aKg = extractKgFromSpec(anchorSpec);
   const tKg = extractKgFromSpec(mySpec);
+
+  // 같은 단위 — spec kg 가 다르면 kg 비례, 같거나 미상이면 ratio 1
+  if (a === t) {
+    if (aKg && tKg && aKg > 0 && tKg > 0 && aKg !== tKg) {
+      return { ratio: aKg / tKg, note: `${aKg}kg→${tKg}kg ÷${(aKg / tKg).toFixed(2)}` };
+    }
+    return { ratio: 1, note: "동일 단위" };
+  }
+
+  // 박스 ↔ 반박스 (spec kg 가 둘 다 있으면 kg 비례 우선)
   if (aKg && tKg && aKg > 0 && tKg > 0) {
     return { ratio: aKg / tKg, note: `${aKg}kg→${tKg}kg ÷${(aKg / tKg).toFixed(2)}` };
   }
+  if (a === "박스" && t === "반박스") return { ratio: 2, note: "박스→반박스 ÷2" };
+  if (a === "반박스" && t === "박스") return { ratio: 0.5, note: "반박스→박스 ×2" };
 
   return null;
 }
