@@ -1,5 +1,5 @@
 import { supabase } from "@/lib/supabase";
-import { calculateAiRecommendation, type AiRecInput, tokenizeName, gradeMatchScore, getGradeTier, getUnitConversionRatio, ceil10 } from "@/lib/aiRecommendation";
+import { calculateAiRecommendation, type AiRecInput, type PackMeta, tokenizeName, gradeMatchScore, getGradeTier, getUnitConversionRatio, ceil10, boxToSubdiv, subdivToBox } from "@/lib/aiRecommendation";
 import { computePrev3MonthPct } from "@/lib/salesStats";
 
 // Next.js 가 GET 응답을 캐시하지 않도록 강제 dynamic
@@ -449,12 +449,65 @@ export async function GET(request: Request) {
       };
       const exactGradeAnchors = sameGradeAnchors.filter((a) => a.score === myTokens.length);
 
-      // 1차 패스 — actual + 동일 등급 anchor
+      // 박스소분 89개 매핑 anchor — pack_role/pack_meta 있는 상품은 관계식 우선
+      type PackAnchor = { code: string; name: string; packRole: string; packMeta: PackMeta };
+      const myPackRole = prod?.pack_role ?? null;
+      const myPackMeta = (prod?.pack_meta ?? null) as PackMeta | null;
+      const packAnchors: PackAnchor[] = [];
+      if (myPackRole && myPackMeta && prod?.product_group) {
+        for (const m of groupMembersMap.get(prod.product_group) || []) {
+          if (m.product_code === row.product_code) continue;
+          if (m.pack_role && m.pack_meta) {
+            packAnchors.push({
+              code: m.product_code,
+              name: m.product_name || m.product_code,
+              packRole: m.pack_role,
+              packMeta: m.pack_meta as PackMeta,
+            });
+          }
+        }
+      }
+      const priceDateObj2 = new Date(priceDate);
+
+      // 박스소분 관계식 환산 — anchor 매입가 → 내 매입가
+      const packConvert = (anchorPrice: number, pa: PackAnchor): number | null => {
+        if (!myPackRole || !myPackMeta) return null;
+        if (pa.packRole === "박스" && myPackRole === "소분") {
+          return boxToSubdiv(anchorPrice, pa.packMeta, myPackMeta, priceDateObj2);
+        }
+        if (pa.packRole === "소분" && myPackRole === "박스") {
+          return subdivToBox(anchorPrice, pa.packMeta, myPackMeta, priceDateObj2);
+        }
+        if (pa.packRole === "소분" && myPackRole === "소분") {
+          // 소분→소분: quantity 비례
+          if ("quantity" in pa.packMeta && "quantity" in myPackMeta && pa.packMeta.quantity > 0) {
+            return ceil10(anchorPrice / pa.packMeta.quantity * myPackMeta.quantity);
+          }
+        }
+        if (pa.packRole === "박스" && myPackRole === "박스") return anchorPrice;
+        return null;
+      };
+
+      // 1차 패스 — actual → 박스소분 관계식 → 동일 등급 토큰 anchor
       const slots: SlotEntry[] = slotDates.map((date) => {
         const actual = priceByDateAndCode.get(date)?.get(row.product_code);
         if (actual != null && actual > 0) {
           return { date, price: actual, source: "actual", anchor: null };
         }
+        // 박스소분 89개 매핑 상품 — 관계식만 사용, 토큰매칭 fallback 없음
+        // (관계식 불가 시 missing → 2차 reference 변동률로)
+        if (myPackRole && myPackMeta) {
+          for (const pa of packAnchors) {
+            const ap = priceByDateAndCode.get(date)?.get(pa.code);
+            if (ap == null || ap <= 0) continue;
+            const est = packConvert(ap, pa);
+            if (est != null && est > 0) {
+              return { date, price: est, source: "inferred", anchor: pa.name };
+            }
+          }
+          return { date, price: null, source: "missing", anchor: null };
+        }
+        // 박스소분 매핑 없는 상품 — 토큰 매칭 단위환산
         for (const a of exactGradeAnchors) {
           const ap = priceByDateAndCode.get(date)?.get(a.code);
           if (ap == null || ap <= 0) continue;

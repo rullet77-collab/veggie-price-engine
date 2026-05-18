@@ -601,7 +601,7 @@ function isPurchaseStable(layer1: BasePurchaseResult): boolean {
 // ─────────────────────────────────────────
 
 // 가지 시즌 판정 (11~6월 ÷30 / 7~10월 ÷45)
-function getActiveDivisor(meta: PackMeta | null | undefined, date: Date): number | null {
+export function getActiveDivisor(meta: PackMeta | null | undefined, date: Date): number | null {
   if (!meta || !("formula_divisor" in meta)) return null;
   if (meta.seasonal) {
     const m = date.getMonth() + 1;
@@ -617,7 +617,7 @@ export function ceil10(v: number): number {
 }
 
 // 박스 매입가 → 소분 수량에 해당하는 매입가
-function boxToSubdiv(boxPrice: number, boxMeta: PackMeta, subdivMeta: PackMeta, date: Date): number | null {
+export function boxToSubdiv(boxPrice: number, boxMeta: PackMeta, subdivMeta: PackMeta, date: Date): number | null {
   if (!("formula_divisor" in boxMeta)) return null;
   if (!("quantity" in subdivMeta)) return null;
   const divisor = getActiveDivisor(boxMeta, date);
@@ -631,7 +631,7 @@ function boxToSubdiv(boxPrice: number, boxMeta: PackMeta, subdivMeta: PackMeta, 
 }
 
 // 소분 매입가 → 같은 분류 박스 매입가 역산
-function subdivToBox(subdivPrice: number, subdivMeta: PackMeta, boxMeta: PackMeta, date: Date): number | null {
+export function subdivToBox(subdivPrice: number, subdivMeta: PackMeta, boxMeta: PackMeta, date: Date): number | null {
   if (!("quantity" in subdivMeta)) return null;
   if (!("formula_divisor" in boxMeta)) return null;
   const divisor = getActiveDivisor(boxMeta, date);
@@ -1004,10 +1004,15 @@ function estimateFromGroupMembers(
 ): GroupEstimateResult | null {
   if (members.length === 0) return null;
 
-  // ── Layer 4-B 우선 시도: 토큰 점수 매칭 + 단위환산 (xlsx 밖 상품 간 가격 유추)
-  // pack_role 없는 케이스(005045 ↔ 007751 같은 별개매입 페어)에 작동
-  const sameGrade = inferFromSameGradeMember(myName, myUnit, mySpec, members, myReferencePrice, myLearnedTier, myProductGroup, tierRatios, myPurchaseSource);
-  if (sameGrade) return sameGrade;
+  // 박스소분 89개 매핑(pack_role+pack_meta)이 있으면 Layer 4-A 관계식이 1차.
+  // 매핑 없는 상품만 Layer 4-B(토큰 매칭 단위환산)를 1차로 사용.
+  const hasPackMapping = !!(myPackRole && myPackMeta);
+
+  if (!hasPackMapping) {
+    // ── Layer 4-B: 토큰 점수 매칭 + 단위환산 (xlsx 밖 상품 간 가격 유추)
+    const sameGrade = inferFromSameGradeMember(myName, myUnit, mySpec, members, myReferencePrice, myLearnedTier, myProductGroup, tierRatios, myPurchaseSource);
+    if (sameGrade) return sameGrade;
+  }
 
   // pack_role / 변동률 교차참조도 같은 매입처 풀로 한정 (다른 풀 매입가 직접 환산 방지)
   const sourceSame = members.filter((m) => (m.purchase_source ?? null) === (myPurchaseSource ?? null));
@@ -1146,6 +1151,9 @@ function estimateFromGroupMembers(
     }
   }
 
+  // 박스소분 89개 매핑 상품은 Layer 4-B(토큰매칭) 미사용 —
+  // 관계식(Case A) + 변동률(Case B) 모두 실패하면 추정 불가로 반환
+  void hasPackMapping;
   return null;
 }
 
