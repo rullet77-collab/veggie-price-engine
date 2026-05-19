@@ -27,7 +27,8 @@ type SalesItem = {
 type DashboardData = {
   price_date: string | null;
   month: string | null;
-  volatile_top10: VolatileItem[];
+  volatile_up: VolatileItem[];
+  volatile_down: VolatileItem[];
   sales_top: Record<string, SalesItem[]>;
   sales_bottom: Record<string, SalesItem[]>;
 };
@@ -56,7 +57,7 @@ function channelLabel(c: string): string {
 
 export default async function Dashboard() {
   const data = await getData();
-  const { price_date, month, volatile_top10, sales_top, sales_bottom } = data;
+  const { price_date, month, volatile_up, volatile_down, sales_top, sales_bottom } = data;
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -82,57 +83,15 @@ export default async function Dashboard() {
       </header>
 
       <main className="max-w-7xl mx-auto px-6 py-8 space-y-10">
-        {/* 1) 매입 등락 TOP10 */}
+        {/* 1) 매입 등락 — 상승/하락 분리 */}
         <section>
           <h2 className="text-lg font-semibold text-gray-800 mb-3">
-            오늘 매입 등락 TOP 10{" "}
+            오늘 매입 등락{" "}
             <span className="text-xs text-gray-500 font-normal">(89개 박스소분 상품 포함)</span>
           </h2>
-          <div className="bg-white rounded-lg shadow-sm border border-gray-200 overflow-hidden">
-            <table className="w-full text-sm">
-              <thead className="bg-gray-50 border-b border-gray-200">
-                <tr className="text-gray-600">
-                  <th className="text-left px-3 py-2 font-medium w-8">#</th>
-                  <th className="text-left px-3 py-2 font-medium w-20">코드</th>
-                  <th className="text-left px-3 py-2 font-medium">상품명</th>
-                  <th className="text-left px-3 py-2 font-medium w-28">규격</th>
-                  <th className="text-right px-3 py-2 font-medium w-28">이전</th>
-                  <th className="text-right px-3 py-2 font-medium w-28">오늘</th>
-                  <th className="text-right px-3 py-2 font-medium w-28">변동률</th>
-                </tr>
-              </thead>
-              <tbody>
-                {volatile_top10.length === 0 && (
-                  <tr><td colSpan={7} className="px-3 py-6 text-center text-gray-400">데이터 없음</td></tr>
-                )}
-                {volatile_top10.map((v, i) => {
-                  const up = v.change_rate > 0;
-                  return (
-                    <tr key={v.product_code} className="border-b border-gray-100 hover:bg-gray-50">
-                      <td className="px-3 py-2 text-gray-500">{i + 1}</td>
-                      <td className="px-3 py-2 text-gray-600 font-mono text-xs">{v.product_code}</td>
-                      <td className="px-3 py-2 text-gray-900">
-                        {v.product_name}
-                        {v.derived && (
-                          <span
-                            className="ml-2 text-[10px] px-1.5 py-0.5 rounded bg-amber-50 text-amber-700 border border-amber-200"
-                            title={`박스소분 역산 (anchor: ${v.anchor_name})`}
-                          >
-                            역산
-                          </span>
-                        )}
-                      </td>
-                      <td className="px-3 py-2 text-gray-500 text-xs">{v.spec || ""}</td>
-                      <td className="px-3 py-2 text-right text-gray-500">{formatPrice(v.prev_price)}</td>
-                      <td className="px-3 py-2 text-right text-gray-900 font-medium">{formatPrice(v.today_price)}</td>
-                      <td className={`px-3 py-2 text-right font-semibold ${up ? "text-red-600" : "text-blue-600"}`}>
-                        {up ? "▲" : "▼"}{(Math.abs(v.change_rate) * 100).toFixed(1)}%
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+            <VolatileCard title="상승 TOP 10" items={volatile_up} tone="up" />
+            <VolatileCard title="하락 TOP 10" items={volatile_down} tone="down" />
           </div>
         </section>
 
@@ -172,6 +131,60 @@ export default async function Dashboard() {
           </div>
         </section>
       </main>
+    </div>
+  );
+}
+
+function VolatileCard({ title, items, tone }: { title: string; items: VolatileItem[]; tone: "up" | "down" }) {
+  const headerClass = tone === "up"
+    ? "bg-red-50 border-red-200 text-red-700"
+    : "bg-blue-50 border-blue-200 text-blue-700";
+  const rateClass = tone === "up" ? "text-red-600" : "text-blue-600";
+  const arrow = tone === "up" ? "▲" : "▼";
+  return (
+    <div className="bg-white rounded-lg shadow-sm border border-gray-200 overflow-hidden">
+      <div className={`px-3 py-2 border-b font-semibold text-sm ${headerClass}`}>{title}</div>
+      <table className="w-full text-sm">
+        <thead className="bg-gray-50 border-b border-gray-200">
+          <tr className="text-gray-600 text-xs">
+            <th className="text-left px-2 py-2 font-medium w-6">#</th>
+            <th className="text-left px-2 py-2 font-medium w-16">코드</th>
+            <th className="text-left px-2 py-2 font-medium">상품명</th>
+            <th className="text-right px-2 py-2 font-medium w-20">이전</th>
+            <th className="text-right px-2 py-2 font-medium w-20">오늘</th>
+            <th className="text-right px-2 py-2 font-medium w-20">변동률</th>
+          </tr>
+        </thead>
+        <tbody>
+          {items.length === 0 && (
+            <tr><td colSpan={6} className="px-2 py-6 text-center text-gray-400">데이터 없음</td></tr>
+          )}
+          {items.map((v, i) => (
+            <tr key={v.product_code} className="border-b border-gray-100 hover:bg-gray-50">
+              <td className="px-2 py-2 text-gray-500">{i + 1}</td>
+              <td className="px-2 py-2 text-gray-600 font-mono text-xs">{v.product_code}</td>
+              <td className="px-2 py-2 text-gray-900">
+                <span className="truncate inline-block max-w-[200px] align-middle" title={v.product_name}>
+                  {v.product_name}
+                </span>
+                {v.derived && (
+                  <span
+                    className="ml-1 text-[10px] px-1 py-0.5 rounded bg-amber-50 text-amber-700 border border-amber-200 align-middle"
+                    title={`박스소분 역산 (anchor: ${v.anchor_name})`}
+                  >
+                    역산
+                  </span>
+                )}
+              </td>
+              <td className="px-2 py-2 text-right text-gray-500 text-xs tabular-nums">{formatPrice(v.prev_price)}</td>
+              <td className="px-2 py-2 text-right text-gray-900 font-medium tabular-nums">{formatPrice(v.today_price)}</td>
+              <td className={`px-2 py-2 text-right font-semibold tabular-nums ${rateClass}`}>
+                {arrow}{(Math.abs(v.change_rate) * 100).toFixed(1)}%
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   );
 }

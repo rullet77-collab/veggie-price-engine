@@ -215,8 +215,15 @@ export async function GET() {
       });
     }
 
-    volatileAll.sort((a, b) => Math.abs(b.change_rate) - Math.abs(a.change_rate));
-    const volatile_top10 = volatileAll.slice(0, 10);
+    // 상승/하락 분리
+    const volatile_up = volatileAll
+      .filter((v) => v.change_rate > 0)
+      .sort((a, b) => b.change_rate - a.change_rate)
+      .slice(0, 10);
+    const volatile_down = volatileAll
+      .filter((v) => v.change_rate < 0)
+      .sort((a, b) => a.change_rate - b.change_rate)
+      .slice(0, 10);
 
     // 4) 이번달 매출 — 채널별 집계
     const salesRows = await fetchAll<SalesRow>(
@@ -267,7 +274,8 @@ export async function GET() {
     return Response.json({
       price_date: priceDate,
       month: priceDate.slice(0, 7),
-      volatile_top10,
+      volatile_up,
+      volatile_down,
       sales_top,
       sales_bottom,
     });
