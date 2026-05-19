@@ -60,34 +60,18 @@ export async function GET(request: Request) {
     const category = url.searchParams.get("category");
     const group = url.searchParams.get("group");
 
-    // 1) priceDate 결정 — daily_purchase_prices 의 max 와 mgmt 의 max 중 더 최근값
-    //    (mgmt 가 갱신 안되더라도 매입 이력이 들어오면 그 날짜를 기준으로 사용)
-    const [{ data: latestMgmt }, { data: latestDaily }] = await Promise.all([
-      supabase.from("daily_product_management").select("price_date").order("price_date", { ascending: false }).limit(1).maybeSingle(),
-      supabase.from("daily_purchase_prices").select("price_date").order("price_date", { ascending: false }).limit(1).maybeSingle(),
-    ]);
-    const mgmtMax = (latestMgmt as { price_date: string } | null)?.price_date ?? null;
-    const dailyMax = (latestDaily as { price_date: string } | null)?.price_date ?? null;
-    const priceDate = (mgmtMax && dailyMax) ? (mgmtMax >= dailyMax ? mgmtMax : dailyMax) : (mgmtMax || dailyMax);
+    // 1) priceDate 결정 — daily_purchase_prices 의 max (mgmt 의존 제거)
+    //    엔진은 현재 폴더 매입/매출 raw 만 사용. 천년경영 "기존/변경"(mgmt) 미사용.
+    const { data: latestDaily } = await supabase
+      .from("daily_purchase_prices")
+      .select("price_date")
+      .order("price_date", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    const priceDate = (latestDaily as { price_date: string } | null)?.price_date ?? null;
     if (!priceDate) return Response.json([]);
 
-    // 2) 해당 날짜 (또는 가장 최근 날짜) mgmt 데이터 — outdated 일 수 있음 (fallback 으로만)
-    type MgmtRow = {
-      product_code: string; price_date: string;
-      purchase_price: number | null; selling_price: number | null;
-      prev_purchase_price: number | null; prev_selling_price: number | null;
-      product_name: string | null; spec: string | null;
-      unit: string | null; category_name: string | null;
-      major_category: string | null;
-    };
-    // mgmt 의 max 날짜 데이터 (priceDate 가 daily 라 mgmt 와 다를 수 있음)
-    const mgmtData = mgmtMax ? await fetchAll<MgmtRow>(
-      "daily_product_management",
-      "product_code,price_date,purchase_price,selling_price,prev_purchase_price,prev_selling_price,product_name,spec,unit,category_name,major_category",
-      (q) => q.eq("price_date", mgmtMax)
-    ) : [];
-
-    // 3) products 마스터 (Phase 5-A: pack_role, pack_meta / Layer 4-B: spec / 학습 tier)
+    // 2) products 마스터 (Phase 5-A: pack_role, pack_meta / Layer 4-B: spec / 학습 tier)
     type ProdRow = {
       product_code: string; product_group: number | null;
       is_key_item: boolean; target_margin_rate: number | null;
@@ -328,29 +312,25 @@ export async function GET(request: Request) {
       return "0.00%";
     };
 
-    // 7) 결과 조합 — 소스: products 마스터 (mgmt 가 outdated/누락이어도 모든 상품 노출)
-    const mgmtMap = new Map<string, MgmtRow>();
-    for (const m of mgmtData) mgmtMap.set(m.product_code, m);
-
+    // 7) 결과 조합 — 소스: products 마스터 (모든 상품 노출)
     let results = productsData.map((prod) => {
-      const row = mgmtMap.get(prod.product_code) || {
+      const row = {
         product_code: prod.product_code,
-        price_date: priceDate,
-        purchase_price: null, selling_price: null,
-        prev_purchase_price: null, prev_selling_price: null,
-        product_name: prod.product_name, spec: prod.spec, unit: prod.unit,
-        category_name: prod.category_name, major_category: null,
-      } as MgmtRow;
+        product_name: prod.product_name,
+        spec: prod.spec,
+        unit: prod.unit,
+        category_name: prod.category_name,
+      };
       const selling = sellingMap.get(row.product_code);
       const ph = purchaseMap.get(row.product_code);
       const monthlyQty = salesQtyMap.get(row.product_code) || null;
 
-      // daily_purchase_prices 우선 (매일 매입 이력 누적이 source of truth),
-      // mgmt 의 기존/변경 컬럼은 fallback (daily 데이터 없을 때만)
+      // 매입가 source of truth = daily_purchase_prices 만 (mgmt fallback 제거).
+      // daily 이력이 없으면 purchasePrice=0 → AI 엔진이 박스소분 역산/그룹 변동률로 추정.
       const dailyToday = dailyTodayMap.get(row.product_code);
       const dailyPrev = dailyPrevMap.get(row.product_code);
-      const purchasePrice = (dailyToday != null && dailyToday > 0) ? dailyToday : (row.purchase_price || 0);
-      const prevPurchase = (dailyPrev != null && dailyPrev > 0) ? dailyPrev : (row.prev_purchase_price || 0);
+      const purchasePrice = (dailyToday != null && dailyToday > 0) ? dailyToday : 0;
+      const prevPurchase = (dailyPrev != null && dailyPrev > 0) ? dailyPrev : 0;
 
       // 변동률/변동액
       const changeAmount = prevPurchase > 0 ? purchasePrice - prevPurchase : 0;
@@ -591,7 +571,7 @@ export async function GET(request: Request) {
       if (prod?.price_fixed) {
         recommendedPrice = selling?.selling_price ?? null;
         recommendReason = "판매가고정";
-      } else if ((platformSellingPrice && platformSellingPrice > 0) || purchasePrice > 0) {
+      } else if ((platformSellingPrice && platformSellingPrice > 0) || purchasePrice > 0 || prod?.product_group) {
         // Phase 5-A / Layer 4-B: 같은 그룹 멤버 데이터 구성 (나 제외, spec/learned_tier 포함)
         const groupMembers = prod?.product_group
           ? (groupMembersMap.get(prod.product_group) || [])

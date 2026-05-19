@@ -32,19 +32,6 @@ function parseDate(value: unknown): string | null {
   return null;
 }
 
-/** 시트명에서 MMDD 추출 → YYYY-MM-DD */
-function extractDateFromSheetName(name: string): string | null {
-  const m = name.match(/\((\d{4})\)/);
-  if (!m) return null;
-  const mmdd = m[1];
-  const month = mmdd.slice(0, 2);
-  const day = mmdd.slice(2, 4);
-  const now = new Date();
-  let year = now.getFullYear();
-  if (parseInt(month) > now.getMonth() + 2) year--;
-  return `${year}-${month}-${day}`;
-}
-
 /** 헤더 셀 값에서 공백 제거 후 매칭 (천년경영 엑셀은 '상  품  명' 같은 공백이 많음) */
 function normalizeHeader(val: string): string {
   return val.replace(/\s+/g, "");
@@ -139,11 +126,10 @@ async function batchUpsert(
 // ── 시트 타입 감지 ──
 
 type SheetType =
-  | "기존" | "변경" | "상품별매입현황" | "월별매출현황" | "경매가평균" | "unknown";
+  | "상품별매입현황" | "월별매출현황" | "경매가평균" | "unknown";
 
 function detectSheetType(name: string, sheet?: XLSX.WorkSheet): SheetType {
-  if (/^기존\(\d{4}\)/.test(name)) return "기존";
-  if (/^변경\(\d{4}\)/.test(name)) return "변경";
+  // 기존/변경 시트(daily_product_management)는 더 이상 처리하지 않음 — 엔진은 매입/매출 raw 만 사용
   if (name.includes("상품별매입현황") || name.includes("매입상세") || name.includes("매입이력")) return "상품별매입현황";
   if (/^월별매출현황/.test(name) || /^신선행월별매출현황/.test(name)) return "월별매출현황";
   if (name.includes("경매가평균")) return "경매가평균";
@@ -194,57 +180,6 @@ function detectChannelFromFilename(filename: string | null | undefined): string 
 }
 
 // ── 각 시트 타입별 파서 ──
-
-/** 기존/변경 → daily_product_management */
-function parseProductManagement(
-  sheet: XLSX.WorkSheet,
-  sheetType: "기존" | "변경",
-  sheetName: string
-): { date: string; rows: Map<string, Record<string, unknown>> } | null {
-  const date = extractDateFromSheetName(sheetName);
-  if (!date) return null;
-
-  const targetKeys = ["상품코드", "상품명", "규격", "단위", "매출가", "매입가", "소분류명", "대분류명"];
-  const headers = findHeaders(sheet, targetKeys);
-  if (!headers || headers.colMap["상품코드"] === undefined) return null;
-
-  const { headerRow, colMap } = headers;
-  const range = XLSX.utils.decode_range(sheet["!ref"] || "A1");
-  const rows = new Map<string, Record<string, unknown>>();
-
-  for (let r = headerRow + 1; r <= range.e.r; r++) {
-    const codeRaw = getCellValue(sheet, r, colMap["상품코드"]!);
-    if (!codeRaw) continue;
-
-    const productCode = padProductCode(codeRaw);
-    const purchasePrice = colMap["매입가"] !== undefined
-      ? Math.round(Number(getCellValue(sheet, r, colMap["매입가"]!) || 0))
-      : null;
-
-    const row: Record<string, unknown> = { product_code: productCode };
-
-    if (sheetType === "변경") {
-      row.purchase_price = purchasePrice;
-    } else {
-      row.prev_purchase_price = purchasePrice;
-    }
-
-    if (colMap["상품명"] !== undefined)
-      row.product_name = String(getCellValue(sheet, r, colMap["상품명"]!) || "").trim() || null;
-    if (colMap["규격"] !== undefined)
-      row.spec = String(getCellValue(sheet, r, colMap["규격"]!) || "").trim() || null;
-    if (colMap["단위"] !== undefined)
-      row.unit = String(getCellValue(sheet, r, colMap["단위"]!) || "").trim() || null;
-    if (colMap["소분류명"] !== undefined)
-      row.category_name = String(getCellValue(sheet, r, colMap["소분류명"]!) || "").trim() || null;
-    if (colMap["대분류명"] !== undefined)
-      row.major_category = String(getCellValue(sheet, r, colMap["대분류명"]!) || "").trim() || null;
-
-    rows.set(productCode, row);
-  }
-
-  return { date, rows };
-}
 
 /** 상품별매입현황(야채7일) → daily_purchase_prices
  *  헤더: 코드, 상품명, 규격, 일자, 단가, 수량, 단위, 공급가액, 합계액, 주매입처 */
@@ -593,31 +528,12 @@ export async function POST(request: Request) {
       return Response.json({ success: true, results, monthly_touched: monthlyTouched, rolled_selling: rolled });
     }
 
-    // 2) RAW DATA 파일 — 시트별 처리
-    // 기존/변경 시트가 있으면 → 판매가 회전 (selling_price → prev_selling_price)
-    const hasGijonByun = workbook.SheetNames.some(
-      (n) => /^기존\(\d{4}\)/.test(n) || /^변경\(\d{4}\)/.test(n)
-    );
-    if (hasGijonByun) {
-      await supabase.rpc("rotate_selling_prices");
-    }
-
-    let gijonData: ReturnType<typeof parseProductManagement> = null;
-    let byunData: ReturnType<typeof parseProductManagement> = null;
-
+    // 2) RAW DATA 파일 — 시트별 처리 (기존/변경은 엔진 미사용으로 처리 안 함)
     for (const sheetName of workbook.SheetNames) {
       const sheet = workbook.Sheets[sheetName];
       const type = detectSheetType(sheetName, sheet);
 
       switch (type) {
-        case "기존":
-          gijonData = parseProductManagement(sheet, "기존", sheetName);
-          break;
-
-        case "변경":
-          byunData = parseProductManagement(sheet, "변경", sheetName);
-          break;
-
         case "상품별매입현황": {
           const rows = parsePurchaseHistory(sheet);
           if (rows.length > 0) {
@@ -660,47 +576,6 @@ export async function POST(request: Request) {
 
         default:
           break;
-      }
-    }
-
-    // 기존/변경 합치기 → daily_product_management
-    if (gijonData || byunData) {
-      const priceDate = byunData?.date || gijonData?.date;
-      if (priceDate) {
-        const allCodes = new Set([
-          ...(gijonData?.rows.keys() || []),
-          ...(byunData?.rows.keys() || []),
-        ]);
-
-        const mergedRows: Record<string, unknown>[] = [];
-        for (const code of allCodes) {
-          const gijon = gijonData?.rows.get(code) || {};
-          const byun = byunData?.rows.get(code) || {};
-          mergedRows.push({
-            product_code: code,
-            price_date: priceDate,
-            purchase_price: byun.purchase_price ?? null,
-            prev_purchase_price: gijon.prev_purchase_price ?? null,
-            product_name: byun.product_name || gijon.product_name || null,
-            spec: byun.spec || gijon.spec || null,
-            unit: byun.unit || gijon.unit || null,
-            category_name: byun.category_name || gijon.category_name || null,
-            major_category: byun.major_category || gijon.major_category || null,
-          });
-        }
-
-        if (mergedRows.length > 0) {
-          const { inserted, errors } = await batchUpsert(
-            "daily_product_management", mergedRows, "product_code,price_date"
-          );
-          results.push({
-            sheetName: `기존+변경 → ${priceDate}`,
-            type: "기존/변경",
-            total: mergedRows.length,
-            inserted,
-            errors: errors.length > 0 ? errors.slice(0, 5) : undefined,
-          });
-        }
       }
     }
 

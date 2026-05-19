@@ -46,8 +46,9 @@ export async function POST(request: Request) {
     }
 
     // 1) 대상 상품 정보 fetch
-    //    products (target_margin_rate) + daily_product_management (purchase_price)
+    //    products (target_margin_rate) + daily_purchase_prices (purchase_price)
     //    + product_selling_prices (기존 selling_price)
+    //    매입가 source = daily_purchase_prices 만 (mgmt 미사용).
     const { data: productsData, error: prodErr } = await supabase
       .from("products")
       .select("product_code, target_margin_rate")
@@ -57,9 +58,9 @@ export async function POST(request: Request) {
       return Response.json({ success: false, error: prodErr.message }, { status: 500 });
     }
 
-    // 최신 price_date 의 purchase_price 조회
+    // 최신 매입일 — daily_purchase_prices
     const { data: latestDateRow } = await supabase
-      .from("daily_product_management")
+      .from("daily_purchase_prices")
       .select("price_date")
       .order("price_date", { ascending: false })
       .limit(1)
@@ -73,14 +74,41 @@ export async function POST(request: Request) {
       );
     }
 
-    const { data: mgmtData, error: mgmtErr } = await supabase
-      .from("daily_product_management")
-      .select("product_code, purchase_price")
-      .eq("price_date", latestDate)
-      .in("product_code", product_codes);
+    // 각 상품의 최근 매입가 — 60일 윈도우 내 가장 최근 price_date 의 purchase_price
+    const windowStart = (() => {
+      const [y, m, d] = latestDate.split("-").map(Number);
+      const dt = new Date(Date.UTC(y, m - 1, d) - 60 * 86_400_000);
+      return `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, "0")}-${String(dt.getUTCDate()).padStart(2, "0")}`;
+    })();
 
-    if (mgmtErr) {
-      return Response.json({ success: false, error: mgmtErr.message }, { status: 500 });
+    const purchaseMap = new Map<string, number | null>();
+    {
+      const latestByCode = new Map<string, string>();
+      const PAGE = 1000;
+      let from = 0;
+      while (true) {
+        const { data, error } = await supabase
+          .from("daily_purchase_prices")
+          .select("product_code, price_date, purchase_price")
+          .in("product_code", product_codes)
+          .gte("price_date", windowStart)
+          .lte("price_date", latestDate)
+          .order("price_date", { ascending: true })
+          .range(from, from + PAGE - 1);
+        if (error) {
+          return Response.json({ success: false, error: error.message }, { status: 500 });
+        }
+        if (!data || data.length === 0) break;
+        for (const r of data) {
+          const cur = latestByCode.get(r.product_code);
+          if (!cur || r.price_date >= cur) {
+            latestByCode.set(r.product_code, r.price_date);
+            purchaseMap.set(r.product_code, r.purchase_price);
+          }
+        }
+        if (data.length < PAGE) break;
+        from += PAGE;
+      }
     }
 
     const { data: sellingData, error: sellErr } = await supabase
@@ -95,10 +123,6 @@ export async function POST(request: Request) {
     const marginMap = new Map<string, number | null>();
     for (const p of productsData || []) {
       marginMap.set(p.product_code, p.target_margin_rate);
-    }
-    const purchaseMap = new Map<string, number | null>();
-    for (const m of mgmtData || []) {
-      purchaseMap.set(m.product_code, m.purchase_price);
     }
     const sellingMap = new Map<string, { selling_price: number | null; prev_selling_price: number | null }>();
     for (const s of sellingData || []) {

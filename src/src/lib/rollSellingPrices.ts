@@ -90,36 +90,19 @@ export async function rollSellingPrices(supabase: SupabaseClient): Promise<RollR
   }
 
   // ── Step 2: 추천가 일괄 산출
-  // 추천가 산출에 필요한 데이터 (api/products/route.ts 와 동일하게 모음)
-  // priceDate = max(mgmt.max, daily_purchase.max) — RAW DATA "기존/변경" 시트가
-  // 매일 안 올라와도 daily_purchase 만 갱신되면 그 날짜 기준으로 추천 산출
-  const [mgmtMaxRes, dailyMaxRes] = await Promise.all([
-    supabase.from("daily_product_management").select("price_date").order("price_date", { ascending: false }).limit(1).maybeSingle(),
-    supabase.from("daily_purchase_prices").select("price_date").order("price_date", { ascending: false }).limit(1).maybeSingle(),
-  ]);
-  const mgmtMax = (mgmtMaxRes.data as { price_date: string } | null)?.price_date ?? null;
-  const dailyMax = (dailyMaxRes.data as { price_date: string } | null)?.price_date ?? null;
-  const priceDate = (mgmtMax && dailyMax) ? (mgmtMax >= dailyMax ? mgmtMax : dailyMax) : (mgmtMax || dailyMax);
+  // priceDate = daily_purchase_prices.max — 엔진은 현재 폴더 매입/매출 raw 만 사용.
+  // 천년경영 "기존/변경"(mgmt) 미사용.
+  const dailyMaxRes = await supabase
+    .from("daily_purchase_prices")
+    .select("price_date")
+    .order("price_date", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  const priceDate = (dailyMaxRes.data as { price_date: string } | null)?.price_date ?? null;
 
   if (!priceDate) {
     return { prev_rolled: prevRolled, recommended_set: 0, duration_ms: Date.now() - start };
   }
-
-  type MgmtRow = {
-    product_code: string; price_date: string;
-    purchase_price: number | null; selling_price: number | null;
-    prev_purchase_price: number | null;
-    product_name: string | null; spec: string | null;
-    unit: string | null; category_name: string | null;
-  };
-  // mgmt 는 priceDate 가 daily 의 max 일 수도 있으므로 mgmt.max 행을 가져옴
-  // (해당 날짜 mgmt 데이터가 없어도 productsData 순회로 모든 838 상품 처리됨)
-  const mgmtFetchDate = mgmtMax || priceDate;
-  const mgmtData = await fetchAll<MgmtRow>(
-    supabase, "daily_product_management",
-    "product_code,price_date,purchase_price,prev_purchase_price,product_name,spec,unit,category_name",
-    (q) => q.eq("price_date", mgmtFetchDate)
-  );
 
   type ProdRow = {
     product_code: string; product_group: number | null;
@@ -233,28 +216,25 @@ export async function rollSellingPrices(supabase: SupabaseClient): Promise<RollR
   }
   void computePrev3MonthPct; // 사용안함 (api/products와 동일 흐름 보존용)
 
-  // mgmt 행 인덱스 (priceDate 기준 1행씩) — products 전 상품 순회용
-  const mgmtMap = new Map<string, MgmtRow>();
-  for (const row of mgmtData) mgmtMap.set(row.product_code, row);
-
-  // ── Step 3: 838개 전 상품 추천가 산출 (products 기준 — mgmt 누락 상품도 포함)
+  // ── Step 3: 838개 전 상품 추천가 산출 (products 기준)
   const recUpdates: { product_code: string; recommended_price: number }[] = [];
   for (const prod of productsData) {
     const code = prod.product_code;
-    const row = mgmtMap.get(code) ?? null;
     const selling = sellingMap.get(code);
     const monthlyQty = salesQtyMap.get(code) || null;
 
+    // 매입가 = daily_purchase_prices 만 (mgmt fallback 제거).
+    // daily 없으면 0 → AI 엔진이 박스소분 역산/그룹 변동률 추정.
     const dailyToday = dailyTodayMap.get(code);
     const dailyPrev = dailyPrevMap.get(code);
-    const purchasePrice = (dailyToday != null && dailyToday > 0) ? dailyToday : (row?.purchase_price || 0);
-    const prevPurchase = (dailyPrev != null && dailyPrev > 0) ? dailyPrev : (row?.prev_purchase_price || 0);
+    const purchasePrice = (dailyToday != null && dailyToday > 0) ? dailyToday : 0;
+    const prevPurchase = (dailyPrev != null && dailyPrev > 0) ? dailyPrev : 0;
 
     const platformSellingPrice = (selling?.selling_price ?? selling?.recommended_price ?? 0);
     const prevPlatformSellingPrice = selling?.prev_selling_price || null;
     const targetMargin = prod.target_margin_rate != null ? Number(prod.target_margin_rate) : null;
 
-    if (purchasePrice <= 0 && platformSellingPrice <= 0) continue;
+    if (purchasePrice <= 0 && platformSellingPrice <= 0 && !prod.product_group) continue;
 
     // 판매가 고정 — 자동 추천 산출 skip, selling_price 를 recommended 로 유지
     if (prod.price_fixed) {
@@ -291,9 +271,9 @@ export async function rollSellingPrices(supabase: SupabaseClient): Promise<RollR
       pack_meta: prod.pack_meta as never,
       group_members: groupMembers,
       price_date: priceDate,
-      unit: (row?.unit ?? prod.unit) || undefined,
-      product_name: row?.product_name ?? prod.product_name,
-      spec: row?.spec ?? prod.spec,
+      unit: prod.unit || undefined,
+      product_name: prod.product_name,
+      spec: prod.spec,
       learned_tier: prod.learned_tier ?? null,
       short_history: shortHistoryMap.get(code) || [],
       long_history: longHistoryMap.get(code) || [],
