@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef, useCallback, DragEvent, ChangeEvent } from "react";
+import { useState, useRef, useCallback, useEffect, DragEvent, ChangeEvent } from "react";
 
 type SheetResult = {
   sheetName: string;
@@ -23,6 +23,63 @@ type FileEntry = {
   result?: UploadResult;
 };
 
+// 탭 이동 후 돌아와도 마지막 업로드 결과를 보여주기 위한 localStorage 스냅샷
+type PersistedFile = {
+  name: string;
+  size: number;
+  status: FileEntry["status"];
+  result?: UploadResult;
+};
+type PersistedSnapshot = {
+  at: number;
+  files: PersistedFile[];
+};
+const SNAPSHOT_KEY = "upload:lastSnapshot:v1";
+const SNAPSHOT_TTL_MS = 24 * 60 * 60 * 1000; // 24h
+
+function loadSnapshot(): PersistedSnapshot | null {
+  try {
+    const raw = localStorage.getItem(SNAPSHOT_KEY);
+    if (!raw) return null;
+    const data = JSON.parse(raw) as PersistedSnapshot;
+    if (Date.now() - data.at > SNAPSHOT_TTL_MS) {
+      localStorage.removeItem(SNAPSHOT_KEY);
+      return null;
+    }
+    return data;
+  } catch {
+    return null;
+  }
+}
+
+function saveSnapshot(entries: FileEntry[]) {
+  try {
+    const files: PersistedFile[] = entries
+      .filter((e) => e.result)
+      .map((e) => ({
+        name: e.file.name,
+        size: e.file.size,
+        status: e.status,
+        result: e.result,
+      }));
+    if (files.length === 0) {
+      localStorage.removeItem(SNAPSHOT_KEY);
+      return;
+    }
+    localStorage.setItem(SNAPSHOT_KEY, JSON.stringify({ at: Date.now(), files }));
+  } catch {}
+}
+
+function formatRelative(ts: number): string {
+  const diff = Date.now() - ts;
+  const m = Math.floor(diff / 60000);
+  if (m < 1) return "방금 전";
+  if (m < 60) return `${m}분 전`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}시간 전`;
+  return `${Math.floor(h / 24)}일 전`;
+}
+
 function isExcelFile(file: File): boolean {
   return (
     file.type ===
@@ -41,7 +98,13 @@ export default function UploadPage() {
   const [entries, setEntries] = useState<FileEntry[]>([]);
   const [uploading, setUploading] = useState(false);
   const [dragOver, setDragOver] = useState(false);
+  const [snapshot, setSnapshot] = useState<PersistedSnapshot | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+
+  // 마운트 시 직전 업로드 결과 복원 (탭 이동 후 돌아왔을 때 보여주기 위함)
+  useEffect(() => {
+    setSnapshot(loadSnapshot());
+  }, []);
 
   // 파일 추가 — 같은 파일은 무시
   const addFiles = useCallback((files: FileList | File[] | null) => {
@@ -106,7 +169,19 @@ export default function UploadPage() {
     if (anySuccess) {
       try { localStorage.setItem("products:invalidate", String(Date.now())); } catch {}
     }
+    // 결과 스냅샷 저장 (탭 이동 후 돌아와도 확인 가능)
+    setEntries((curr) => {
+      saveSnapshot(curr);
+      setSnapshot(loadSnapshot());
+      return curr;
+    });
   };
+
+  // 스냅샷 지우기
+  const clearSnapshot = useCallback(() => {
+    try { localStorage.removeItem(SNAPSHOT_KEY); } catch {}
+    setSnapshot(null);
+  }, []);
 
   // 드래그앤드롭 — append
   const handleDragOver = useCallback((e: DragEvent) => {
@@ -142,9 +217,68 @@ export default function UploadPage() {
     <div className="min-h-screen bg-gray-50">
       <main className="max-w-3xl mx-auto px-6 py-8">
         <h1 className="text-2xl font-bold text-gray-900 mb-2">데이터 업로드</h1>
-        <p className="text-sm text-gray-500 mb-8">
+        <p className="text-sm text-gray-500 mb-4">
           매입·매출 파일을 한 번에 여러 개 선택하거나 끌어다 놓으세요. 서로 다른 폴더의 파일도 추가 선택으로 합칠 수 있습니다.
         </p>
+
+        {/* 사용 안내 */}
+        <div className="mb-6 bg-blue-50 border border-blue-200 rounded-lg p-4 text-sm text-blue-900">
+          <p className="font-medium mb-1">이 화면 사용법</p>
+          <ol className="list-decimal list-inside space-y-0.5 text-xs leading-relaxed">
+            <li>매입(상품별매입현황) / 매출(월별매출상세) 엑셀을 한 번에 여러 개 선택 또는 드래그</li>
+            <li><strong>업로드</strong> 클릭 → 파일은 순차 처리 (각 파일 처리 후 추천가·매출 집계 자동 갱신)</li>
+            <li>각 파일 옆 점이 <span className="text-green-700">●</span> 완료 / <span className="text-red-700">●</span> 실패 로 표시</li>
+            <li>업로드 후 다른 탭으로 이동했다 돌아와도 <strong>직전 결과</strong>가 24시간 보존됩니다</li>
+          </ol>
+        </div>
+
+        {/* 직전 업로드 결과 — 탭 이동 후 돌아왔을 때 보임 (현재 작업이 없을 때만) */}
+        {snapshot && entries.length === 0 && (
+          <div className="mb-6 bg-white rounded-lg border border-gray-200 shadow-sm p-4">
+            <div className="flex items-center justify-between mb-2">
+              <div>
+                <h2 className="text-sm font-semibold text-gray-800">직전 업로드 결과</h2>
+                <p className="text-xs text-gray-500">{formatRelative(snapshot.at)} · {snapshot.files.length}개 파일</p>
+              </div>
+              <button
+                onClick={clearSnapshot}
+                className="text-xs text-gray-400 hover:text-gray-700"
+              >
+                결과 지우기
+              </button>
+            </div>
+            <div className="space-y-2">
+              {snapshot.files.map((f, i) => {
+                if (!f.result) return null;
+                if (!f.result.success) {
+                  return (
+                    <div key={i} className="p-3 rounded-lg text-sm bg-red-50 border border-red-200 text-red-800">
+                      <p className="font-medium text-xs text-gray-600">{f.name}</p>
+                      <p>{f.result.error || "업로드 중 오류가 발생했습니다."}</p>
+                    </div>
+                  );
+                }
+                return (
+                  <div key={i} className="p-3 rounded-lg text-sm bg-green-50 border border-green-200 text-green-800">
+                    <p className="font-medium text-xs text-gray-600 mb-1">{f.name}</p>
+                    {(f.result.results || []).map((r, j) => (
+                      <div key={j} className="text-xs">
+                        <span className="font-medium">{r.type}</span> — {r.sheetName} · {r.total.toLocaleString()}건 처리,{" "}
+                        <strong>{r.inserted.toLocaleString()}건 저장</strong>
+                        {r.skipped !== undefined && r.skipped > 0 && (
+                          <span className="text-gray-500"> ({r.skipped.toLocaleString()}건 변경 없음)</span>
+                        )}
+                        {r.errors && r.errors.length > 0 && (
+                          <span className="block text-amber-700">일부 오류: {r.errors[0]}</span>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
 
         <div className="bg-white rounded-lg border border-gray-200 shadow-sm p-6">
           <h2 className="text-lg font-semibold text-gray-800 mb-1">엑셀 파일 업로드</h2>
@@ -308,10 +442,6 @@ export default function UploadPage() {
           <p className="font-medium mb-2">자동 인식되는 파일/시트</p>
           <div className="grid grid-cols-2 gap-x-6 gap-y-1 text-xs">
             <div className="flex justify-between">
-              <span>기존(MMDD) + 변경(MMDD)</span>
-              <span className="text-gray-500">→ 일일 상품관리</span>
-            </div>
-            <div className="flex justify-between">
               <span>상품별매입현황(야채7일)</span>
               <span className="text-gray-500">→ 매입가 이력</span>
             </div>
@@ -323,13 +453,13 @@ export default function UploadPage() {
               <span>경매가평균(최근일주일)</span>
               <span className="text-gray-500">→ 경매가</span>
             </div>
-            <div className="flex justify-between col-span-2">
-              <span>월별매출상세 (RAW + 채널 통합)</span>
-              <span className="text-gray-500">→ 매출 상세 (UPSERT, 정정 반영)</span>
+            <div className="flex justify-between">
+              <span>월별매출상세 (RAW / 통합)</span>
+              <span className="text-gray-500">→ 매출 상세 (UPSERT)</span>
             </div>
           </div>
           <p className="text-xs text-gray-500 mt-3">
-            여러 파일은 순차 처리됩니다. 각 파일 처리 직후 추천가 / 매출 집계가 자동 갱신됩니다.
+            ※ 기존(MMDD)·변경(MMDD) 시트는 더 이상 처리하지 않습니다 (엔진에서 제거됨).
           </p>
         </div>
       </main>
