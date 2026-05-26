@@ -223,7 +223,7 @@ export default function UploadPage() {
 
         {/* 사용 안내 */}
         <div className="mb-6 bg-blue-50 border border-blue-200 rounded-lg p-4 text-sm text-blue-900">
-          <p className="font-medium mb-1">이 화면 사용법</p>
+          <p className="font-medium mb-1">How-to Guide</p>
           <ol className="list-decimal list-inside space-y-0.5 text-xs leading-relaxed">
             <li>매입(상품별매입현황) / 매출(월별매출상세) 엑셀을 한 번에 여러 개 선택 또는 드래그</li>
             <li><strong>업로드</strong> 클릭 → 파일은 순차 처리 (각 파일 처리 후 추천가·매출 집계 자동 갱신)</li>
