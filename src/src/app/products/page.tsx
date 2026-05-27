@@ -4,6 +4,7 @@ import React, { useEffect, useState, useMemo, useCallback, useRef } from "react"
 import { createPortal } from "react-dom";
 import { List } from "react-window";
 import { tokenizeName, gradeMatchScore } from "@/lib/aiRecommendation";
+import { uploadManager } from "@/lib/uploadManager";
 
 // ── Types ──
 
@@ -902,6 +903,8 @@ function VirtualRow(props: any) {
 
 export default function ProductsPage() {
   const [products, setProducts] = useState<Product[]>([]);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [uploadInProgress, setUploadInProgress] = useState(false);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
@@ -955,21 +958,48 @@ export default function ProductsPage() {
   }, [search]);
 
   // 데이터 로드 (검색은 클라이언트에서)
+  // 전이성 실패(서버 일시 오류) 시 1회 자동 재시도. 그래도 실패하면 이전 데이터 유지 + 에러 표시.
   const fetchData = useCallback(async () => {
     setLoading(true);
-    try {
-      const params = new URLSearchParams();
-      if (category && category !== "전체") params.set("category", category);
-      if (onlyInactive) params.set("onlyInactive", "1");
-      else if (fixedOnly) params.set("fixedOnly", "1");
-      const res = await fetch(`/api/products?${params}`);
-      const data = await res.json();
-      if (Array.isArray(data)) setProducts(data);
-    } catch (err) {
-      console.error("Fetch error:", err);
-    } finally {
-      setLoading(false);
+    const params = new URLSearchParams();
+    if (category && category !== "전체") params.set("category", category);
+    if (onlyInactive) params.set("onlyInactive", "1");
+    else if (fixedOnly) params.set("fixedOnly", "1");
+    const url = `/api/products?${params}`;
+
+    const tryOnce = async (): Promise<{ ok: true; data: Product[] } | { ok: false; reason: string }> => {
+      try {
+        const res = await fetch(url, { cache: "no-store" });
+        if (!res.ok) return { ok: false, reason: `HTTP ${res.status}` };
+        const data = await res.json();
+        if (!Array.isArray(data)) {
+          const reason = (data && typeof data === "object" && "error" in data && typeof data.error === "string")
+            ? data.error
+            : "응답이 배열이 아님";
+          return { ok: false, reason };
+        }
+        return { ok: true, data: data as Product[] };
+      } catch (err) {
+        return { ok: false, reason: err instanceof Error ? err.message : "네트워크 오류" };
+      }
+    };
+
+    let result = await tryOnce();
+    if (!result.ok) {
+      // 전이성 오류 흡수 — 1.5초 후 1회 재시도
+      await new Promise((r) => setTimeout(r, 1500));
+      result = await tryOnce();
     }
+
+    if (result.ok) {
+      setProducts(result.data);
+      setLoadError(null);
+    } else {
+      console.error("Fetch error:", result.reason);
+      // 이전 products 는 유지(빈 화면 방지). 에러 배너만 띄움.
+      setLoadError(result.reason);
+    }
+    setLoading(false);
   }, [category, onlyInactive, fixedOnly]);
 
   // 카운트 (총/판매중/판매중지) — products API 와 별도, 변동 시점만 갱신
@@ -985,6 +1015,24 @@ export default function ProductsPage() {
 
   useEffect(() => { fetchData(); }, [fetchData]);
   useEffect(() => { fetchStatusStats(); }, [fetchStatusStats]);
+
+  // uploadManager 구독 — 업로드 진행/종료 감지.
+  // 진행 중이면 노란 배너 표시, 끝나는 순간 자동으로 fetchData 한 번 더 호출해 갱신.
+  useEffect(() => {
+    let prev = uploadManager.isUploading();
+    setUploadInProgress(prev);
+    const unsub = uploadManager.subscribe(() => {
+      const cur = uploadManager.isUploading();
+      setUploadInProgress(cur);
+      if (prev && !cur) {
+        // 업로드가 방금 끝남 → 데이터 갱신
+        fetchData();
+        fetchStatusStats();
+      }
+      prev = cur;
+    });
+    return unsub;
+  }, [fetchData, fetchStatusStats]);
 
   // 페이지 focus / 탭 visible 시 자동 갱신 (업로드 페이지 다녀온 후 데이터 stale 방지)
   // 추가: 다른 탭에서 localStorage "products:invalidate" 발화 → 즉시 갱신
@@ -1597,6 +1645,36 @@ export default function ProductsPage() {
           </button>
         </div>
 
+        {/* 업로드 처리 중 배너 (에러보다 우선) — 끝나면 자동 갱신 */}
+        {uploadInProgress && !loading && (
+          <div className="mb-3 flex items-center gap-3 rounded-lg border border-amber-200 bg-amber-50 px-4 py-2 text-sm text-amber-800">
+            <svg className="animate-spin h-4 w-4 text-amber-600 shrink-0" viewBox="0 0 24 24" fill="none">
+              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+            </svg>
+            <span>
+              업로드 처리 중 — 자동 갱신 대기
+              {products.length > 0 && <span className="ml-2 text-xs text-gray-600">(직전 데이터 표시 중)</span>}
+            </span>
+          </div>
+        )}
+
+        {/* 로드 실패 배너 — 업로드 중이 아닐 때만 (업로드 중 실패는 정상 상황이라 혼란 방지) */}
+        {loadError && !loading && !uploadInProgress && (
+          <div className="mb-3 flex items-center justify-between rounded-lg border border-red-200 bg-red-50 px-4 py-2 text-sm text-red-700">
+            <span>
+              데이터 로드 실패 — <span className="text-xs text-red-600">{loadError}</span>
+              {products.length > 0 && <span className="ml-2 text-xs text-gray-600">(직전 데이터 표시 중)</span>}
+            </span>
+            <button
+              onClick={() => fetchData()}
+              className="text-xs px-2 py-1 rounded border border-red-300 bg-white hover:bg-red-100"
+            >
+              다시 시도
+            </button>
+          </div>
+        )}
+
         {/* 테이블 (가상 스크롤) */}
         {loading ? (
           <div className="flex items-center justify-center py-20">
@@ -1604,7 +1682,13 @@ export default function ProductsPage() {
           </div>
         ) : filtered.length === 0 ? (
           <div className="border border-gray-200 rounded-lg bg-white shadow-sm px-4 py-12 text-center text-gray-400 text-sm">
-            {products.length === 0 ? "데이터가 없습니다. RAW DATA를 먼저 업로드해주세요." : "검색 결과가 없습니다."}
+            {uploadInProgress && products.length === 0
+              ? "업로드 처리 중입니다. 완료되면 자동으로 표시됩니다."
+              : loadError && products.length === 0
+              ? "데이터 로드 실패. 위 \"다시 시도\" 버튼을 눌러주세요."
+              : products.length === 0
+              ? "데이터가 없습니다. RAW DATA를 먼저 업로드해주세요."
+              : "검색 결과가 없습니다."}
           </div>
         ) : (
           <div className="border border-gray-200 rounded-lg bg-white shadow-sm overflow-hidden">
