@@ -910,7 +910,7 @@ export default function ProductsPage() {
   const [debouncedSearch, setDebouncedSearch] = useState("");
   const [category, setCategory] = useState("전체");
   const [productType, setProductType] = useState<"전체" | "야채" | "공산">("야채");
-  const [sortKey, setSortKey] = useState<SortKey>("product_code");
+  const [sortKey, setSortKey] = useState<SortKey>("product_group");
   const [sortDir, setSortDir] = useState<SortDir>("asc");
   const [onlyChanged, setOnlyChanged] = useState(false);
   const [onlyKeyItems, setOnlyKeyItems] = useState(false);
@@ -1129,11 +1129,15 @@ export default function ProductsPage() {
     return list.sort((a, b) => {
       const av = a[sortKey as keyof Product];
       const bv = b[sortKey as keyof Product];
-      if (av == null && bv == null) return 0;
-      if (av == null) return 1;
-      if (bv == null) return -1;
-      const cmp = typeof av === "string" ? av.localeCompare(bv as string) : (av as number) - (bv as number);
-      return sortDir === "asc" ? cmp : -cmp;
+      let cmp: number;
+      if (av == null && bv == null) cmp = 0;
+      else if (av == null) cmp = 1;
+      else if (bv == null) cmp = -1;
+      else cmp = typeof av === "string" ? av.localeCompare(bv as string) : (av as number) - (bv as number);
+      const primary = sortDir === "asc" ? cmp : -cmp;
+      // 동률이면 product_code 오름차순으로 보조 정렬 — 그룹 정렬 시 같은 그룹 내 일관된 순서 보장
+      if (primary !== 0 || sortKey === "product_code") return primary;
+      return a.product_code.localeCompare(b.product_code);
     });
   }, [products, sortKey, sortDir, onlyChanged, onlyKeyItems, onlyLowMargin, debouncedSearch, productType]);
 
