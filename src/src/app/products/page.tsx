@@ -1,1389 +1,1791 @@
-"use client"
+"use client";
 
-import React, { useEffect, useState, useMemo, useCallback, useRef } from "react"
+import React, { useEffect, useState, useMemo, useCallback, useRef } from "react";
+import { createPortal } from "react-dom";
+import { List } from "react-window";
+import { tokenizeName, gradeMatchScore } from "@/lib/aiRecommendation";
+import { uploadManager } from "@/lib/uploadManager";
 
-// ──────────────────────────────────────────────
-// Types
-// ──────────────────────────────────────────────
+// ── Types ──
 
 type Product = {
-  product_code: string
-  product_name: string
-  category_name: string | null
-  product_group: number | null
-  is_key_item: boolean
-  target_margin_rate: number | null
-  latest_purchase_price: number | null
-  latest_purchase_date: string | null
-  latest_selling_price: number | null
-  latest_selling_date: string | null
-  current_margin_rate: number | null
+  product_code: string;
+  product_name: string;
+  spec: string | null;
+  unit: string | null;
+  category_name: string | null;
+  price_date: string;
+  product_type: string;
+
+  product_group: number | null;
+  is_key_item: boolean;
+  is_event_item: boolean;
+  target_margin_rate: number | null;
+  platform_status?: string | null;
+  price_fixed?: boolean;
+
+  prev_purchase_price: number | null;
+  purchase_price: number | null;
+  change_amount: number;
+  change_rate: number;
+
+  purchase_prices_7d: number[];
+  max_price_7d: number | null;
+  today_purchase: number | null;
+  purchase_history_8d: Array<{
+    date: string;
+    price: number | null;
+    source: "actual" | "inferred" | "missing";
+    anchor: string | null;
+  }>;
+
+  prev_selling_price: number | null;
+  selling_price: number | null;   // NULL = 추천가 자동 적용
+  margin_rate: number;
+
+  target_price: number | null;
+
+  recommended_price: number | null;
+  recommended_margin: number | null;
+  recommend_reason: string;
+
+  sinsunhang_price: number | null;
+  sinsunhang_margin: number | null;
+  baemin_price: number | null;
+  baemin_margin: number | null;
+
+  monthly_qty: number | null;
+  month_1_qty: number | null;
+  month_2_qty: number | null;
+  month_3_qty: number | null;
+  current_month_qty: number | null;
+  prev_3month_pct: string | null;
+  // 채널별 3개월대비 (식봄/신선행/온일장/배민/total)
+  prev_3month_pct_sikbom: string | null;
+  prev_3month_pct_sinsunhang: string | null;
+  prev_3month_pct_oniljang: string | null;
+  prev_3month_pct_baemin: string | null;
+  prev_3month_pct_total: string | null;
+  // 월 라벨 (priceDate 기반 동적)
+  month_1_label?: string;
+  month_2_label?: string;
+  month_3_label?: string;
+  learned_tier?: number | null;
+  pack_role?: "박스" | "소분" | null;
+  pack_meta?: unknown;
+};
+
+type SortKey = keyof Product;
+type SortDir = "asc" | "desc";
+
+// ── Helpers ──
+
+function fmt(n: number | null | undefined): string {
+  if (n == null || isNaN(n)) return "-";
+  return n.toLocaleString();
+}
+function pct(n: number | null | undefined): string {
+  if (n == null || isNaN(n)) return "-";
+  return (n * 100).toFixed(1) + "%";
+}
+function changeClass(val: number): string {
+  if (val > 0) return "text-red-600";
+  if (val < 0) return "text-blue-600";
+  return "text-gray-400";
+}
+function marginClass(rate: number): string {
+  if (rate < 0.1) return "text-red-600 font-semibold";
+  if (rate < 0.15) return "text-orange-500";
+  if (rate >= 0.25) return "text-green-600";
+  return "";
 }
 
-type SortKey = keyof Product | "recommended_price"
-type SortDir = "asc" | "desc"
+type HistEntry = {
+  date: string;
+  price: number | null;
+  source: "actual" | "inferred" | "missing";
+  anchor: string | null;
+};
 
-// ──────────────────────────────────────────────
-// Constants
-// ──────────────────────────────────────────────
-
-const CATEGORIES = [
-  "전체",
-  "엽채류",
-  "근채류",
-  "과채류",
-  "버섯류",
-  "가공품",
-  "과일류",
-  "건채/해조/수산",
-] as const
-
-const GROUP_COLORS = [
-  "border-blue-500",
-  "border-green-500",
-  "border-purple-500",
-  "border-orange-500",
-  "border-pink-500",
-  "border-teal-500",
-  "border-indigo-500",
-  "border-red-400",
-  "border-yellow-500",
-  "border-cyan-500",
-  "border-emerald-500",
-  "border-violet-500",
-  "border-amber-500",
-  "border-lime-500",
-  "border-fuchsia-500",
-  "border-rose-500",
-]
-
-// ──────────────────────────────────────────────
-// Helpers
-// ──────────────────────────────────────────────
-
-function formatPrice(v: number | null): string {
-  if (v == null) return "-"
-  return v.toLocaleString("ko-KR") + "원"
-}
-
-function formatRate(v: number | null): string {
-  if (v == null) return "-"
-  return v.toFixed(1) + "%"
-}
-
-function formatDate(v: string | null): string {
-  if (!v) return "-"
-  return v
-}
-
-/** 추천가 = CEIL(매입가 / (1 - 목표수익률/100) / 10) * 10 */
-function calcRecommendedPrice(
-  purchasePrice: number | null,
-  targetMarginRate: number | null
-): number | null {
-  if (purchasePrice == null || targetMarginRate == null) return null
-  if (targetMarginRate >= 100) return null
-  const raw = purchasePrice / (1 - targetMarginRate / 100)
-  return Math.ceil(raw / 10) * 10
-}
-
-/** 수익률 = 1 - (매입가 / 판매가) */
-function calcMarginRate(
-  purchasePrice: number | null,
-  sellingPrice: number | null
-): number | null {
-  if (purchasePrice == null || sellingPrice == null || sellingPrice === 0)
-    return null
-  return (1 - purchasePrice / sellingPrice) * 100
-}
-
-/** 신선행가 = MAX(CEIL(식봄가 * 0.94 / 10) * 10, CEIL(매입가 / 0.9 / 10) * 10) */
-function calcSinsunPrice(
-  sibomPrice: number,
-  purchasePrice: number | null
-): number {
-  const fromSibom = Math.ceil((sibomPrice * 0.94) / 10) * 10
-  if (purchasePrice == null) return fromSibom
-  const fromPurchase = Math.ceil(purchasePrice / 0.9 / 10) * 10
-  return Math.max(fromSibom, fromPurchase)
-}
-
-function getGroupColorClass(
-  groupNumber: number,
-  groupIndexMap: Map<number, number>
-): string {
-  let idx = groupIndexMap.get(groupNumber)
-  if (idx == null) {
-    idx = groupIndexMap.size % GROUP_COLORS.length
-    groupIndexMap.set(groupNumber, idx)
-  }
-  return GROUP_COLORS[idx]
-}
-
-// ──────────────────────────────────────────────
-// Toast Component
-// ──────────────────────────────────────────────
-
-function Toast({
-  message,
-  type,
-  onClose,
+function Sparkline({
+  history,
+  fallbackPrices,
 }: {
-  message: string
-  type: "success" | "error"
-  onClose: () => void
+  history?: HistEntry[];
+  fallbackPrices?: number[];
 }) {
-  useEffect(() => {
-    const timer = setTimeout(onClose, 3000)
-    return () => clearTimeout(timer)
-  }, [onClose])
+  const [tip, setTip] = useState<{ x: number; y: number } | null>(null);
 
+  // history 우선, 없으면 fallbackPrices 로 합성
+  const hist: HistEntry[] = history && history.length > 0
+    ? history
+    : (fallbackPrices || []).map((p, i) => ({ date: `slot-${i}`, price: p, source: "actual" as const, anchor: null }));
+
+  const valid = hist.filter((h) => h.price != null && h.price > 0) as Array<HistEntry & { price: number }>;
+  if (valid.length < 2) return <span className="text-gray-300 text-xs">-</span>;
+
+  const prices = valid.map((h) => h.price);
+  const min = Math.min(...prices);
+  const max = Math.max(...prices);
+  const range = max - min || 1;
+  const w = 60, h = 20;
+
+  const pts = valid.map((entry, i) => {
+    const x = (i / (valid.length - 1)) * w;
+    const y = h - ((entry.price - min) / range) * (h - 2) - 1;
+    return { x, y, entry };
+  });
+
+  const lineColor =
+    valid[valid.length - 1].price > valid[0].price
+      ? "#ef4444"
+      : valid[valid.length - 1].price < valid[0].price
+        ? "#3b82f6"
+        : "#9ca3af";
+
+  const polylinePoints = pts.map((p) => `${p.x},${p.y}`).join(" ");
+
+  const showTip = (e: React.MouseEvent) => {
+    setTip({ x: e.clientX, y: e.clientY });
+  };
+  const hideTip = () => setTip(null);
+
+  return (
+    <span
+      className="inline-block relative"
+      onMouseEnter={showTip}
+      onMouseMove={showTip}
+      onMouseLeave={hideTip}
+    >
+      <svg width={w} height={h} className="inline-block">
+        <polyline points={polylinePoints} fill="none" stroke={lineColor} strokeWidth="1.2" />
+        {pts.map((p, i) => (
+          <circle
+            key={i}
+            cx={p.x}
+            cy={p.y}
+            r={1.8}
+            fill={p.entry.source === "actual" ? "#000" : "#ef4444"}
+          />
+        ))}
+      </svg>
+      {tip && typeof window !== "undefined" &&
+        createPortal(
+          <div
+            className="fixed z-[9999] bg-white border border-gray-300 rounded shadow-lg px-2 py-1 pointer-events-none"
+            style={{ left: tip.x + 12, top: tip.y + 12, fontSize: "11px", minWidth: "120px" }}
+          >
+            <div className="text-gray-500 mb-0.5 text-[10px]">7일 매입가 (과거→현재)</div>
+            {hist.map((h, i) => {
+              const dateLabel = h.date.length >= 10 ? h.date.slice(5) : h.date;
+              if (h.price == null) {
+                return (
+                  <div key={i} className="text-gray-300">
+                    {dateLabel}: -
+                  </div>
+                );
+              }
+              const cls = h.source === "actual" ? "text-black" : "text-red-600";
+              const tag = h.source === "inferred" ? " (계산)" : "";
+              return (
+                <div key={i} className={cls}>
+                  <span className="font-mono">{dateLabel}</span>: {h.price.toLocaleString()}원{tag}
+                </div>
+              );
+            })}
+          </div>,
+          document.body,
+        )}
+    </span>
+  );
+}
+
+// ── 인라인 편집 셀 ──
+
+function EditableCell({
+  value,
+  productCode,
+  apiUrl,
+  fieldName,
+  onSaved,
+  isPercent,
+  className: extraClass,
+}: {
+  value: number;
+  productCode: string;
+  apiUrl: string;
+  fieldName: string;
+  onSaved: (code: string, newValue: number) => void;
+  isPercent?: boolean;
+  className?: string;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(isPercent ? String(value) : String(value));
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (editing) {
+      inputRef.current?.focus();
+      inputRef.current?.select();
+    }
+  }, [editing]);
+
+  const save = async () => {
+    const newVal = isPercent ? parseFloat(Number(draft).toFixed(1)) : Math.round(Number(draft));
+    if (isNaN(newVal) || newVal < 0) {
+      setDraft(String(value));
+      setEditing(false);
+      return;
+    }
+    if (newVal === value) {
+      setEditing(false);
+      return;
+    }
+
+    try {
+      const res = await fetch(apiUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ product_code: productCode, [fieldName]: newVal }),
+      });
+      if (res.ok) {
+        onSaved(productCode, newVal);
+      }
+    } catch {
+      // ignore
+    }
+    setEditing(false);
+  };
+
+  if (editing) {
+    return (
+      <input
+        ref={inputRef}
+        type="number"
+        step={isPercent ? "0.1" : "1"}
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={save}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") save();
+          if (e.key === "Escape") { setDraft(String(value)); setEditing(false); }
+        }}
+        className="w-16 px-1 py-0 text-xs text-right border border-blue-400 rounded bg-blue-50 outline-none"
+      />
+    );
+  }
+
+  const display = isPercent
+    ? (value > 0 ? value.toFixed(1) + "%" : <span className="text-gray-300">-</span>)
+    : (value > 0 ? fmt(value) : <span className="text-gray-300">-</span>);
+
+  return (
+    <span
+      onClick={() => { setDraft(String(value)); setEditing(true); }}
+      className={`cursor-pointer hover:bg-yellow-100 px-1 py-0.5 rounded ${extraClass || "font-semibold"}`}
+      title="클릭하여 편집"
+    >
+      {display}
+    </span>
+  );
+}
+
+// ── 사용자 수동 selling_price 셀 (NULL 허용 + 추천가 placeholder) ──
+function SellingPriceCell({
+  value,
+  recommended,
+  productCode,
+  onSaved,
+}: {
+  value: number | null;
+  recommended: number | null;
+  productCode: string;
+  onSaved: (code: string, newValue: number) => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(value != null ? String(value) : "");
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (editing) {
+      inputRef.current?.focus();
+      inputRef.current?.select();
+    }
+  }, [editing]);
+
+  const save = async () => {
+    const trimmed = draft.trim();
+    let newVal: number | null = null;
+    if (trimmed !== "") {
+      const n = Math.round(Number(trimmed));
+      if (isNaN(n) || n < 0) {
+        setDraft(value != null ? String(value) : "");
+        setEditing(false);
+        return;
+      }
+      newVal = n;
+    }
+    if (newVal === value) {
+      setEditing(false);
+      return;
+    }
+    try {
+      const res = await fetch("/api/products/update-selling-price", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ product_code: productCode, selling_price: newVal }),
+      });
+      if (res.ok) {
+        // newVal 이 null 일 수도 있어 onSaved 시그니처에 0 전달 (실제 DB는 NULL).
+        // 다음 fetchData 에서 정확한 값으로 재동기화됨. 일단 즉시 시각 업데이트.
+        onSaved(productCode, newVal ?? 0);
+      }
+    } catch {
+      // ignore
+    }
+    setEditing(false);
+  };
+
+  if (editing) {
+    return (
+      <input
+        ref={inputRef}
+        type="number"
+        step="1"
+        value={draft}
+        placeholder={recommended ? recommended.toLocaleString() : ""}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={save}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") save();
+          if (e.key === "Escape") { setDraft(value != null ? String(value) : ""); setEditing(false); }
+        }}
+        className="w-16 px-1 py-0 text-xs text-right border border-blue-400 rounded bg-blue-50 outline-none"
+      />
+    );
+  }
+
+  // 표시: 사용자 입력 우선, 없으면 추천가 회색 표시
+  if (value != null && value > 0) {
+    return (
+      <span
+        onClick={() => { setDraft(String(value)); setEditing(true); }}
+        className="cursor-pointer hover:bg-yellow-100 px-1 py-0.5 rounded font-semibold"
+        title="클릭하여 편집 (빈 값으로 저장하면 추천가 자동 적용)"
+      >
+        {fmt(value)}
+      </span>
+    );
+  }
+  return (
+    <span
+      onClick={() => { setDraft(""); setEditing(true); }}
+      className="cursor-pointer hover:bg-yellow-100 px-1 py-0.5 rounded text-gray-400"
+      title="추천가 자동 적용 중. 클릭하여 수동 입력"
+    >
+      {recommended != null && recommended > 0 ? `(${fmt(recommended)})` : "-"}
+    </span>
+  );
+}
+
+// ── Column definitions ──
+
+// 그룹 expand UI 상태가 행에 주입됨 — 자식 표시용
+type ProductRow = Product & {
+  _isChild?: boolean;
+  _isAnchor?: boolean;
+  // Phase 2: 자식 행에 가격 관계식 검증 메타 주입
+  _expectedFromAnchor?: number | null;   // 박스 → 자기 환산 예상가
+  _conversionNote?: string | null;       // "÷2", "×5/30", "×1/5kg" 등
+  _conversionDelta?: number | null;      // (실제-예상)/예상  (양수=비싸짐)
+  _anomaly?: string | null;              // "등급역전" / "환산불일치 +20%" / null
+  _anchorBoxPrice?: number | null;
+  _anchorBoxName?: string | null;
+};
+
+// Phase 3: 차트 row (그룹 비교 차트)
+type ChartRow = {
+  _isChartRow: true;
+  group: number;
+  members: Product[];   // 차트에 그릴 멤버들 (모든 단위)
+};
+
+type DisplayItem = ProductRow | ChartRow;
+function isChartRow(item: DisplayItem): item is ChartRow {
+  return (item as ChartRow)._isChartRow === true;
+}
+
+// Phase 2: 환산 helper — 박스 → 자기 단위 예상가
+function computeExpectedFromBox(
+  boxPrice: number,
+  boxSpec: string | null | undefined,
+  boxPackMeta: unknown,
+  myUnit: string | null | undefined,
+  mySpec: string | null | undefined,
+  myName: string | null | undefined,
+  date: Date,
+): { expected: number; note: string } | null {
+  if (!boxPrice || boxPrice <= 0) return null;
+
+  // 박스 → 반박스: ÷2
+  if (myUnit === "반박스") {
+    return { expected: Math.ceil(boxPrice / 2 / 10) * 10, note: "÷2" };
+  }
+
+  // 박스 → 봉/단/통: pack_meta.formula_divisor + 자기 quantity
+  // boxPackMeta = { formula_divisor: 30, seasonal: { winter_months, winter_divisor, summer_divisor } }
+  let divisor: number | null = null;
+  if (boxPackMeta && typeof boxPackMeta === "object") {
+    const meta = boxPackMeta as { formula_divisor?: number; seasonal?: { winter_months?: number[]; winter_divisor?: number; summer_divisor?: number } };
+    if (meta.seasonal) {
+      const m = date.getMonth() + 1;
+      divisor = meta.seasonal.winter_months?.includes(m) ? meta.seasonal.winter_divisor ?? null : meta.seasonal.summer_divisor ?? null;
+    }
+    if (!divisor && meta.formula_divisor) divisor = meta.formula_divisor;
+  }
+
+  // 자기 수량 추출 (상품명 또는 spec 에서 "N개" / "Nkg" / "Nkg±")
+  const nameStr = (myName || "") + " " + (mySpec || "");
+  const piecesMatch = nameStr.match(/(\d+)\s*개/);
+  const kgMatch = nameStr.match(/(\d+\.?\d*)\s*[kK][gG]/);
+
+  if (divisor && piecesMatch) {
+    const qty = parseInt(piecesMatch[1]);
+    return { expected: Math.ceil((boxPrice * qty / divisor) / 10) * 10, note: `×${qty}/${divisor}개` };
+  }
+
+  // kg 환산: 박스spec kg / 자기 kg
+  const boxKgMatch = (boxSpec || "").match(/(\d+\.?\d*)\s*[kK][gG]/);
+  if (boxKgMatch && kgMatch) {
+    const boxKg = parseFloat(boxKgMatch[1]);
+    const myKg = parseFloat(kgMatch[1]);
+    if (boxKg > 0 && myKg > 0) {
+      return { expected: Math.ceil((boxPrice * myKg / boxKg) / 10) * 10, note: `×${myKg}kg/${boxKg}kg` };
+    }
+  }
+
+  return null;
+}
+
+type Column = {
+  key: string;
+  label: string;
+  group: string;
+  width: string;
+  align?: "left" | "right" | "center";
+  render: (p: ProductRow, callbacks: {
+    onPriceSaved: (code: string, price: number) => void;
+    onMarginSaved: (code: string, margin: number) => void;
+    expandedGroups?: Set<number>;
+    toggleGroup?: (g: number) => void;
+    selected?: Set<string>;
+    toggleSelect?: (code: string) => void;
+  }) => React.ReactNode;
+  sortable?: boolean;
+};
+
+const COLUMNS: Column[] = [
+  { key: "_select", label: "", group: "기본", width: "w-8", align: "center",
+    render: (p, ctx) => {
+      if (p._isChild) return null;
+      const checked = ctx.selected?.has(p.product_code) || false;
+      return (
+        <input
+          type="checkbox"
+          checked={checked}
+          onChange={(e) => { e.stopPropagation(); ctx.toggleSelect?.(p.product_code); }}
+          onClick={(e) => e.stopPropagation()}
+          className="rounded cursor-pointer"
+        />
+      );
+    } },
+  { key: "product_group", label: "그룹", group: "기본", width: "w-12", align: "center", sortable: true,
+    render: (p, ctx) => {
+      if (!p.product_group) return <span className="text-gray-300">-</span>;
+      // 학습 tier 색 dot — null=회색
+      const tier = p.learned_tier;
+      const tierDot = tier === 1
+        ? "bg-emerald-500"
+        : tier === 2 ? "bg-amber-400"
+        : tier === 3 ? "bg-rose-400"
+        : "bg-gray-300";
+      const tierTip = tier ? `학습 tier ${tier}` : "tier 미학습";
+
+      if (p._isChild) {
+        return (
+          <span className="text-gray-400 text-[10px] inline-flex items-center gap-0.5">
+            <span className={`inline-block w-1.5 h-1.5 rounded-full ${tierDot}`} title={tierTip} />
+            └ {p.product_group}
+          </span>
+        );
+      }
+      const expanded = ctx.expandedGroups?.has(p.product_group);
+      return (
+        <span className="inline-flex items-center gap-0.5">
+          <button
+            type="button"
+            onClick={(e) => { e.stopPropagation(); ctx.toggleGroup?.(p.product_group!); }}
+            className="text-gray-400 hover:text-blue-600 cursor-pointer text-[8px] font-mono w-2.5 leading-none select-none"
+            title={expanded ? "그룹 접기" : "그룹 멤버 펼치기"}
+          >
+            {expanded ? "▼" : "▶"}
+          </button>
+          <span className={`inline-block w-1.5 h-1.5 rounded-full ${tierDot}`} title={tierTip} />
+          <span>{p.product_group}</span>
+        </span>
+      );
+    } },
+  { key: "product_code", label: "코드", group: "기본", width: "w-16", sortable: true,
+    render: (p) => <span className="font-mono text-xs">{p.product_code}</span> },
+  { key: "product_name", label: "상품명", group: "기본", width: "w-44", sortable: true,
+    render: (p) => (
+      <span className={p.is_key_item ? "font-semibold text-blue-700" : ""}>
+        {p.product_name}
+        {p.is_event_item && <span className="ml-1 text-orange-500 text-[10px]">행사</span>}
+      </span>
+    ) },
+  { key: "spec", label: "규격", group: "기본", width: "w-24",
+    render: (p) => <span className="text-gray-600">{p.spec || "-"}</span> },
+  { key: "unit", label: "단위", group: "기본", width: "w-12", align: "center",
+    render: (p) => p.unit || "-" },
+  // 매입가 (기존/변경/7일최고/오늘매입 컬럼 제거 — daily_purchase_prices 자동 도출로 중복)
+  { key: "change_rate", label: "변동률", group: "매입가", width: "w-14", align: "right", sortable: true,
+    render: (p) => <span className={changeClass(p.change_rate)}>{p.change_rate !== 0 ? (p.change_rate > 0 ? "+" : "") + pct(p.change_rate) : "-"}</span> },
+  { key: "change_amount", label: "변동액", group: "매입가", width: "w-14", align: "right", sortable: true,
+    render: (p) => <span className={changeClass(p.change_amount)}>{p.change_amount !== 0 ? (p.change_amount > 0 ? "+" : "") + fmt(p.change_amount) : "-"}</span> },
+  { key: "purchase_prices_7d", label: "7일동향", group: "매입가", width: "w-16", align: "center",
+    render: (p) => <Sparkline history={p.purchase_history_8d} fallbackPrices={p.purchase_prices_7d} /> },
+  // 판매가
+  { key: "prev_selling_price", label: "기존판매가", group: "판매가", width: "w-16", align: "right", sortable: true,
+    render: (p) => fmt(p.prev_selling_price) },
+  { key: "selling_price", label: "판매가", group: "판매가", width: "w-20", align: "right", sortable: true,
+    render: (p, { onPriceSaved }) => (
+      <SellingPriceCell
+        value={p.selling_price}
+        recommended={p.recommended_price}
+        productCode={p.product_code}
+        onSaved={onPriceSaved}
+      />
+    ) },
+  { key: "margin_rate", label: "수익률", group: "판매가", width: "w-14", align: "right", sortable: true,
+    render: (p) => <span className={marginClass(p.margin_rate)}>{pct(p.margin_rate)}</span> },
+  // 수익률일괄변경 — 기본수익률 1개 컬럼만
+  { key: "target_margin_rate", label: "기본수익률", group: "일괄변경", width: "w-16", align: "right", sortable: true,
+    render: (p, { onMarginSaved }) => <EditableCell value={p.target_margin_rate || 0} productCode={p.product_code} apiUrl="/api/products/update-target-margin" fieldName="target_margin_rate" onSaved={onMarginSaved} isPercent /> },
+  // Claude 추천
+  { key: "recommended_price", label: "추천가", group: "추천", width: "w-16", align: "right", sortable: true,
+    render: (p) => {
+      if (!p.recommended_price) return <span className="text-gray-300">-</span>;
+      // 사용자 selling_price 가 있으면 그것과 비교, 없으면 그냥 표시
+      const compareTo = p.selling_price ?? null;
+      if (compareTo == null) {
+        return <span className="text-gray-700">{fmt(p.recommended_price)}</span>;
+      }
+      const diff = p.recommended_price - compareTo;
+      return <span className={diff > 0 ? "text-red-600 font-semibold" : diff < 0 ? "text-blue-600 font-semibold" : "text-gray-500"}>{fmt(p.recommended_price)}</span>;
+    } },
+  { key: "recommend_reason", label: "사유", group: "추천", width: "w-12", align: "center",
+    render: (p) => {
+      // 자식 행 + 환산식 메타가 있으면 환산식 + 이상치 표시
+      if (p._isChild && p._conversionNote) {
+        const exp = p._expectedFromAnchor;
+        const delta = p._conversionDelta ?? null;
+        const ok = delta != null && Math.abs(delta) <= 0.2;
+        const icon = p._anomaly ? "⚠️" : ok ? "✓" : "";
+        const cls = p._anomaly
+          ? "text-red-600"
+          : ok ? "text-emerald-600" : "text-gray-500";
+        const tip = p._anomaly
+          ? `이상치: ${p._anomaly} (anchor ${p._anchorBoxName?.slice(0, 12) ?? ""} ${(p._anchorBoxPrice || 0).toLocaleString()}원 → 예상 ${exp?.toLocaleString() ?? "-"}원, 실제 ${(p.purchase_price || 0).toLocaleString()}원)`
+          : `${p._anchorBoxName?.slice(0, 12) ?? ""} → ${p._conversionNote} = ${exp?.toLocaleString() ?? "-"}원`;
+        return (
+          <span className={`text-[10px] ${cls}`} title={tip}>
+            {p._conversionNote} {icon}
+          </span>
+        );
+      }
+      const colors: Record<string, string> = { "매입↑": "text-red-600", "하락추세": "text-blue-600", "관망": "text-amber-600", "저수익": "text-orange-600", "최소마진": "text-red-700", "유지": "text-gray-400" };
+      return <span className={`text-[10px] ${colors[p.recommend_reason] || ""}`}>{p.recommend_reason || "-"}</span>;
+    } },
+  { key: "recommended_margin", label: "수익률", group: "추천", width: "w-14", align: "right", sortable: true,
+    render: (p) => {
+      if (p.recommended_margin == null) return <span className="text-gray-300">-</span>;
+      // 기준수익률 대비 차이(%p)를 색으로 강조
+      const target = p.target_margin_rate ? Number(p.target_margin_rate) / 100 : null;
+      const diffPp = target != null ? (p.recommended_margin - target) * 100 : 0;
+      const cls = marginClass(p.recommended_margin);
+      const diffStr = target != null ? ` (${diffPp >= 0 ? "+" : ""}${diffPp.toFixed(1)}%p)` : "";
+      return (
+        <span className={cls} title={`기준 ${target != null ? (target * 100).toFixed(1) : "-"}% 대비${diffStr}`}>
+          {pct(p.recommended_margin)}
+        </span>
+      );
+    } },
+  // 플랫폼
+  { key: "sinsunhang_price", label: "신선행", group: "플랫폼", width: "w-16", align: "right",
+    render: (p) => fmt(p.sinsunhang_price) },
+  { key: "sinsunhang_margin", label: "수익률", group: "플랫폼", width: "w-14", align: "right",
+    render: (p) => <span className={marginClass(p.sinsunhang_margin || 0)}>{pct(p.sinsunhang_margin)}</span> },
+  { key: "baemin_price", label: "배민", group: "플랫폼", width: "w-16", align: "right",
+    render: (p) => fmt(p.baemin_price) },
+  // 매출 (1/2/3월 양수 = total 기준 합산 / 이번달 = total) — 라벨은 priceDate 기반 동적 (헤더에서 별도 처리)
+  { key: "month_1_qty", label: "전3월", group: "매출", width: "w-12", align: "right", sortable: true,
+    render: (p) => fmt(p.month_1_qty) },
+  { key: "month_2_qty", label: "전2월", group: "매출", width: "w-12", align: "right", sortable: true,
+    render: (p) => fmt(p.month_2_qty) },
+  { key: "month_3_qty", label: "전1월", group: "매출", width: "w-12", align: "right", sortable: true,
+    render: (p) => fmt(p.month_3_qty) },
+  { key: "current_month_qty", label: "이번달", group: "매출", width: "w-12", align: "right", sortable: true,
+    render: (p) => <span className="font-semibold">{fmt(p.current_month_qty)}</span> },
+  // 채널별 3개월대비 5개
+  { key: "prev_3month_pct_sikbom", label: "식봄", group: "3개월대비", width: "w-14", align: "right", sortable: true,
+    render: (p) => renderPctCell(p.prev_3month_pct_sikbom) },
+  { key: "prev_3month_pct_sinsunhang", label: "신선행", group: "3개월대비", width: "w-14", align: "right", sortable: true,
+    render: (p) => renderPctCell(p.prev_3month_pct_sinsunhang) },
+  { key: "prev_3month_pct_oniljang", label: "온일장", group: "3개월대비", width: "w-14", align: "right", sortable: true,
+    render: (p) => renderPctCell(p.prev_3month_pct_oniljang) },
+  { key: "prev_3month_pct_baemin", label: "배민", group: "3개월대비", width: "w-14", align: "right", sortable: true,
+    render: (p) => renderPctCell(p.prev_3month_pct_baemin) },
+  { key: "prev_3month_pct_total", label: "전체", group: "3개월대비", width: "w-14", align: "right", sortable: true,
+    render: (p) => renderPctCell(p.prev_3month_pct_total) },
+];
+
+function renderPctCell(s: string | null) {
+  if (!s) return <span className="text-gray-300">-</span>;
+  const isUp = s.includes("▲") || s.startsWith("+");
+  const isDown = s.includes("▼") || s.startsWith("-");
+  return <span className={`text-[10px] ${isUp ? "text-red-600" : isDown ? "text-blue-600" : "text-gray-700"}`}>{s}</span>;
+}
+
+// ── Column pixel widths (matching tailwind w-XX classes) ──
+const COL_WIDTHS: Record<string, number> = {
+  _select: 32,
+  product_group: 48,
+  product_code: 64,
+  product_name: 176,
+  spec: 96,
+  unit: 48,
+  prev_purchase_price: 64,
+  purchase_price: 64,
+  change_rate: 56,
+  change_amount: 56,
+  purchase_prices_7d: 64,
+  max_price_7d: 56,
+  today_purchase: 56,
+  prev_selling_price: 64,
+  selling_price: 80,
+  margin_rate: 56,
+  target_margin_rate: 56,
+  target_price: 64,
+  recommended_price: 64,
+  recommend_reason: 48,
+  recommended_margin: 56,
+  sinsunhang_price: 64,
+  sinsunhang_margin: 56,
+  baemin_price: 64,
+  month_1_qty: 48,
+  month_2_qty: 48,
+  month_3_qty: 48,
+  current_month_qty: 48,
+  prev_3month_pct: 64,
+  prev_3month_pct_sikbom: 56,
+  prev_3month_pct_sinsunhang: 56,
+  prev_3month_pct_oniljang: 56,
+  prev_3month_pct_baemin: 56,
+  prev_3month_pct_total: 56,
+};
+
+const COL_GROUPS: { label: string; group: string; color: string }[] = [
+  { label: "기본정보", group: "기본", color: "bg-gray-100" },
+  { label: "매입가", group: "매입가", color: "bg-blue-50" },
+  { label: "판매가", group: "판매가", color: "bg-green-50" },
+  { label: "수익률일괄변경", group: "일괄변경", color: "bg-teal-50" },
+  { label: "Claude 추천", group: "추천", color: "bg-violet-50" },
+  { label: "플랫폼", group: "플랫폼", color: "bg-purple-50" },
+  { label: "매출", group: "매출", color: "bg-amber-50" },
+  { label: "3개월대비", group: "3개월대비", color: "bg-rose-50" },
+];
+
+// 그룹별 합산 너비 (px)
+const COL_GROUP_WIDTHS: Record<string, number> = {};
+for (const g of COL_GROUPS) {
+  COL_GROUP_WIDTHS[g.group] = COLUMNS
+    .filter((c) => c.group === g.group)
+    .reduce((sum, c) => sum + (COL_WIDTHS[c.key] || 60), 0);
+}
+
+// ── Virtual scroll constants ──
+const ROW_HEIGHT = 28;
+const CHART_ROW_HEIGHT = 110;
+const MAX_TABLE_HEIGHT = 700;
+const TABLE_MIN_WIDTH = 1600;
+
+// ── Phase 3: 그룹 매입 동조 비교 차트 ──
+const CHART_COLORS = ["#ef4444", "#3b82f6", "#10b981", "#f59e0b", "#8b5cf6", "#ec4899", "#0891b2", "#84cc16"];
+
+function GroupCompareChart({
+  group,
+  members,
+  onBulkApply,
+  applying,
+}: {
+  group: number;
+  members: Product[];
+  onBulkApply?: (group: number, members: Product[]) => void;
+  applying?: boolean;
+}) {
+  const W = 1500, H = 90, PAD = 8;
+  // 모든 멤버에서 슬롯 날짜 수집 (각 멤버 같은 8일 윈도우 가정)
+  const allDates = new Set<string>();
+  for (const m of members) {
+    for (const h of m.purchase_history_8d || []) allDates.add(h.date);
+  }
+  const dates = [...allDates].sort();
+  if (dates.length < 2) return null;
+
+  // 각 멤버 정규화 — 자기 min~max 를 0~1 스케일로 (트렌드 비교 위주)
+  type Series = { code: string; name: string; unit: string | null; tier: number | null; color: string; points: { x: number; y: number; price: number; date: string }[] };
+  const series: Series[] = members.slice(0, 8).map((m, idx) => {
+    const valid = (m.purchase_history_8d || []).filter((h) => h.price != null && (h.price as number) > 0) as Array<{ date: string; price: number; source: string }>;
+    if (valid.length < 2) return null;
+    const prices = valid.map((h) => h.price);
+    const min = Math.min(...prices), max = Math.max(...prices);
+    const range = max - min || 1;
+    const points = valid.map((h) => {
+      const dateIdx = dates.indexOf(h.date);
+      const x = PAD + (dateIdx / Math.max(dates.length - 1, 1)) * (W - PAD * 2);
+      const y = (H - PAD) - ((h.price - min) / range) * (H - PAD * 2);
+      return { x, y, price: h.price, date: h.date };
+    });
+    return {
+      code: m.product_code,
+      name: m.product_name || m.product_code,
+      unit: m.unit,
+      tier: m.learned_tier ?? null,
+      color: CHART_COLORS[idx % CHART_COLORS.length],
+      points,
+    };
+  }).filter(Boolean) as Series[];
+
+  if (series.length < 2) return null;
+
+  return (
+    <div className="flex items-center gap-3 px-3 py-2 bg-slate-50 border-b border-slate-200" style={{ minWidth: TABLE_MIN_WIDTH }}>
+      <svg width={W} height={H} className="bg-white border border-gray-200 rounded">
+        {/* x축 날짜 */}
+        {dates.map((d, i) => {
+          const x = PAD + (i / Math.max(dates.length - 1, 1)) * (W - PAD * 2);
+          return (
+            <g key={d}>
+              <line x1={x} y1={H - PAD} x2={x} y2={H - PAD + 2} stroke="#cbd5e1" />
+              <text x={x} y={H - PAD + 8} textAnchor="middle" fontSize="8" fill="#64748b">{d.slice(5)}</text>
+            </g>
+          );
+        })}
+        {series.map((s) => (
+          <g key={s.code}>
+            <polyline
+              points={s.points.map((p) => `${p.x},${p.y}`).join(" ")}
+              fill="none"
+              stroke={s.color}
+              strokeWidth="1.5"
+              opacity="0.85"
+            />
+            {s.points.map((p, i) => (
+              <circle key={i} cx={p.x} cy={p.y} r={1.8} fill={s.color}>
+                <title>{`${s.code} ${s.name} (${s.unit ?? "-"}) ${p.date.slice(5)}: ${p.price.toLocaleString()}원`}</title>
+              </circle>
+            ))}
+          </g>
+        ))}
+      </svg>
+      {/* 범례 */}
+      <div className="flex flex-col gap-0.5 text-[10px] flex-shrink-0">
+        {series.map((s) => (
+          <div key={s.code} className="flex items-center gap-1 whitespace-nowrap">
+            <span className="inline-block w-3 h-0.5" style={{ backgroundColor: s.color }} />
+            <span className="font-mono text-gray-500">{s.code}</span>
+            <span className="text-gray-700">{(s.name || "").replace(/^\*+/, "").slice(0, 14)}</span>
+            <span className="text-gray-400">{s.unit ?? ""}{s.tier ? ` T${s.tier}` : ""}</span>
+          </div>
+        ))}
+      </div>
+      {/* Phase 4-a: 그룹 일괄 액션 패널 */}
+      {(() => {
+        const candidates = members.filter((m) => (m.recommended_price ?? 0) > 0 && m.recommended_price !== m.selling_price);
+        if (candidates.length === 0 || !onBulkApply) {
+          return (
+            <div className="flex flex-col items-end gap-1 ml-auto text-[10px] text-gray-400">
+              <span>일괄 적용 대상 없음</span>
+            </div>
+          );
+        }
+        return (
+          <div className="flex flex-col items-end gap-1 ml-auto text-[10px]">
+            <span className="text-gray-500">그룹 일괄 액션</span>
+            <button
+              type="button"
+              disabled={applying}
+              onClick={() => onBulkApply(group, candidates)}
+              className={`px-2 py-1 rounded text-white whitespace-nowrap ${
+                applying ? "bg-gray-300 cursor-wait" : "bg-emerald-600 hover:bg-emerald-700"
+              }`}
+              title={candidates.map((c) => `${c.product_code} ${c.selling_price?.toLocaleString()}→${c.recommended_price?.toLocaleString()}`).join("\n")}
+            >
+              추천가 일괄 적용 ({candidates.length})
+            </button>
+          </div>
+        );
+      })()}
+    </div>
+  );
+}
+
+// ── Virtual Row (for react-window v2) ──
+interface VirtualRowProps {
+  items: DisplayItem[];
+  onPriceSaved: (code: string, price: number) => void;
+  onMarginSaved: (code: string, margin: number) => void;
+  expandedGroups: Set<number>;
+  toggleGroup: (g: number) => void;
+  onGroupBulkApply?: (group: number, members: Product[]) => void;
+  applyingGroup?: number | null;
+  selected?: Set<string>;
+  toggleSelect?: (code: string) => void;
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function VirtualRow(props: any) {
+  const { index, style, items, onPriceSaved, onMarginSaved, expandedGroups, toggleGroup, onGroupBulkApply, applyingGroup, selected, toggleSelect } = props as {
+    index: number;
+    style: React.CSSProperties;
+  } & VirtualRowProps;
+  const item = items[index];
+  if (!item) return null;
+
+  // 차트 행: 그룹 비교 차트 + 일괄 액션 렌더
+  if (isChartRow(item)) {
+    return (
+      <div style={style} className="overflow-hidden">
+        <GroupCompareChart
+          group={item.group}
+          members={item.members}
+          onBulkApply={onGroupBulkApply}
+          applying={applyingGroup === item.group}
+        />
+      </div>
+    );
+  }
+
+  const p = item;
+  const childBg = p._isChild ? "bg-violet-50/40" : (index % 2 === 0 ? "bg-white" : "bg-gray-50/30");
   return (
     <div
-      className={`fixed top-4 right-4 z-50 px-4 py-3 rounded-lg shadow-lg text-sm font-medium transition-all ${
-        type === "success"
-          ? "bg-green-600 text-white"
-          : "bg-red-600 text-white"
+      style={style}
+      className={`flex items-center border-b border-gray-100 hover:bg-blue-50/30 text-xs whitespace-nowrap ${childBg} ${
+        p.change_amount !== 0 && !p._isChild ? "bg-yellow-50/40" : ""
       }`}
     >
-      {message}
-    </div>
-  )
-}
-
-// ──────────────────────────────────────────────
-// Group Sync Modal
-// ──────────────────────────────────────────────
-
-function GroupSyncModal({
-  groupNumber,
-  changedProductCode,
-  groupProducts,
-  onConfirm,
-  onCancel,
-}: {
-  groupNumber: number
-  changedProductCode: string
-  groupProducts: Product[]
-  onConfirm: () => void
-  onCancel: () => void
-}) {
-  const others = groupProducts.filter(
-    (p) => p.product_code !== changedProductCode
-  )
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
-      <div className="bg-white rounded-lg shadow-xl p-6 max-w-md w-full mx-4">
-        <h3 className="text-lg font-bold text-gray-900 mb-2">
-          상품그룹 동조화
-        </h3>
-        <p className="text-sm text-gray-600 mb-4">
-          그룹 {groupNumber}의 다른 상품도 함께 조정하시겠습니까?
-        </p>
-        <div className="mb-4 max-h-32 overflow-y-auto">
-          {others.map((p) => (
-            <div
-              key={p.product_code}
-              className="text-xs text-gray-500 py-0.5"
-            >
-              {p.product_code} - {p.product_name}
-            </div>
-          ))}
+      {COLUMNS.map((col) => (
+        <div
+          key={col.key}
+          className={`flex-shrink-0 px-2 py-1 ${col.align === "right" ? "text-right" : col.align === "center" ? "text-center" : "text-left"}`}
+          style={{ width: COL_WIDTHS[col.key] || 60 }}
+        >
+          {col.render(p, { onPriceSaved, onMarginSaved, expandedGroups, toggleGroup, selected, toggleSelect })}
         </div>
-        <div className="flex gap-2 justify-end">
-          <button
-            onClick={onCancel}
-            className="px-4 py-2 text-sm text-gray-600 border border-gray-300 rounded-md hover:bg-gray-50"
-          >
-            이 상품만
-          </button>
-          <button
-            onClick={onConfirm}
-            className="px-4 py-2 text-sm text-white bg-blue-600 rounded-md hover:bg-blue-700"
-          >
-            그룹 전체 조정
-          </button>
-        </div>
-      </div>
+      ))}
     </div>
-  )
+  );
 }
 
-// ──────────────────────────────────────────────
-// Platform Prices Expandable Row
-// ──────────────────────────────────────────────
-
-// ──────────────────────────────────────────────
-// Analysis Detail Panel
-// ──────────────────────────────────────────────
-
-type AnalysisData = {
-  success: boolean
-  product_code: string
-  product_name: string
-  analysis_date: string | null
-  analysis: {
-    trend: {
-      direction: string | null
-      change_rate: number | null
-      base_price: number | null
-      trimmed_avg: number | null
-    }
-    volatility: {
-      level: string | null
-      cv: number | null
-      data_days: number
-    }
-    week_stats: {
-      max: number | null
-      min: number | null
-      median: number | null
-      weighted_avg: number | null
-      range_rate: number | null
-    }
-    strategy: {
-      policy: string | null
-      total_score: number
-      margin_adjustment: number
-      score_details: { signal: string; detail: string; score: number }[]
-    }
-    sales_trend: Record<string, unknown> | null
-    recent_prices: { price_date: string; purchase_price: number }[]
-  } | null
-  message?: string
-}
-
-function trendBadge(trend: string | null) {
-  if (!trend) return <span className="text-gray-400 text-xs">-</span>
-  const colors: Record<string, string> = {
-    "급등": "bg-red-100 text-red-700",
-    "상승": "bg-orange-100 text-orange-700",
-    "보합": "bg-gray-100 text-gray-700",
-    "하락": "bg-blue-100 text-blue-700",
-    "급락": "bg-purple-100 text-purple-700",
-  }
-  return (
-    <span className={`px-2 py-0.5 rounded text-xs font-medium ${colors[trend] ?? "bg-gray-100 text-gray-600"}`}>
-      {trend}
-    </span>
-  )
-}
-
-function volatilityBadge(level: string | null) {
-  if (!level) return <span className="text-gray-400 text-xs">-</span>
-  const colors: Record<string, string> = {
-    "LOW": "bg-green-100 text-green-700",
-    "MEDIUM": "bg-yellow-100 text-yellow-700",
-    "HIGH": "bg-orange-100 text-orange-700",
-    "VERY_HIGH": "bg-red-100 text-red-700",
-  }
-  const labels: Record<string, string> = {
-    "LOW": "낮음",
-    "MEDIUM": "보통",
-    "HIGH": "높음",
-    "VERY_HIGH": "매우높음",
-  }
-  return (
-    <span className={`px-2 py-0.5 rounded text-xs font-medium ${colors[level] ?? "bg-gray-100 text-gray-600"}`}>
-      {labels[level] ?? level}
-    </span>
-  )
-}
-
-function policyBadge(policy: string | null) {
-  if (!policy) return <span className="text-gray-400 text-xs">-</span>
-  const colors: Record<string, string> = {
-    "마진방어": "bg-red-100 text-red-700",
-    "마진확보": "bg-orange-100 text-orange-700",
-    "현상유지": "bg-gray-100 text-gray-700",
-    "점유율확대": "bg-blue-100 text-blue-700",
-    "공격적인하": "bg-purple-100 text-purple-700",
-    "긴급대응": "bg-red-200 text-red-800",
-  }
-  return (
-    <span className={`px-2 py-0.5 rounded text-xs font-medium ${colors[policy] ?? "bg-gray-100 text-gray-600"}`}>
-      {policy}
-    </span>
-  )
-}
-
-function AnalysisPanel({
-  data,
-  loading,
-  onClose,
-}: {
-  data: AnalysisData | null
-  loading: boolean
-  onClose: () => void
-}) {
-  if (loading) {
-    return (
-      <tr>
-        <td colSpan={12} className="px-4 py-6 bg-blue-50">
-          <div className="flex items-center gap-2 text-sm text-blue-600">
-            <span className="animate-spin inline-block w-4 h-4 border-2 border-blue-500 border-t-transparent rounded-full" />
-            분석 데이터 로딩 중...
-          </div>
-        </td>
-      </tr>
-    )
-  }
-
-  if (!data || !data.analysis) {
-    return (
-      <tr>
-        <td colSpan={12} className="px-4 py-4 bg-gray-50">
-          <div className="flex items-center justify-between">
-            <span className="text-sm text-gray-500">
-              {data?.message ?? "분석 데이터가 없습니다."}
-            </span>
-            <button onClick={onClose} className="text-xs text-gray-400 hover:text-gray-600">닫기</button>
-          </div>
-        </td>
-      </tr>
-    )
-  }
-
-  const a = data.analysis
-  return (
-    <tr>
-      <td colSpan={12} className="px-0 py-0">
-        <div className="bg-blue-50 border-y border-blue-200 px-6 py-4">
-          <div className="flex items-center justify-between mb-3">
-            <h4 className="text-sm font-bold text-blue-900">
-              {data.product_name} 분석 ({data.analysis_date})
-            </h4>
-            <button onClick={onClose} className="text-xs text-blue-500 hover:text-blue-700">닫기</button>
-          </div>
-
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">
-            {/* 동향 */}
-            <div className="bg-white rounded-lg p-3 border border-blue-100">
-              <p className="text-xs text-gray-500 mb-1">7일 동향</p>
-              <div className="flex items-center gap-2">
-                {trendBadge(a.trend.direction)}
-                {a.trend.change_rate != null && (
-                  <span className="text-xs text-gray-500">
-                    ({(a.trend.change_rate * 100).toFixed(1)}%)
-                  </span>
-                )}
-              </div>
-              {a.trend.base_price != null && (
-                <p className="text-xs text-gray-400 mt-1">
-                  기준가 {a.trend.base_price.toLocaleString()}원
-                </p>
-              )}
-            </div>
-
-            {/* 변동성 */}
-            <div className="bg-white rounded-lg p-3 border border-blue-100">
-              <p className="text-xs text-gray-500 mb-1">변동성</p>
-              <div className="flex items-center gap-2">
-                {volatilityBadge(a.volatility.level)}
-                {a.volatility.cv != null && (
-                  <span className="text-xs text-gray-500">
-                    CV {a.volatility.cv.toFixed(1)}%
-                  </span>
-                )}
-              </div>
-              <p className="text-xs text-gray-400 mt-1">
-                데이터 {a.volatility.data_days}일
-              </p>
-            </div>
-
-            {/* 7일 통계 */}
-            <div className="bg-white rounded-lg p-3 border border-blue-100">
-              <p className="text-xs text-gray-500 mb-1">7일 가격 범위</p>
-              <div className="text-xs space-y-0.5">
-                <div className="flex justify-between">
-                  <span className="text-gray-500">최고</span>
-                  <span className="font-medium text-gray-700">
-                    {a.week_stats.max != null ? `${a.week_stats.max.toLocaleString()}원` : "-"}
-                  </span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-gray-500">중앙</span>
-                  <span className="font-medium text-gray-700">
-                    {a.week_stats.median != null ? `${Math.round(a.week_stats.median).toLocaleString()}원` : "-"}
-                  </span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-gray-500">최저</span>
-                  <span className="font-medium text-gray-700">
-                    {a.week_stats.min != null ? `${a.week_stats.min.toLocaleString()}원` : "-"}
-                  </span>
-                </div>
-              </div>
-            </div>
-
-            {/* 전략 정책 */}
-            <div className="bg-white rounded-lg p-3 border border-blue-100">
-              <p className="text-xs text-gray-500 mb-1">전략 정책</p>
-              <div className="flex items-center gap-2">
-                {policyBadge(a.strategy.policy)}
-                <span className="text-xs text-gray-500">
-                  점수 {a.strategy.total_score}
-                </span>
-              </div>
-              {a.strategy.margin_adjustment !== 0 && (
-                <p className="text-xs text-gray-400 mt-1">
-                  수익률 조정 {a.strategy.margin_adjustment > 0 ? "+" : ""}{a.strategy.margin_adjustment}%p
-                </p>
-              )}
-            </div>
-          </div>
-
-          {/* 점수 상세 */}
-          {a.strategy.score_details.length > 0 && (
-            <div className="bg-white rounded-lg p-3 border border-blue-100 mb-3">
-              <p className="text-xs text-gray-500 mb-2">신호 상세</p>
-              <div className="flex flex-wrap gap-2">
-                {a.strategy.score_details.map((d, i) => (
-                  <div
-                    key={i}
-                    className={`text-xs px-2 py-1 rounded ${
-                      d.score > 0 ? "bg-orange-50 text-orange-700" : "bg-green-50 text-green-700"
-                    }`}
-                  >
-                    <span className="font-medium">{d.signal}</span>
-                    <span className="text-gray-500 ml-1">({d.score > 0 ? "+" : ""}{d.score})</span>
-                    <span className="block text-gray-400 text-[10px]">{d.detail}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* 최근 매입가 추이 */}
-          {a.recent_prices.length > 0 && (
-            <div className="bg-white rounded-lg p-3 border border-blue-100">
-              <p className="text-xs text-gray-500 mb-2">최근 매입가 추이</p>
-              <div className="flex items-end gap-1 h-12">
-                {a.recent_prices.map((rp, i) => {
-                  const prices = a.recent_prices.map((r) => r.purchase_price)
-                  const max = Math.max(...prices)
-                  const min = Math.min(...prices)
-                  const range = max - min || 1
-                  const height = ((rp.purchase_price - min) / range) * 100
-                  return (
-                    <div
-                      key={i}
-                      className="flex-1 flex flex-col items-center gap-0.5"
-                      title={`${rp.price_date}: ${rp.purchase_price.toLocaleString()}원`}
-                    >
-                      <div
-                        className="w-full bg-blue-400 rounded-t min-h-[2px]"
-                        style={{ height: `${Math.max(height, 5)}%` }}
-                      />
-                      <span className="text-[8px] text-gray-400">
-                        {rp.price_date.slice(5)}
-                      </span>
-                    </div>
-                  )
-                })}
-              </div>
-            </div>
-          )}
-        </div>
-      </td>
-    </tr>
-  )
-}
-
-// ──────────────────────────────────────────────
-// Platform Prices Expandable Row
-// ──────────────────────────────────────────────
-
-function PlatformPrices({
-  sibomPrice,
-  purchasePrice,
-}: {
-  sibomPrice: number
-  purchasePrice: number | null
-}) {
-  const baeminPrice = sibomPrice
-  const sinsunPrice = calcSinsunPrice(sibomPrice, purchasePrice)
-
-  return (
-    <div className="text-xs text-gray-500 mt-1 space-y-0.5">
-      <div>
-        식봄: <span className="font-medium text-gray-700">{formatPrice(sibomPrice)}</span>
-      </div>
-      <div>
-        배민: <span className="font-medium text-gray-700">{formatPrice(baeminPrice)}</span>
-      </div>
-      <div>
-        신선행: <span className="font-medium text-gray-700">{formatPrice(sinsunPrice)}</span>
-      </div>
-    </div>
-  )
-}
-
-// ──────────────────────────────────────────────
-// Main Page Component
-// ──────────────────────────────────────────────
+// ── Main Page ──
 
 export default function ProductsPage() {
-  const [products, setProducts] = useState<Product[]>([])
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
+  const [products, setProducts] = useState<Product[]>([]);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [uploadInProgress, setUploadInProgress] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [search, setSearch] = useState("");
+  const [debouncedSearch, setDebouncedSearch] = useState("");
+  const [category, setCategory] = useState("전체");
+  const [productType, setProductType] = useState<"전체" | "야채" | "공산">("야채");
+  const [sortKey, setSortKey] = useState<SortKey>("product_code");
+  const [sortDir, setSortDir] = useState<SortDir>("asc");
+  const [onlyChanged, setOnlyChanged] = useState(false);
+  const [onlyKeyItems, setOnlyKeyItems] = useState(false);
+  const [onlyLowMargin, setOnlyLowMargin] = useState(false);
+  const [bulkApplying, setBulkApplying] = useState(false);
+  const [applyingGroup, setApplyingGroup] = useState<number | null>(null);
+  const [expandedGroups, setExpandedGroups] = useState<Set<number>>(new Set());
+  const [onlyInactive, setOnlyInactive] = useState(false);
+  const [fixedOnly, setFixedOnly] = useState(false);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [statusApplying, setStatusApplying] = useState(false);
+  const [fixedApplying, setFixedApplying] = useState(false);
+  type StatusStats = { 야채: { active: number; inactive: number; fixed: number; total: number }; 공산: { active: number; inactive: number; fixed: number; total: number } };
+  const [statusStats, setStatusStats] = useState<StatusStats | null>(null);
+  // 수익률일괄변경 실행 직전 selling_price 스냅샷 (실행취소용, 세션 단위)
+  type BulkSnapshotEntry = { product_code: string; prev_selling_price: number | null };
+  const [bulkSnapshot, setBulkSnapshot] = useState<BulkSnapshotEntry[] | null>(null);
+  const [reverting, setReverting] = useState(false);
 
-  // Edits: map of product_code -> edited selling price
-  const [edits, setEdits] = useState<Map<string, number>>(new Map())
+  const toggleSelect = useCallback((code: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(code)) next.delete(code);
+      else next.add(code);
+      return next;
+    });
+  }, []);
 
-  // Inline editing state
-  const [editingCode, setEditingCode] = useState<string | null>(null)
-  const [editingValue, setEditingValue] = useState("")
-  const editInputRef = useRef<HTMLInputElement>(null)
+  const headerRef = useRef<HTMLDivElement>(null);
+  const bodyRef = useRef<HTMLDivElement>(null);
 
-  // Filters
-  const [category, setCategory] = useState<string>("전체")
-  const [search, setSearch] = useState("")
-  const [lowMarginOnly, setLowMarginOnly] = useState(false)
+  const toggleGroup = useCallback((g: number) => {
+    setExpandedGroups((prev) => {
+      const next = new Set(prev);
+      if (next.has(g)) next.delete(g);
+      else next.add(g);
+      return next;
+    });
+  }, []);
 
-  // Sort
-  const [sortKey, setSortKey] = useState<SortKey>("product_code")
-  const [sortDir, setSortDir] = useState<SortDir>("asc")
-
-  // Toast
-  const [toast, setToast] = useState<{
-    message: string
-    type: "success" | "error"
-  } | null>(null)
-
-  // Platform prices expand
-  const [expandedCodes, setExpandedCodes] = useState<Set<string>>(new Set())
-
-  // Group sync modal
-  const [groupSyncModal, setGroupSyncModal] = useState<{
-    groupNumber: number
-    changedProductCode: string
-    newPrice: number
-  } | null>(null)
-
-  // Saving state
-  const [saving, setSaving] = useState(false)
-
-  // Analysis panel state
-  const [analysisCode, setAnalysisCode] = useState<string | null>(null)
-  const [analysisData, setAnalysisData] = useState<AnalysisData | null>(null)
-  const [analysisLoading, setAnalysisLoading] = useState(false)
-
-  // ──────────────────────────────────────────
-  // Fetch data
-  // ──────────────────────────────────────────
-
+  // 검색 디바운스 (300ms)
   useEffect(() => {
-    async function fetchData() {
+    const t = setTimeout(() => setDebouncedSearch(search), 300);
+    return () => clearTimeout(t);
+  }, [search]);
+
+  // 데이터 로드 (검색은 클라이언트에서)
+  // 전이성 실패(서버 일시 오류) 시 1회 자동 재시도. 그래도 실패하면 이전 데이터 유지 + 에러 표시.
+  const fetchData = useCallback(async () => {
+    setLoading(true);
+    const params = new URLSearchParams();
+    if (category && category !== "전체") params.set("category", category);
+    if (onlyInactive) params.set("onlyInactive", "1");
+    else if (fixedOnly) params.set("fixedOnly", "1");
+    const url = `/api/products?${params}`;
+
+    const tryOnce = async (): Promise<{ ok: true; data: Product[] } | { ok: false; reason: string }> => {
       try {
-        const res = await fetch("/api/products")
-        if (!res.ok) throw new Error(`API 오류: ${res.status}`)
-        const data = await res.json()
-        if (Array.isArray(data)) {
-          setProducts(data)
-        } else {
-          setProducts([])
-          if (data?.error) setError(data.error)
+        const res = await fetch(url, { cache: "no-store" });
+        if (!res.ok) return { ok: false, reason: `HTTP ${res.status}` };
+        const data = await res.json();
+        if (!Array.isArray(data)) {
+          const reason = (data && typeof data === "object" && "error" in data && typeof data.error === "string")
+            ? data.error
+            : "응답이 배열이 아님";
+          return { ok: false, reason };
         }
-      } catch (e) {
-        setError(e instanceof Error ? e.message : "데이터를 불러올 수 없습니다")
-        setProducts([])
-      } finally {
-        setLoading(false)
+        return { ok: true, data: data as Product[] };
+      } catch (err) {
+        return { ok: false, reason: err instanceof Error ? err.message : "네트워크 오류" };
       }
-    }
-    fetchData()
-  }, [])
+    };
 
-  // Focus input when editing starts
-  useEffect(() => {
-    if (editingCode && editInputRef.current) {
-      editInputRef.current.focus()
-      editInputRef.current.select()
-    }
-  }, [editingCode])
-
-  // ──────────────────────────────────────────
-  // Group color mapping (stable across renders)
-  // ──────────────────────────────────────────
-
-  const groupIndexMap = useMemo(() => {
-    const map = new Map<number, number>()
-    let idx = 0
-    for (const p of products) {
-      if (p.product_group != null && !map.has(p.product_group)) {
-        map.set(p.product_group, idx % GROUP_COLORS.length)
-        idx++
-      }
-    }
-    return map
-  }, [products])
-
-  // ──────────────────────────────────────────
-  // Derived: effective selling price (with edits)
-  // ──────────────────────────────────────────
-
-  function getEffectiveSellingPrice(p: Product): number | null {
-    if (edits.has(p.product_code)) return edits.get(p.product_code)!
-    return p.latest_selling_price
-  }
-
-  function getEffectiveMarginRate(p: Product): number | null {
-    const sellingPrice = getEffectiveSellingPrice(p)
-    return calcMarginRate(p.latest_purchase_price, sellingPrice)
-  }
-
-  // ──────────────────────────────────────────
-  // Inline edit handlers
-  // ──────────────────────────────────────────
-
-  function startEdit(p: Product) {
-    const currentPrice = getEffectiveSellingPrice(p)
-    setEditingCode(p.product_code)
-    setEditingValue(currentPrice != null ? String(currentPrice) : "")
-  }
-
-  function commitEdit(productCode: string) {
-    const num = parseInt(editingValue, 10)
-    if (!isNaN(num) && num > 0) {
-      const product = products.find((p) => p.product_code === productCode)
-      // Check if value actually changed from original
-      if (product && num !== product.latest_selling_price) {
-        const newEdits = new Map(edits)
-        newEdits.set(productCode, num)
-        setEdits(newEdits)
-
-        // Check for group sync
-        if (product.product_group != null) {
-          const groupProducts = products.filter(
-            (p) =>
-              p.product_group === product.product_group &&
-              p.product_code !== productCode
-          )
-          if (groupProducts.length > 0) {
-            setGroupSyncModal({
-              groupNumber: product.product_group,
-              changedProductCode: productCode,
-              newPrice: num,
-            })
-          }
-        }
-      } else if (product && num === product.latest_selling_price) {
-        // Reverted to original, remove edit
-        const newEdits = new Map(edits)
-        newEdits.delete(productCode)
-        setEdits(newEdits)
-      }
-    }
-    setEditingCode(null)
-    setEditingValue("")
-  }
-
-  function cancelEdit() {
-    setEditingCode(null)
-    setEditingValue("")
-  }
-
-  // ──────────────────────────────────────────
-  // Analysis panel
-  // ──────────────────────────────────────────
-
-  async function toggleAnalysis(productCode: string) {
-    if (analysisCode === productCode) {
-      setAnalysisCode(null)
-      setAnalysisData(null)
-      return
-    }
-    setAnalysisCode(productCode)
-    setAnalysisLoading(true)
-    setAnalysisData(null)
-    try {
-      const res = await fetch(`/api/products/analysis?product_code=${productCode}`)
-      const data: AnalysisData = await res.json()
-      setAnalysisData(data)
-    } catch {
-      setAnalysisData(null)
-    } finally {
-      setAnalysisLoading(false)
-    }
-  }
-
-  // ──────────────────────────────────────────
-  // Group sync
-  // ──────────────────────────────────────────
-
-  function handleGroupSyncConfirm() {
-    if (!groupSyncModal) return
-    const { groupNumber, changedProductCode, newPrice } = groupSyncModal
-    const changedProduct = products.find(
-      (p) => p.product_code === changedProductCode
-    )
-    if (!changedProduct) {
-      setGroupSyncModal(null)
-      return
+    let result = await tryOnce();
+    if (!result.ok) {
+      // 전이성 오류 흡수 — 1.5초 후 1회 재시도
+      await new Promise((r) => setTimeout(r, 1500));
+      result = await tryOnce();
     }
 
-    const originalPrice = changedProduct.latest_selling_price
-    if (originalPrice == null || originalPrice === 0) {
-      setGroupSyncModal(null)
-      return
-    }
-
-    const ratio = newPrice / originalPrice
-    const groupProducts = products.filter(
-      (p) =>
-        p.product_group === groupNumber &&
-        p.product_code !== changedProductCode
-    )
-
-    const newEdits = new Map(edits)
-    for (const gp of groupProducts) {
-      const gpPrice = getEffectiveSellingPrice(gp)
-      if (gpPrice != null) {
-        const adjusted = Math.ceil((gpPrice * ratio) / 10) * 10
-        newEdits.set(gp.product_code, adjusted)
-      }
-    }
-    setEdits(newEdits)
-    setGroupSyncModal(null)
-  }
-
-  // ──────────────────────────────────────────
-  // Bulk adjust: < 19.5% -> recommended price
-  // ──────────────────────────────────────────
-
-  function handleBulkAdjust() {
-    const newEdits = new Map(edits)
-    let count = 0
-    for (const p of products) {
-      const margin = getEffectiveMarginRate(p)
-      if (margin != null && margin < 19.5) {
-        const recommended = calcRecommendedPrice(
-          p.latest_purchase_price,
-          p.target_margin_rate
-        )
-        if (recommended != null) {
-          const currentEffective = getEffectiveSellingPrice(p)
-          if (currentEffective !== recommended) {
-            newEdits.set(p.product_code, recommended)
-            count++
-          }
-        }
-      }
-    }
-    setEdits(newEdits)
-    if (count > 0) {
-      setToast({ message: `${count}개 상품 판매가를 추천가로 조정했습니다`, type: "success" })
+    if (result.ok) {
+      setProducts(result.data);
+      setLoadError(null);
     } else {
-      setToast({ message: "조정할 상품이 없습니다", type: "success" })
+      console.error("Fetch error:", result.reason);
+      // 이전 products 는 유지(빈 화면 방지). 에러 배너만 띄움.
+      setLoadError(result.reason);
     }
-  }
+    setLoading(false);
+  }, [category, onlyInactive, fixedOnly]);
 
-  // ──────────────────────────────────────────
-  // Confirm (batch save)
-  // ──────────────────────────────────────────
-
-  async function handleConfirm() {
-    if (edits.size === 0) return
-    setSaving(true)
-
-    const today = new Date().toISOString().slice(0, 10)
-    const updates = Array.from(edits.entries()).map(([code, price]) => ({
-      product_code: code,
-      selling_price: price,
-    }))
-
+  // 카운트 (총/판매중/판매중지) — products API 와 별도, 변동 시점만 갱신
+  const fetchStatusStats = useCallback(async () => {
     try {
+      const res = await fetch("/api/products/stats");
+      const data = await res.json();
+      if (data?.야채 && data?.공산) setStatusStats(data);
+    } catch (err) {
+      console.error("Stats fetch error:", err);
+    }
+  }, []);
+
+  useEffect(() => { fetchData(); }, [fetchData]);
+  useEffect(() => { fetchStatusStats(); }, [fetchStatusStats]);
+
+  // uploadManager 구독 — 업로드 진행/종료 감지.
+  // 진행 중이면 노란 배너 표시, 끝나는 순간 자동으로 fetchData 한 번 더 호출해 갱신.
+  useEffect(() => {
+    let prev = uploadManager.isUploading();
+    setUploadInProgress(prev);
+    const unsub = uploadManager.subscribe(() => {
+      const cur = uploadManager.isUploading();
+      setUploadInProgress(cur);
+      if (prev && !cur) {
+        // 업로드가 방금 끝남 → 데이터 갱신
+        fetchData();
+        fetchStatusStats();
+      }
+      prev = cur;
+    });
+    return unsub;
+  }, [fetchData, fetchStatusStats]);
+
+  // 페이지 focus / 탭 visible 시 자동 갱신 (업로드 페이지 다녀온 후 데이터 stale 방지)
+  // 추가: 다른 탭에서 localStorage "products:invalidate" 발화 → 즉시 갱신
+  useEffect(() => {
+    const refresh = () => { fetchData(); fetchStatusStats(); };
+    const onVisible = () => { if (document.visibilityState === "visible") refresh(); };
+    const onStorage = (e: StorageEvent) => { if (e.key === "products:invalidate") refresh(); };
+    window.addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("storage", onStorage);
+    return () => {
+      window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("storage", onStorage);
+    };
+  }, [fetchData, fetchStatusStats]);
+
+  // 판매중지 등록 (또는 해제)
+  const handleSetPlatformStatus = useCallback(async (status: "판매중" | "판매중지") => {
+    if (selected.size === 0) return;
+    const codes = [...selected];
+    const label = status === "판매중지" ? "판매중지 등록" : "판매중 복원";
+    if (!confirm(`${codes.length}개 상품을 ${label} 하시겠습니까?`)) return;
+    setStatusApplying(true);
+    try {
+      const res = await fetch("/api/products/set-platform-status", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ codes, status }),
+      });
+      const data = await res.json();
+      if (!data.success) {
+        alert(`실패: ${data.error || "알 수 없는 오류"}`);
+        return;
+      }
+      setSelected(new Set());
+      await Promise.all([fetchData(), fetchStatusStats()]);
+    } catch (err) {
+      alert(`네트워크 오류: ${err}`);
+    } finally {
+      setStatusApplying(false);
+    }
+  }, [selected, fetchData, fetchStatusStats]);
+
+  // 판매가 수정 콜백
+  const handlePriceSaved = useCallback((code: string, newPrice: number) => {
+    setProducts((prev) =>
+      prev.map((p) => {
+        if (p.product_code !== code) return p;
+        const purchasePrice = p.purchase_price || 0;
+        const newMargin = newPrice > 0 ? 1 - purchasePrice / newPrice : 0;
+        return { ...p, selling_price: newPrice, margin_rate: newMargin };
+      })
+    );
+  }, []);
+
+  // 목표수익률 수정 콜백
+  const handleMarginSaved = useCallback((code: string, newMargin: number) => {
+    setProducts((prev) =>
+      prev.map((p) => {
+        if (p.product_code !== code) return p;
+        const purchasePrice = p.purchase_price || 0;
+        const newTargetPrice = newMargin > 0 && purchasePrice > 0
+          ? Math.ceil(purchasePrice / (1 - newMargin / 100) / 10) * 10
+          : null;
+        return { ...p, target_margin_rate: newMargin, target_price: newTargetPrice };
+      })
+    );
+  }, []);
+
+  // 클라이언트 사이드 필터 + 정렬
+  const filtered = useMemo(() => {
+    let list = products;
+
+    // 야채/공산 필터
+    if (productType !== "전체") {
+      list = list.filter((p) => p.product_type === productType);
+    }
+
+    // 검색 (클라이언트사이드)
+    if (debouncedSearch) {
+      const kw = debouncedSearch.toLowerCase();
+      list = list.filter(
+        (p) =>
+          (p.product_name || "").toLowerCase().includes(kw) ||
+          p.product_code.includes(kw)
+      );
+    }
+
+    if (onlyChanged) list = list.filter((p) => p.change_amount !== 0);
+    if (onlyKeyItems) list = list.filter((p) => p.is_key_item);
+    if (onlyLowMargin) list = list.filter((p) => p.margin_rate > 0 && p.margin_rate < 0.195);
+
+    return list.sort((a, b) => {
+      const av = a[sortKey as keyof Product];
+      const bv = b[sortKey as keyof Product];
+      if (av == null && bv == null) return 0;
+      if (av == null) return 1;
+      if (bv == null) return -1;
+      const cmp = typeof av === "string" ? av.localeCompare(bv as string) : (av as number) - (bv as number);
+      return sortDir === "asc" ? cmp : -cmp;
+    });
+  }, [products, sortKey, sortDir, onlyChanged, onlyKeyItems, onlyLowMargin, debouncedSearch, productType]);
+
+  // 그룹 expand 가 적용된 표시용 행 배열 — 자식은 anchor 바로 아래에 삽입
+  // Phase 2: 자식에 박스→자기 환산 예상가 + 이상치 플래그 주입
+  // Phase 3: anchor 와 자식 사이에 차트 row 삽입 (그룹 매입 동조 시각화)
+  const displayRows = useMemo<DisplayItem[]>(() => {
+    if (expandedGroups.size === 0) return filtered as ProductRow[];
+    const seenGroups = new Set<number>();
+    const out: DisplayItem[] = [];
+    const unitOrder = (u: string | null | undefined): number =>
+      u === "박스" ? 0 : u === "반박스" ? 1 : u === "망" ? 2 : u === "봉" ? 3 : u === "단" ? 4 : u === "통" ? 5 : 6;
+    const today = new Date();
+    for (const p of filtered) {
+      const g = p.product_group;
+      if (g != null && expandedGroups.has(g)) {
+        if (seenGroups.has(g)) continue;
+        seenGroups.add(g);
+        out.push({ ...p, _isAnchor: true });
+
+        // 그룹의 모든 멤버 (자기 포함) + 박스 멤버들 (anchor 후보 풀)
+        const allMembers = products.filter((m) => m.product_group === g);
+
+
+        const boxAnchorPool = allMembers.filter((m) => m.unit === "박스" && (m.purchase_price || 0) > 0);
+
+        const members = allMembers
+          .filter((m) => m.product_code !== p.product_code)
+          .sort((a, b) => {
+            const ua = unitOrder(a.unit), ub = unitOrder(b.unit);
+            if (ua !== ub) return ua - ub;
+            const at = a.learned_tier ?? 9, bt = b.learned_tier ?? 9;
+            if (at !== bt) return at - bt;
+            return (a.product_code || "").localeCompare(b.product_code || "");
+          });
+
+        // 자식별 anchor 선정 helper — 환산 가능한 박스 중에서 토큰/tier/가격 우선
+        const pickAnchorFor = (child: Product): { anchor: Product; conv: { expected: number; note: string } } | null => {
+          if (boxAnchorPool.length === 0) return null;
+          // 1) 환산 가능한 박스만 후보로 좁힘 (pack_meta 없는 박스는 봉/단 환산 불가)
+          const eligible: Array<{ anchor: Product; conv: { expected: number; note: string } }> = [];
+          for (const a of boxAnchorPool) {
+            const conv = computeExpectedFromBox(
+              a.purchase_price as number,
+              a.spec,
+              a.pack_meta,
+              child.unit,
+              child.spec,
+              child.product_name,
+              today,
+            );
+            if (conv) eligible.push({ anchor: a, conv });
+          }
+          if (eligible.length === 0) return null;
+
+          const myTokens = tokenizeName(child.product_name);
+          const myTier = child.learned_tier ?? null;
+          const myRefPrice = child.purchase_price || 0;
+
+          eligible.sort((a, b) => {
+            // 1) 토큰 점수 (가지/상 vs 가지/특)
+            const aScore = gradeMatchScore(myTokens, tokenizeName(a.anchor.product_name));
+            const bScore = gradeMatchScore(myTokens, tokenizeName(b.anchor.product_name));
+            if (aScore !== bScore) return bScore - aScore;
+            // 2) 학습 tier diff
+            if (myTier != null && a.anchor.learned_tier != null && b.anchor.learned_tier != null) {
+              const aD = Math.abs(a.anchor.learned_tier - myTier);
+              const bD = Math.abs(b.anchor.learned_tier - myTier);
+              if (aD !== bD) return aD - bD;
+            }
+            // 3) 가격 유사도 (실제 매입가 vs 환산 예상값 차이)
+            if (myRefPrice > 0) {
+              const aDiff = Math.abs(a.conv.expected - myRefPrice);
+              const bDiff = Math.abs(b.conv.expected - myRefPrice);
+              if (aDiff !== bDiff) return aDiff - bDiff;
+            }
+            // 4) product_code asc
+            return (a.anchor.product_code || "").localeCompare(b.anchor.product_code || "");
+          });
+          return eligible[0];
+        };
+
+        for (const m of members) {
+          const child: ProductRow = { ...m, _isChild: true };
+
+          // 자기 자신은 박스가 아닌 경우만 환산 계산 (anchor 후보 중 환산 가능한 것 우선)
+          if (m.unit !== "박스") {
+            const picked = pickAnchorFor(m);
+            if (picked) {
+              child._expectedFromAnchor = picked.conv.expected;
+              child._conversionNote = picked.conv.note;
+              child._anchorBoxPrice = picked.anchor.purchase_price;
+              child._anchorBoxName = picked.anchor.product_name;
+              const actual = m.purchase_price || 0;
+              if (actual > 0 && picked.conv.expected > 0) {
+                const delta = (actual - picked.conv.expected) / picked.conv.expected;
+                child._conversionDelta = delta;
+                if (Math.abs(delta) > 0.2) {
+                  child._anomaly = `환산 ±${(delta * 100).toFixed(0)}%`;
+                }
+              }
+            }
+          }
+
+          // 등급 역전 감지 (박스 멤버끼리): 학습 tier 가 낮은 등급(=숫자 큼)이 더 비싸면 이상
+          if (m.unit === "박스" && boxAnchorPool.length > 1) {
+            // 자기 가격이 같은 그룹 내 학습 tier 1 박스보다 비싼지 체크
+            const t1Boxes = boxAnchorPool.filter((b) => b.learned_tier === 1 && b.product_code !== m.product_code);
+            const myT = m.learned_tier;
+            if (myT != null && myT > 1 && t1Boxes.length > 0) {
+              const t1Max = Math.max(...t1Boxes.map((b) => b.purchase_price || 0));
+              if ((m.purchase_price || 0) > t1Max && t1Max > 0) {
+                child._anomaly = (child._anomaly ? child._anomaly + " / " : "") + "tier역전";
+              }
+            }
+          }
+
+          out.push(child);
+        }
+      } else {
+        out.push(p as ProductRow);
+      }
+    }
+    return out;
+  }, [filtered, products, expandedGroups]);
+
+  const priceDate = products.length > 0 ? products[0].price_date : "";
+
+  // List 전체 높이 계산 — chart row 110px, 일반 28px
+  const totalListHeight = useMemo(() => {
+    let h = 0;
+    for (const r of displayRows) h += isChartRow(r) ? CHART_ROW_HEIGHT : ROW_HEIGHT;
+    return h;
+  }, [displayRows]);
+
+  const stats = useMemo(() => {
+    const total = filtered.length;
+    const changed = filtered.filter((p) => p.change_amount !== 0).length;
+    const up = filtered.filter((p) => p.change_amount > 0).length;
+    const down = filtered.filter((p) => p.change_amount < 0).length;
+    const lowMargin = filtered.filter((p) => p.margin_rate > 0 && p.margin_rate < 0.1).length;
+    return { total, changed, up, down, lowMargin };
+  }, [filtered]);
+
+  const handleSort = (key: SortKey) => {
+    if (sortKey === key) setSortDir((d) => d === "asc" ? "desc" : "asc");
+    else { setSortKey(key); setSortDir("asc"); }
+  };
+
+  // 수익률일괄변경 실행 — 체크박스 우선
+  //   selected.size > 0 → 선택된 상품만 (토글 무시)
+  //   selected.size === 0 → 현재 토글 결과 (filtered)
+  const handleBulkApplyTarget = useCallback(async () => {
+    const pool: Product[] = selected.size > 0
+      ? products.filter((p) => selected.has(p.product_code))
+      : filtered;
+
+    // target_price 가 있고 현재 판매가와 다른 상품 + 판매가고정 아닌 것만
+    const candidates = pool.filter(
+      (p) =>
+        !p.price_fixed &&
+        p.target_price != null &&
+        p.target_price > 0 &&
+        p.selling_price !== p.target_price
+    );
+
+    if (candidates.length === 0) {
+      alert("일괄변경 대상이 없습니다. (필터/판매가고정 확인)");
+      return;
+    }
+
+    const sampleLines = candidates
+      .slice(0, 5)
+      .map(
+        (p) =>
+          `  • ${p.product_name} (${p.product_code}) : ${fmt(p.selling_price)} → ${fmt(p.target_price)}`
+      )
+      .join("\n");
+    const more = candidates.length > 5 ? `\n  ... 외 ${candidates.length - 5}개` : "";
+
+    const confirmed = window.confirm(
+      `현재 필터된 ${candidates.length}개 상품의 판매가를 기본수익률 기준 가격으로 즉시 변경합니다.\n\n${sampleLines}${more}\n\n실행 후 "실행 취소" 버튼으로 되돌릴 수 있습니다.`
+    );
+    if (!confirmed) return;
+
+    setBulkApplying(true);
+    try {
+      // 스냅샷 — 실행 직전 selling_price 저장 (취소용)
+      const snapshot: BulkSnapshotEntry[] = candidates.map((p) => ({
+        product_code: p.product_code,
+        prev_selling_price: p.selling_price,
+      }));
+
+      const res = await fetch("/api/products/bulk-apply-target", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          product_codes: candidates.map((p) => p.product_code),
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        alert(`오류: ${data.error || "일괄변경 실패"}`);
+        return;
+      }
+      setBulkSnapshot(snapshot);
+      alert(
+        `완료: ${data.applied}건 적용${data.skipped ? `, ${data.skipped}건 스킵` : ""}\n\n잘못 적용했으면 "실행 취소" 버튼으로 되돌릴 수 있습니다.`
+      );
+      await fetchData();
+    } catch (err) {
+      console.error(err);
+      alert("네트워크 오류가 발생했습니다.");
+    } finally {
+      setBulkApplying(false);
+    }
+  }, [filtered, products, selected, fetchData]);
+
+  // 일괄변경 버튼 라벨용 — 체크박스 우선 (selected.size > 0 면 선택만, else filtered)
+  // 실제 적용 가능한 상품만 카운트 (판매가고정 제외, target 존재, selling != target)
+  const bulkTargetCount = useMemo(() => {
+    const pool: Product[] = selected.size > 0
+      ? products.filter((p) => selected.has(p.product_code))
+      : filtered;
+    let cnt = 0;
+    for (const p of pool) {
+      if (
+        !p.price_fixed &&
+        p.target_price != null &&
+        p.target_price > 0 &&
+        p.selling_price !== p.target_price
+      ) cnt++;
+    }
+    return cnt;
+  }, [filtered, products, selected]);
+
+  // 수익률일괄변경 실행 취소 — 가장 최근 스냅샷으로 복원
+  const handleRevertBulk = useCallback(async () => {
+    if (!bulkSnapshot || bulkSnapshot.length === 0) return;
+    if (!confirm(`수익률일괄변경 실행 직전 상태로 ${bulkSnapshot.length}개 상품의 판매가를 되돌립니다. 진행할까요?`)) return;
+    setReverting(true);
+    try {
+      const res = await fetch("/api/products/bulk-set-selling-prices", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ entries: bulkSnapshot }),
+      });
+      const data = await res.json();
+      if (!data?.success) {
+        alert(`실패: ${data?.error || "복원 실패"}`);
+        return;
+      }
+      setBulkSnapshot(null);
+      await fetchData();
+      alert(`복원 완료: ${data.updated}건`);
+    } catch (err) {
+      alert(`네트워크 오류: ${err}`);
+    } finally {
+      setReverting(false);
+    }
+  }, [bulkSnapshot, fetchData]);
+
+  // 판매가 고정 등록/해제
+  const handleSetPriceFixed = useCallback(async (fixed: boolean) => {
+    if (selected.size === 0) return;
+    const codes = [...selected];
+    const label = fixed ? "판매가 고정" : "판매가 고정 해제";
+    if (!confirm(`${codes.length}개 상품을 ${label} 하시겠습니까?`)) return;
+    setFixedApplying(true);
+    try {
+      const res = await fetch("/api/products/set-price-fixed", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ codes, fixed }),
+      });
+      const data = await res.json();
+      if (!data?.success) {
+        alert(`실패: ${data?.error || "알 수 없는 오류"}`);
+        return;
+      }
+      setSelected(new Set());
+      await Promise.all([fetchData(), fetchStatusStats()]);
+    } catch (err) {
+      alert(`네트워크 오류: ${err}`);
+    } finally {
+      setFixedApplying(false);
+    }
+  }, [selected, fetchData, fetchStatusStats]);
+
+  const categories = useMemo(() => {
+    const cats = new Set(products.map((p) => p.category_name).filter(Boolean));
+    return ["전체", ...Array.from(cats).sort()] as string[];
+  }, [products]);
+
+  // Phase 4-a: 그룹 단위 추천가 일괄 적용
+  const handleGroupBulkApply = useCallback(async (group: number, candidates: Product[]) => {
+    const targets = candidates.filter((c) => (c.recommended_price ?? 0) > 0 && c.recommended_price !== c.selling_price);
+    if (targets.length === 0) {
+      alert("적용 대상이 없습니다.");
+      return;
+    }
+    const sample = targets.slice(0, 5).map((p) => `  • ${p.product_name} (${p.product_code}): ${fmt(p.selling_price)} → ${fmt(p.recommended_price)}`).join("\n");
+    const more = targets.length > 5 ? `\n  ... 외 ${targets.length - 5}개` : "";
+    const ok = window.confirm(`그룹 ${group} 의 ${targets.length}개 상품 판매가를 추천가로 변경합니다.\n\n${sample}${more}\n\n계속하시겠습니까?`);
+    if (!ok) return;
+
+    setApplyingGroup(group);
+    try {
+      const pd = products[0]?.price_date;
+      if (!pd) throw new Error("price_date 없음");
       const res = await fetch("/api/products/batch-update", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ updates, price_date: today }),
-      })
-
-      if (!res.ok) {
-        const errData = await res.json().catch(() => null)
-        throw new Error(errData?.error ?? `서버 오류: ${res.status}`)
+        body: JSON.stringify({
+          updates: targets.map((p) => ({ product_code: p.product_code, selling_price: p.recommended_price! })),
+          price_date: pd,
+        }),
+      });
+      const data = await res.json();
+      if (!data.success) {
+        alert(`적용 실패: ${data.error || "오류"}`);
+        return;
       }
-
-      const result = await res.json()
-      const successCount = result.success_count ?? edits.size
-
-      // Update local state with confirmed prices
+      // 로컬 state 갱신 (재요청 없이)
       setProducts((prev) =>
         prev.map((p) => {
-          if (edits.has(p.product_code)) {
-            const newPrice = edits.get(p.product_code)!
-            return {
-              ...p,
-              latest_selling_price: newPrice,
-              latest_selling_date: today,
-              current_margin_rate: calcMarginRate(
-                p.latest_purchase_price,
-                newPrice
-              ),
-            }
-          }
-          return p
+          const t = targets.find((x) => x.product_code === p.product_code);
+          if (!t) return p;
+          const newPrice = t.recommended_price!;
+          const newMargin = newPrice > 0 && (p.purchase_price || 0) > 0 ? 1 - (p.purchase_price as number) / newPrice : 0;
+          return { ...p, selling_price: newPrice, margin_rate: newMargin };
         })
-      )
-      setEdits(new Map())
-      setToast({
-        message: `${successCount}개 상품 확정 완료`,
-        type: "success",
-      })
+      );
     } catch (e) {
-      setToast({
-        message:
-          e instanceof Error ? e.message : "확정 중 오류가 발생했습니다",
-        type: "error",
-      })
+      alert(`오류: ${(e as Error).message}`);
     } finally {
-      setSaving(false)
+      setApplyingGroup(null);
     }
-  }
-
-  // ──────────────────────────────────────────
-  // Sort
-  // ──────────────────────────────────────────
-
-  const handleSort = useCallback(
-    (key: SortKey) => {
-      if (sortKey === key) {
-        setSortDir((d) => (d === "asc" ? "desc" : "asc"))
-      } else {
-        setSortKey(key)
-        setSortDir("asc")
-      }
-    },
-    [sortKey]
-  )
-
-  // ──────────────────────────────────────────
-  // Filter + sort
-  // ──────────────────────────────────────────
-
-  const filtered = useMemo(() => {
-    let list = products
-
-    if (category !== "전체") {
-      list = list.filter((p) => p.category_name === category)
-    }
-
-    if (search.trim()) {
-      const q = search.trim().toLowerCase()
-      list = list.filter(
-        (p) =>
-          p.product_code.toLowerCase().includes(q) ||
-          p.product_name.toLowerCase().includes(q)
-      )
-    }
-
-    if (lowMarginOnly) {
-      list = list.filter((p) => {
-        const margin = getEffectiveMarginRate(p)
-        return margin != null && margin < 19.5
-      })
-    }
-
-    return list
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [products, category, search, lowMarginOnly, edits])
-
-  const sorted = useMemo(() => {
-    const arr = [...filtered]
-    arr.sort((a, b) => {
-      let av: string | number | boolean | null
-      let bv: string | number | boolean | null
-
-      if (sortKey === "recommended_price") {
-        av = calcRecommendedPrice(a.latest_purchase_price, a.target_margin_rate)
-        bv = calcRecommendedPrice(b.latest_purchase_price, b.target_margin_rate)
-      } else if (sortKey === "current_margin_rate") {
-        av = getEffectiveMarginRate(a)
-        bv = getEffectiveMarginRate(b)
-      } else if (sortKey === "latest_selling_price") {
-        av = getEffectiveSellingPrice(a)
-        bv = getEffectiveSellingPrice(b)
-      } else {
-        av = a[sortKey]
-        bv = b[sortKey]
-      }
-
-      if (av == null && bv == null) return 0
-      if (av == null) return 1
-      if (bv == null) return -1
-      if (typeof av === "string" && typeof bv === "string") {
-        return sortDir === "asc" ? av.localeCompare(bv) : bv.localeCompare(av)
-      }
-      if (typeof av === "number" && typeof bv === "number") {
-        return sortDir === "asc" ? av - bv : bv - av
-      }
-      if (typeof av === "boolean" && typeof bv === "boolean") {
-        return sortDir === "asc"
-          ? Number(av) - Number(bv)
-          : Number(bv) - Number(av)
-      }
-      return 0
-    })
-    return arr
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filtered, sortKey, sortDir, edits])
-
-  // ──────────────────────────────────────────
-  // Row style helpers
-  // ──────────────────────────────────────────
-
-  function rowBgClass(p: Product): string {
-    const margin = getEffectiveMarginRate(p)
-    if (margin != null && margin < 10) return "bg-red-50"
-    if (margin != null && margin < 19.5) return "bg-yellow-50"
-    return ""
-  }
-
-  function recommendedPriceColorClass(
-    currentPrice: number | null,
-    recommendedPrice: number | null
-  ): string {
-    if (currentPrice == null || recommendedPrice == null) return "text-gray-700"
-    const ratio = currentPrice / recommendedPrice
-    if (ratio > 1.05) return "text-blue-600"
-    if (ratio < 0.95) return "text-red-600"
-    return "text-gray-700"
-  }
-
-  // ──────────────────────────────────────────
-  // Expand toggle
-  // ──────────────────────────────────────────
-
-  function toggleExpand(code: string) {
-    setExpandedCodes((prev) => {
-      const next = new Set(prev)
-      if (next.has(code)) next.delete(code)
-      else next.add(code)
-      return next
-    })
-  }
-
-  // ──────────────────────────────────────────
-  // Columns
-  // ──────────────────────────────────────────
-
-  const SortIcon = ({ col }: { col: SortKey }) => {
-    if (sortKey !== col)
-      return <span className="text-gray-300 ml-1">&#8597;</span>
-    return (
-      <span className="ml-1 text-gray-600">
-        {sortDir === "asc" ? "\u25B2" : "\u25BC"}
-      </span>
-    )
-  }
-
-  type ColumnDef = { key: SortKey; label: string; align?: "right" | "left" }
-
-  const columns: ColumnDef[] = [
-    { key: "product_code", label: "상품코드" },
-    { key: "product_name", label: "상품명" },
-    { key: "category_name", label: "대분류" },
-    { key: "product_group", label: "그룹", align: "right" },
-    { key: "latest_purchase_price", label: "최근매입가", align: "right" },
-    { key: "latest_selling_price", label: "판매가", align: "right" },
-    { key: "current_margin_rate", label: "수익률", align: "right" },
-    { key: "target_margin_rate", label: "목표수익률", align: "right" },
-    { key: "recommended_price", label: "추천가", align: "right" },
-    { key: "latest_purchase_date", label: "매입일" },
-    { key: "latest_selling_date", label: "판매일" },
-  ]
-
-  // ──────────────────────────────────────────
-  // Render
-  // ──────────────────────────────────────────
+  }, [products]);
 
   return (
     <div className="min-h-screen bg-gray-50">
-      <header className="bg-white border-b border-gray-200 px-6 py-4 flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl font-bold text-gray-900">전체상품</h1>
-          <p className="text-sm text-gray-500 mt-1">
-            상품 목록 및 수익률 현황 -- 판매가 클릭으로 인라인 수정
-          </p>
+      <main className="max-w-[1800px] mx-auto px-4 py-4">
+        <div className="flex items-center justify-between mb-4">
+          <div>
+            <h1 className="text-xl font-bold text-gray-900">전체상품 (야채용)</h1>
+            <p className="text-xs text-gray-500">
+              {priceDate && `기준일: ${priceDate}`}
+              {statusStats && (() => {
+                const s = productType === "전체"
+                  ? {
+                      total: statusStats.야채.total + statusStats.공산.total,
+                      active: statusStats.야채.active + statusStats.공산.active,
+                      inactive: statusStats.야채.inactive + statusStats.공산.inactive,
+                      fixed: statusStats.야채.fixed + statusStats.공산.fixed,
+                    }
+                  : statusStats[productType];
+                return (
+                  <>
+                    {" | "}
+                    총 {s.total}개 / 판매중 {s.active}개 (판매가고정 {s.fixed}개) / 판매중지 {s.inactive}개
+                  </>
+                );
+              })()}
+            </p>
+          </div>
+          <div className="flex items-center gap-3 text-xs">
+            <span className="px-2 py-1 bg-red-50 text-red-700 rounded">상승 {stats.up}</span>
+            <span className="px-2 py-1 bg-blue-50 text-blue-700 rounded">하락 {stats.down}</span>
+            <span className="px-2 py-1 bg-gray-100 text-gray-600 rounded">변동 {stats.changed}</span>
+            {stats.lowMargin > 0 && <span className="px-2 py-1 bg-orange-50 text-orange-700 rounded">저수익 {stats.lowMargin}</span>}
+          </div>
         </div>
 
-        <div className="flex items-center gap-3">
-          {/* 수익률 일괄조정 버튼 */}
-          <button
-            onClick={handleBulkAdjust}
-            className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-md hover:bg-gray-50 transition-colors"
-          >
-            19.5% 미만 일괄조정
-          </button>
-
-          {/* 확정 버튼 */}
-          <button
-            onClick={handleConfirm}
-            disabled={edits.size === 0 || saving}
-            className={`px-4 py-2 text-sm font-medium rounded-md transition-colors flex items-center gap-2 ${
-              edits.size === 0
-                ? "bg-gray-200 text-gray-400 cursor-not-allowed"
-                : "bg-blue-600 text-white hover:bg-blue-700"
-            }`}
-          >
-            {saving ? "저장 중..." : "변경사항 확정"}
-            {edits.size > 0 && (
-              <span className="bg-white/20 text-white px-2 py-0.5 rounded-full text-xs font-bold">
-                {edits.size}개 변경
-              </span>
-            )}
-          </button>
-        </div>
-      </header>
-
-      <main className="max-w-[1600px] mx-auto px-4 py-6">
         {/* 필터 바 */}
-        <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-4 mb-4 flex flex-wrap items-center gap-4">
-          <div className="flex items-center gap-2">
-            <label
-              htmlFor="category"
-              className="text-sm font-medium text-gray-700"
-            >
-              대분류
-            </label>
-            <select
-              id="category"
-              value={category}
-              onChange={(e) => setCategory(e.target.value)}
-              className="border border-gray-300 rounded-md px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
-            >
-              {CATEGORIES.map((c) => (
-                <option key={c} value={c}>
-                  {c}
-                </option>
-              ))}
-            </select>
+        <div className="flex flex-wrap items-center gap-3 mb-3">
+          <input
+            type="text"
+            placeholder="상품명 또는 코드 검색..."
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            className="px-3 py-1.5 text-sm border border-gray-300 rounded-lg w-56 focus:outline-none focus:ring-1 focus:ring-blue-400"
+          />
+          <select
+            value={category}
+            onChange={(e) => setCategory(e.target.value)}
+            className="px-2 py-1.5 text-sm border border-gray-300 rounded-lg bg-white"
+          >
+            {categories.map((c) => <option key={c} value={c}>{c}</option>)}
+          </select>
+
+          {/* 야채/공산 필터 */}
+          <div className="flex bg-white border border-gray-300 rounded-lg overflow-hidden text-sm">
+            {(["야채", "공산", "전체"] as const).map((t) => (
+              <button
+                key={t}
+                onClick={() => setProductType(t)}
+                className={`px-3 py-1 ${productType === t ? "bg-blue-600 text-white" : "text-gray-600 hover:bg-gray-100"}`}
+              >
+                {t}
+              </button>
+            ))}
           </div>
 
-          <div className="flex items-center gap-2">
-            <label
-              htmlFor="search"
-              className="text-sm font-medium text-gray-700"
-            >
-              검색
-            </label>
-            <input
-              id="search"
-              type="text"
-              placeholder="상품명 또는 상품코드"
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              className="border border-gray-300 rounded-md px-3 py-1.5 text-sm w-56 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
-            />
-          </div>
-
-          <label className="flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
+          <label className="flex items-center gap-1 text-sm text-gray-600 cursor-pointer">
+            <input type="checkbox" checked={onlyChanged} onChange={(e) => setOnlyChanged(e.target.checked)} className="rounded" />
+            변동만
+          </label>
+          <label className="flex items-center gap-1 text-sm text-gray-600 cursor-pointer">
+            <input type="checkbox" checked={onlyKeyItems} onChange={(e) => setOnlyKeyItems(e.target.checked)} className="rounded" />
+            주요품목
+          </label>
+          <label className="flex items-center gap-1 text-sm text-orange-600 cursor-pointer font-medium">
+            <input type="checkbox" checked={onlyLowMargin} onChange={(e) => setOnlyLowMargin(e.target.checked)} className="rounded border-orange-400" />
+            19.5%미만
+          </label>
+          <label className="flex items-center gap-1 text-sm text-gray-600 cursor-pointer">
             <input
               type="checkbox"
-              checked={lowMarginOnly}
-              onChange={(e) => setLowMarginOnly(e.target.checked)}
-              className="rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+              checked={onlyInactive}
+              onChange={(e) => { setOnlyInactive(e.target.checked); if (e.target.checked) setFixedOnly(false); }}
+              className="rounded"
             />
-            19.5% 미만만 표시
+            판매중지건
+          </label>
+          <label className="flex items-center gap-1 text-sm text-gray-600 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={fixedOnly}
+              onChange={(e) => { setFixedOnly(e.target.checked); if (e.target.checked) setOnlyInactive(false); }}
+              className="rounded"
+            />
+            판매가고정건
           </label>
 
-          <span className="ml-auto text-sm text-gray-500">
-            총{" "}
-            <strong className="text-gray-900">
-              {sorted.length.toLocaleString()}
-            </strong>
-            개 상품
-            {edits.size > 0 && (
-              <span className="ml-2 text-blue-600 font-medium">
-                ({edits.size}개 수정됨)
-              </span>
+          {/* 액션 버튼들 — 항상 노출 (선택 0개면 비활성) */}
+          <div className="ml-auto flex items-center gap-2">
+            {selected.size > 0 && (
+              <span className="text-sm text-gray-600">{selected.size}개 선택</span>
             )}
-          </span>
+            <button
+              onClick={() => handleSetPriceFixed(!fixedOnly)}
+              disabled={fixedApplying || selected.size === 0}
+              className={`px-3 py-1.5 text-sm font-medium rounded-lg border ${
+                fixedApplying || selected.size === 0
+                  ? "bg-gray-100 text-gray-400 border-gray-200 cursor-not-allowed"
+                  : "bg-sky-600 text-white border-sky-700 hover:bg-sky-700"
+              }`}
+              title={fixedOnly ? "선택한 상품의 판매가 고정 해제" : "선택한 상품을 판매가 고정 (자동 변경 제외)"}
+            >
+              {fixedOnly ? "고정 해제" : "판매가 고정"}
+            </button>
+            <button
+              onClick={() => handleSetPlatformStatus("판매중지")}
+              disabled={statusApplying || selected.size === 0}
+              className={`px-3 py-1.5 text-sm font-medium rounded-lg border ${
+                statusApplying || selected.size === 0
+                  ? "bg-gray-100 text-gray-400 border-gray-200 cursor-not-allowed"
+                  : "bg-amber-600 text-white border-amber-700 hover:bg-amber-700"
+              }`}
+              title="선택한 상품을 판매중지로 등록 (화면에서 숨김)"
+            >
+              판매중지 등록
+            </button>
+            <button
+              onClick={() => handleSetPlatformStatus("판매중")}
+              disabled={statusApplying || selected.size === 0}
+              className={`px-3 py-1.5 text-sm font-medium rounded-lg border ${
+                statusApplying || selected.size === 0
+                  ? "bg-gray-100 text-gray-400 border-gray-200 cursor-not-allowed"
+                  : "bg-emerald-600 text-white border-emerald-700 hover:bg-emerald-700"
+              }`}
+              title="선택한 상품을 판매중으로 복원"
+            >
+              판매중 복원
+            </button>
+            {selected.size > 0 && (
+              <button
+                onClick={() => setSelected(new Set())}
+                className="px-2 py-1.5 text-xs text-gray-500 hover:text-gray-700"
+              >
+                해제
+              </button>
+            )}
+          </div>
+
+          {/* 수익률일괄변경 실행 + 실행 취소 */}
+          {bulkSnapshot && bulkSnapshot.length > 0 && (
+            <button
+              onClick={handleRevertBulk}
+              disabled={reverting}
+              className="px-3 py-1.5 text-sm font-medium rounded-lg border bg-yellow-500 text-white border-yellow-600 hover:bg-yellow-600 disabled:opacity-50"
+              title="가장 최근 수익률일괄변경 실행을 취소"
+            >
+              {reverting ? "복원 중..." : `실행 취소 (${bulkSnapshot.length})`}
+            </button>
+          )}
+          <button
+            onClick={handleBulkApplyTarget}
+            disabled={bulkApplying || bulkTargetCount === 0}
+            className={`px-3 py-1.5 text-sm font-medium rounded-lg border transition-colors ${
+              bulkApplying || bulkTargetCount === 0
+                ? "bg-gray-100 text-gray-400 border-gray-200 cursor-not-allowed"
+                : "bg-red-600 text-white border-red-700 hover:bg-red-700 active:bg-red-800"
+            }`}
+            title="필터 결과 + 체크박스로 추가 선택한 상품의 판매가를 기본수익률 기준으로 즉시 변경합니다."
+          >
+            {bulkApplying ? "적용 중..." : `수익률일괄변경 실행 (${bulkTargetCount})`}
+          </button>
         </div>
 
-        {/* 에러 */}
-        {error && (
-          <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg mb-4 text-sm">
-            {error}
+        {/* 업로드 처리 중 배너 (에러보다 우선) — 끝나면 자동 갱신 */}
+        {uploadInProgress && !loading && (
+          <div className="mb-3 flex items-center gap-3 rounded-lg border border-amber-200 bg-amber-50 px-4 py-2 text-sm text-amber-800">
+            <svg className="animate-spin h-4 w-4 text-amber-600 shrink-0" viewBox="0 0 24 24" fill="none">
+              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+            </svg>
+            <span>
+              업로드 처리 중 — 자동 갱신 대기
+              {products.length > 0 && <span className="ml-2 text-xs text-gray-600">(직전 데이터 표시 중)</span>}
+            </span>
           </div>
         )}
 
-        {/* 테이블 */}
-        <div className="bg-white rounded-lg shadow-sm border border-gray-200 overflow-hidden">
-          <div className="overflow-x-auto">
-            <div className="max-h-[calc(100vh-280px)] overflow-y-auto">
-              <table className="w-full text-sm">
-                <thead className="bg-gray-50 border-b border-gray-200 sticky top-0 z-10">
-                  <tr>
-                    {/* Group color bar header */}
-                    <th className="w-1 px-0" />
-                    {columns.map((col) => (
-                      <th
-                        key={col.key}
-                        className={`px-4 py-3 font-medium text-gray-600 whitespace-nowrap cursor-pointer select-none hover:bg-gray-100 transition-colors ${
-                          col.align === "right" ? "text-right" : "text-left"
-                        }`}
-                        onClick={() => handleSort(col.key)}
-                      >
-                        {col.label}
-                        <SortIcon col={col.key} />
-                      </th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {loading ? (
-                    <>
-                      {Array.from({ length: 15 }).map((_, i) => (
-                        <tr key={i} className="border-b border-gray-100">
-                          <td className="w-1 px-0" />
-                          {columns.map((col) => (
-                            <td key={col.key} className="px-4 py-3">
-                              <div className="h-4 bg-gray-200 rounded animate-pulse" />
-                            </td>
-                          ))}
-                        </tr>
-                      ))}
-                    </>
-                  ) : sorted.length === 0 ? (
-                    <tr>
-                      <td
-                        colSpan={columns.length + 1}
-                        className="px-4 py-12 text-center text-gray-400"
-                      >
-                        {products.length === 0
-                          ? "데이터가 없습니다"
-                          : "필터 조건에 맞는 상품이 없습니다"}
-                      </td>
-                    </tr>
-                  ) : (
-                    sorted.map((p) => {
-                      const isEdited = edits.has(p.product_code)
-                      const effectivePrice = getEffectiveSellingPrice(p)
-                      const effectiveMargin = getEffectiveMarginRate(p)
-                      const recommendedPrice = calcRecommendedPrice(
-                        p.latest_purchase_price,
-                        p.target_margin_rate
-                      )
-                      const isExpanded = expandedCodes.has(p.product_code)
-                      const isCurrentlyEditing =
-                        editingCode === p.product_code
+        {/* 로드 실패 배너 — 업로드 중이 아닐 때만 (업로드 중 실패는 정상 상황이라 혼란 방지) */}
+        {loadError && !loading && !uploadInProgress && (
+          <div className="mb-3 flex items-center justify-between rounded-lg border border-red-200 bg-red-50 px-4 py-2 text-sm text-red-700">
+            <span>
+              데이터 로드 실패 — <span className="text-xs text-red-600">{loadError}</span>
+              {products.length > 0 && <span className="ml-2 text-xs text-gray-600">(직전 데이터 표시 중)</span>}
+            </span>
+            <button
+              onClick={() => fetchData()}
+              className="text-xs px-2 py-1 rounded border border-red-300 bg-white hover:bg-red-100"
+            >
+              다시 시도
+            </button>
+          </div>
+        )}
 
-                      const isAnalysisOpen = analysisCode === p.product_code
-
-                      return [
-                        <tr
-                          key={p.product_code}
-                          className={`border-b border-gray-100 hover:bg-gray-50 transition-colors ${rowBgClass(p)} ${
-                            isEdited ? "border-l-4 border-l-blue-500" : ""
-                          } ${isAnalysisOpen ? "bg-blue-50/50" : ""}`}
+        {/* 테이블 (가상 스크롤) */}
+        {loading ? (
+          <div className="flex items-center justify-center py-20">
+            <div className="animate-spin h-8 w-8 border-2 border-blue-500 border-t-transparent rounded-full" />
+          </div>
+        ) : filtered.length === 0 ? (
+          <div className="border border-gray-200 rounded-lg bg-white shadow-sm px-4 py-12 text-center text-gray-400 text-sm">
+            {uploadInProgress && products.length === 0
+              ? "업로드 처리 중입니다. 완료되면 자동으로 표시됩니다."
+              : loadError && products.length === 0
+              ? "데이터 로드 실패. 위 \"다시 시도\" 버튼을 눌러주세요."
+              : products.length === 0
+              ? "데이터가 없습니다. RAW DATA를 먼저 업로드해주세요."
+              : "검색 결과가 없습니다."}
+          </div>
+        ) : (
+          <div className="border border-gray-200 rounded-lg bg-white shadow-sm overflow-hidden">
+            {/* 고정 헤더 (flex 기반, body와 너비 동기화) */}
+            <div className="overflow-x-auto overflow-y-hidden" ref={headerRef} style={{ scrollbarWidth: "none" }}>
+              <div style={{ minWidth: TABLE_MIN_WIDTH }}>
+                {/* 그룹 헤더 */}
+                <div className="flex border-b border-gray-200">
+                  {COL_GROUPS.map((g) => (
+                    <div
+                      key={g.group}
+                      className={`flex-shrink-0 px-2 py-1 text-center text-[10px] font-medium text-gray-500 ${g.color} border-r border-gray-200 last:border-r-0`}
+                      style={{ width: COL_GROUP_WIDTHS[g.group] }}
+                    >
+                      {g.label}
+                    </div>
+                  ))}
+                </div>
+                {/* 컬럼 헤더 */}
+                <div className="flex border-b border-gray-300 bg-gray-50">
+                  {COLUMNS.map((col) => {
+                    // _select 헤더에 전체선택 체크박스
+                    if (col.key === "_select") {
+                      const visibleCodes = filtered.filter((p) => !p._isChild).map((p) => p.product_code);
+                      const allChecked = visibleCodes.length > 0 && visibleCodes.every((c) => selected.has(c));
+                      const someChecked = visibleCodes.some((c) => selected.has(c));
+                      return (
+                        <div
+                          key={col.key}
+                          className="flex-shrink-0 px-2 py-1.5 text-center"
+                          style={{ width: COL_WIDTHS[col.key] || 32 }}
                         >
-                          {/* Group color bar */}
-                          <td className="w-1 px-0">
-                            {p.product_group != null && (
-                              <div
-                                className={`w-1 h-full min-h-[2.5rem] border-l-4 ${getGroupColorClass(
-                                  p.product_group,
-                                  groupIndexMap
-                                )}`}
-                              />
-                            )}
-                          </td>
-
-                          {/* 상품코드 (클릭 시 분석) */}
-                          <td className="px-4 py-2.5 whitespace-nowrap">
-                            <button
-                              onClick={(e) => {
-                                e.stopPropagation()
-                                toggleAnalysis(p.product_code)
-                              }}
-                              className={`font-mono text-sm hover:underline ${
-                                analysisCode === p.product_code
-                                  ? "text-blue-600 font-bold"
-                                  : "text-gray-700"
-                              }`}
-                              title="클릭하여 분석 보기"
-                            >
-                              {p.product_code}
-                            </button>
-                          </td>
-
-                          {/* 상품명 */}
-                          <td className="px-4 py-2.5 text-gray-900 whitespace-nowrap">
-                            {p.is_key_item && (
-                              <span
-                                className="text-yellow-500 mr-1"
-                                title="주요 경쟁 품목"
-                              >
-                                &#9733;
-                              </span>
-                            )}
-                            {p.product_name}
-                          </td>
-
-                          {/* 대분류 */}
-                          <td className="px-4 py-2.5 text-gray-600 whitespace-nowrap">
-                            {p.category_name ?? "-"}
-                          </td>
-
-                          {/* 그룹 */}
-                          <td className="px-4 py-2.5 text-right text-gray-600">
-                            {p.product_group ?? "-"}
-                          </td>
-
-                          {/* 최근매입가 */}
-                          <td className="px-4 py-2.5 text-right text-gray-700 whitespace-nowrap">
-                            {formatPrice(p.latest_purchase_price)}
-                          </td>
-
-                          {/* 판매가 (인라인 편집) */}
-                          <td
-                            className={`px-4 py-2.5 text-right whitespace-nowrap cursor-pointer ${
-                              isEdited
-                                ? "text-blue-700 font-bold"
-                                : "text-gray-700"
-                            }`}
-                            onClick={() => {
-                              if (!isCurrentlyEditing) startEdit(p)
-                            }}
-                          >
-                            {isCurrentlyEditing ? (
-                              <input
-                                ref={editInputRef}
-                                type="number"
-                                value={editingValue}
-                                onChange={(e) =>
-                                  setEditingValue(e.target.value)
+                          <input
+                            type="checkbox"
+                            ref={(el) => { if (el) el.indeterminate = !allChecked && someChecked; }}
+                            checked={allChecked}
+                            onChange={() => {
+                              setSelected((prev) => {
+                                const next = new Set(prev);
+                                if (allChecked) {
+                                  for (const c of visibleCodes) next.delete(c);
+                                } else {
+                                  for (const c of visibleCodes) next.add(c);
                                 }
-                                onKeyDown={(e) => {
-                                  if (e.key === "Enter")
-                                    commitEdit(p.product_code)
-                                  if (e.key === "Escape") cancelEdit()
-                                }}
-                                onBlur={() => commitEdit(p.product_code)}
-                                className="w-24 px-2 py-1 text-right border-2 border-blue-500 rounded text-sm focus:outline-none"
-                              />
-                            ) : (
-                              <span
-                                className={
-                                  isEdited
-                                    ? "border-b-2 border-blue-500 pb-0.5"
-                                    : ""
-                                }
-                                title="클릭하여 수정"
-                              >
-                                {formatPrice(effectivePrice)}
-                              </span>
-                            )}
-                          </td>
-
-                          {/* 수익률 */}
-                          <td
-                            className={`px-4 py-2.5 text-right font-medium whitespace-nowrap ${
-                              effectiveMargin != null &&
-                              effectiveMargin < 10
-                                ? "text-red-600"
-                                : effectiveMargin != null &&
-                                    effectiveMargin < 19.5
-                                  ? "text-yellow-600"
-                                  : "text-gray-700"
-                            }`}
-                          >
-                            {formatRate(effectiveMargin)}
-                          </td>
-
-                          {/* 목표수익률 */}
-                          <td className="px-4 py-2.5 text-right text-gray-600 whitespace-nowrap">
-                            {formatRate(p.target_margin_rate)}
-                          </td>
-
-                          {/* 추천가 + 플랫폼 펼치기 */}
-                          <td className="px-4 py-2.5 text-right whitespace-nowrap">
-                            <div className="flex flex-col items-end">
-                              <div className="flex items-center gap-1">
-                                <span
-                                  className={`font-medium ${recommendedPriceColorClass(
-                                    effectivePrice,
-                                    recommendedPrice
-                                  )}`}
-                                >
-                                  {formatPrice(recommendedPrice)}
-                                </span>
-                                {recommendedPrice != null && (
-                                  <button
-                                    onClick={(e) => {
-                                      e.stopPropagation()
-                                      toggleExpand(p.product_code)
-                                    }}
-                                    className="text-gray-400 hover:text-gray-600 text-xs ml-1"
-                                    title="플랫폼별 가격 보기"
-                                  >
-                                    {isExpanded ? "\u25B4" : "\u25BE"}
-                                  </button>
-                                )}
-                              </div>
-                              {isExpanded && recommendedPrice != null && (
-                                <PlatformPrices
-                                  sibomPrice={recommendedPrice}
-                                  purchasePrice={p.latest_purchase_price}
-                                />
-                              )}
-                            </div>
-                          </td>
-
-                          {/* 매입일 */}
-                          <td className="px-4 py-2.5 text-gray-500 whitespace-nowrap">
-                            {formatDate(p.latest_purchase_date)}
-                          </td>
-
-                          {/* 판매일 */}
-                          <td className="px-4 py-2.5 text-gray-500 whitespace-nowrap">
-                            {formatDate(p.latest_selling_date)}
-                          </td>
-                        </tr>,
-                        isAnalysisOpen ? (
-                          <AnalysisPanel
-                            key={`${p.product_code}-analysis`}
-                            data={analysisData}
-                            loading={analysisLoading}
-                            onClose={() => {
-                              setAnalysisCode(null)
-                              setAnalysisData(null)
+                                return next;
+                              });
                             }}
+                            className="rounded cursor-pointer"
+                            title={allChecked ? "전체 해제" : "전체 선택"}
                           />
-                        ) : null,
-                      ]
-                    })
-                  )}
-                </tbody>
-              </table>
+                        </div>
+                      );
+                    }
+                    // 월 컬럼 동적 라벨 (priceDate 기반)
+                    let label = col.label;
+                    const sample = products[0];
+                    if (sample) {
+                      if (col.key === "month_1_qty" && sample.month_1_label) label = sample.month_1_label;
+                      else if (col.key === "month_2_qty" && sample.month_2_label) label = sample.month_2_label;
+                      else if (col.key === "month_3_qty" && sample.month_3_label) label = sample.month_3_label;
+                    }
+                    return (
+                      <div
+                        key={col.key}
+                        className={`flex-shrink-0 px-2 py-1.5 text-[10px] font-medium text-gray-600 ${col.align === "right" ? "text-right" : col.align === "center" ? "text-center" : "text-left"} ${col.sortable ? "cursor-pointer hover:bg-gray-100 select-none" : ""}`}
+                        style={{ width: COL_WIDTHS[col.key] || 60 }}
+                        onClick={() => col.sortable && handleSort(col.key as SortKey)}
+                      >
+                        {label}
+                        {sortKey === col.key && <span className="ml-0.5">{sortDir === "asc" ? "▲" : "▼"}</span>}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+            {/* 가상 스크롤 바디 */}
+            <div
+              className="overflow-x-auto"
+              ref={bodyRef}
+              onScroll={(e) => {
+                if (headerRef.current) headerRef.current.scrollLeft = e.currentTarget.scrollLeft;
+              }}
+            >
+              <List
+                defaultHeight={Math.min(totalListHeight, MAX_TABLE_HEIGHT)}
+                rowCount={displayRows.length}
+                rowHeight={(idx: number) => isChartRow(displayRows[idx]) ? CHART_ROW_HEIGHT : ROW_HEIGHT}
+                overscanCount={10}
+                rowComponent={VirtualRow}
+                rowProps={{ items: displayRows, onPriceSaved: handlePriceSaved, onMarginSaved: handleMarginSaved, expandedGroups, toggleGroup, onGroupBulkApply: handleGroupBulkApply, applyingGroup, selected, toggleSelect }}
+                style={{ height: Math.min(totalListHeight, MAX_TABLE_HEIGHT), minWidth: TABLE_MIN_WIDTH }}
+              />
             </div>
           </div>
-        </div>
+        )}
       </main>
-
-      {/* Toast */}
-      {toast && (
-        <Toast
-          message={toast.message}
-          type={toast.type}
-          onClose={() => setToast(null)}
-        />
-      )}
-
-      {/* Group Sync Modal */}
-      {groupSyncModal && (
-        <GroupSyncModal
-          groupNumber={groupSyncModal.groupNumber}
-          changedProductCode={groupSyncModal.changedProductCode}
-          groupProducts={products.filter(
-            (p) => p.product_group === groupSyncModal.groupNumber
-          )}
-          onConfirm={handleGroupSyncConfirm}
-          onCancel={() => setGroupSyncModal(null)}
-        />
-      )}
     </div>
-  )
+  );
 }

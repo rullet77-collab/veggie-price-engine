@@ -1,5 +1,22 @@
 # 야채 판매가 자동책정 시스템 — Claude Code 프로젝트 가이드
 
+@엔진_로직_명세.md
+@엔진_체크리스트.md
+
+## ★ 작업 규칙 (Claude 가 반드시 지킨다) ★
+
+위 `@` 로 `엔진_로직_명세.md`(확정 로직), `엔진_체크리스트.md`(단계별 확인)가 자동 로드된다.
+
+1. **확정 로직 재질문 금지** — `엔진_로직_명세.md` 에 있는 내용(박스소분 89개, 매입가
+   우선순위, basePP_v3, 추천 분기 등)은 형민님이 이미 결정한 것. 다시 묻지 않는다.
+2. **추측 금지** — 불명확하면 ① 엔진_로직_명세.md ② 코드 ③ SQL(execute_sql) 순으로 확인.
+3. **화면 캐시 의존 금지** — 브라우저 화면은 stale 일 수 있다. 분석·검증은 API/SQL 로 한다.
+4. **검증 없는 "완료" 보고 금지** — 변경 후 API/SQL 로 결과를 확인하고 보고한다.
+5. **수정 범위 최소화** — 정상 동작 코드는 명확한 승인 없이 건드리지 않는다.
+   `엔진_체크리스트.md` 의 "변경 금지 항목" 을 임의로 바꾸지 않는다.
+6. **문서-코드 동기화** — 로직을 바꾸면 `엔진_로직_명세.md` 도 같은 커밋에서 갱신한다.
+7. 작업 흐름은 `엔진_체크리스트.md` 의 작업 전 / 수정 중 / 커밋 전 단계를 따른다.
+
 ## 프로젝트 개요
 
 식자재 유통업체의 야채 판매가를 4개 플랫폼(식봄, 온일장, 신선행, 배민)에 자동으로 책정하는 시스템.
@@ -23,44 +40,22 @@
 | 배포 | Vercel |
 | 코드관리 | GitHub |
 
-## 현재 진행 상태 (2026-04-01 기준)
+## 현재 진행 상태 (2026-04-10 기준)
 
-### S00-A: 2025년 데이터 Supabase 적재 — 진행 중
+### 일일 운영 모드 — 가동 중
 
-| 테이블 | 목표 | 현재 | 진행률 | 비고 |
-|--------|------|------|--------|------|
-| products | 838 | 838 | **100%** | 완료 |
-| daily_purchase_prices | 65,535 | 25,349 | **39%** | SQL 배치 실행 필요 |
-| daily_selling_prices | 60,486 | 9,587 | **16%** | SQL 배치 실행 필요 |
+매일 반복되는 워크플로:
+1. `/upload` — 오늘자 로우데이터 업로드 (매입상세 + 매출상세 + ★ 플랫폼시트)
+2. `/products` — 전체상품 대시보드에서 판매가 확인·조정·확정
+3. `/platform` — 플랫폼별 업로드 파일 다운로드
 
-### 즉시 해야 할 작업: 데이터 로딩 완료
-
-`claude-code-migration/` 폴더에 준비된 SQL 배치 파일을 실행하면 됨:
-
-```bash
-# 1. Supabase 연결 문자열 확인 (Supabase Dashboard → Settings → Database → Connection string)
-# 형식: postgresql://postgres.[project-ref]:[password]@aws-0-ap-northeast-2.pooler.supabase.com:6543/postgres
-
-# 2. 매입 데이터 로딩 (188 파일, ON CONFLICT DO NOTHING으로 안전)
-for f in claude-code-migration/p_sql/*.sql; do
-  psql "$DATABASE_URL" -f "$f" 2>/dev/null
-  echo "Done: $f"
-done
-
-# 3. 매출 데이터 로딩 (173 파일, ON CONFLICT DO NOTHING으로 안전)
-for f in claude-code-migration/s_sql/*.sql; do
-  psql "$DATABASE_URL" -f "$f" 2>/dev/null
-  echo "Done: $f"
-done
-
-# 4. 검증
-psql "$DATABASE_URL" -c "SELECT 'products' as t, count(*) FROM products UNION ALL SELECT 'purchases', count(*) FROM daily_purchase_prices UNION ALL SELECT 'sales', count(*) FROM daily_selling_prices;"
-# 기대값: products=838, purchases=65535, sales=60486
-```
-
-> **참고**: SQL 파일들은 모두 ON CONFLICT DO NOTHING 포함이므로 여러 번 실행해도 안전합니다.
-> psql이 없으면 `npm install -g supabase` 후 Supabase MCP를 사용하거나,
-> load_data.sh 스크립트를 참고하세요.
+| 테이블 | 현재 상태 | 비고 |
+|--------|-----------|------|
+| products | 838행 | 상품 마스터 (고정) |
+| daily_purchase_prices | 2026년~ 데이터만 | 일일 업로드로 누적 |
+| daily_selling_prices | 2026년~ 데이터만 | 일일 업로드로 누적 |
+| product_selling_prices | 현재 판매가 | 판매가 조정 시 upsert |
+| learning_sessions / learning_items | 학습 이력 (보존) | 학습 기능 제거됨, 데이터만 보관 |
 
 ## 데이터베이스 스키마 (현재 Supabase에 존재)
 
@@ -85,7 +80,7 @@ CREATE TABLE products (
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- 일별 매입가 (목표: 65,535행)
+-- 일별 매입가 (2026년~ 일일 누적)
 CREATE TABLE daily_purchase_prices (
   id SERIAL PRIMARY KEY,
   product_code VARCHAR(6) NOT NULL REFERENCES products(product_code),
@@ -97,7 +92,7 @@ CREATE TABLE daily_purchase_prices (
   UNIQUE(product_code, price_date, purchase_price)
 );
 
--- 일별 매출가 (목표: 60,486행)
+-- 일별 매출가 (2026년~ 일일 누적)
 CREATE TABLE daily_selling_prices (
   id SERIAL PRIMARY KEY,
   product_code VARCHAR(6) NOT NULL REFERENCES products(product_code),
@@ -110,27 +105,25 @@ CREATE TABLE daily_selling_prices (
 );
 ```
 
-## 스프린트 로드맵
+## 로드맵
 
-### 0단계: 백테스트 (현재)
-- **S00-A**: 2025 데이터 Supabase 적재 ← **현재 여기**
-- **S00-B**: 신호 해석층 백테스트 (추세/변곡점/변동성 계산)
-- **S00-C**: 점수화 + 추천가 백테스트 (실제 판매가와 비교)
-- **S00-D**: 품목군별 파라미터 튜닝
+### ✅ 완료
+- DB 스키마 구축 (products, daily_purchase_prices, daily_selling_prices, product_selling_prices 등)
+- 엑셀 업로드 API (매입상세 + 매출상세 + ★ 플랫폼시트 → DB)
+- 전체상품 대시보드 (/products) — 필터, 인라인 수정, 수익률일괄변경 실행
+- AI 추천 엔진 (3층 구조: 신호 해석 → 전략 선택 → 가격 산출)
+- 2025년 데이터 정리 완료 (Supabase에서 삭제, 2026년~ 데이터만 유지)
 
-### 1단계: 기반 구축
-- S01: Supabase DB 테이블 + Next.js 프로젝트
-- S02: 엑셀 업로드 API (천년경영 → DB)
-- S03: 기존 데이터 마이그레이션
+### 🗑️ 제거됨
+- 학습 시스템 (/learn, /learn/history) — 코드 삭제, DB 테이블(learning_sessions/items)은 보존
 
-### 2단계: 분석 엔진
-- S05~S08: 매입가 변동, 7일 동향, 판매량 추이, 추천 판매가 산출
+### 🔄 현재 — 일일 운영 + 개선
+- 매일 로우데이터 업로드 → 판매가 조정
+- 품목별 패턴이 보이면 aiRecommendation.ts 로직 분기 추가
 
-### 3단계: 웹 대시보드
-- S09~S12: 전체상품 뷰, 인라인 수정, 추천가 UI, 상품그룹 동조화
-
-### 4단계: 플랫폼 업로드
-- S13~S16: 식봄/온일장/배민/신선행 업로드 파일 생성
+### 📋 다음 단계
+- 플랫폼 업로드 파일 자동 생성 (식봄/온일장/배민/신선행)
+- 상품그룹 동조화 UI (대표상품 ↔ 소분상품 연동)
 
 ## 핵심 비즈니스 규칙
 
@@ -163,27 +156,31 @@ CREATE TABLE daily_selling_prices (
 ## 파일 구조
 
 ```
-판매가변경영상/
-├── 판매가_자동화_기획서.md              ← 전체 설계 문서 (필독)
+판매가변경영상/                          ← Git 루트 (main / dev 브랜치)
 ├── CLAUDE.md                           ← 이 파일
-├── claude-code-migration/
-│   ├── CLAUDE.md                       ← 이 파일 사본
-│   ├── p_sql/                          ← 매입 INSERT SQL (188 파일, 350행/파일)
-│   ├── s_sql/                          ← 매출 INSERT SQL (173 파일, 350행/파일)
-│   ├── load_data.sh                    ← 데이터 로딩 bash 스크립트
-│   └── .mcp.json                       ← Supabase MCP 설정 (참고용)
-├── sprints/                            ← 스프린트 계약서/평가서 (향후 생성)
-└── src/                                ← Next.js 소스 (향후 생성)
+├── 판매가_자동화_기획서.md              ← 전체 설계 문서 (필독)
+├── .gitignore
+├── claude-code-migration/              ← 마이그레이션 참고자료 (gitignored)
+│   └── load_data.sh
+└── src/                                ← Next.js 프로젝트
+    ├── package.json
+    ├── next.config.ts
+    ├── src/app/                         ← App Router 페이지
+    │   ├── page.tsx                     ← / (대시보드)
+    │   ├── products/page.tsx            ← /products (전체상품)
+    │   ├── upload/page.tsx              ← /upload (데이터 업로드)
+    │   ├── platform/page.tsx            ← /platform (플랫폼 업로드)
+    │   └── api/                         ← API 라우트
+    └── src/lib/
+        ├── supabase.ts                  ← Supabase 클라이언트
+        └── aiRecommendation.ts          ← AI 추천 엔진
 ```
 
-## 데이터 원본
+## 데이터 현황
 
-2025년 천년경영 엑셀:
-- 매입상세: 65,535건, 497개 고유 상품코드
-- 매출상세: 60,486건, 672개 고유 상품코드
-- 양쪽 모두 있는 코드: 331개
-- 매출만 있는 코드 (소분/재고판매): 341개
-- 기간: 2025-01-02 ~ 2025-12-31
+- **상품 마스터**: 838개 (products 테이블, 고정)
+- **매입/매출 데이터**: 2026년~ 일일 업로드로 누적 (2025년 데이터는 정리 완료)
+- **데이터 소스**: 천년경영 엑셀 (매입상세 + 매출상세) + ★ 플랫폼시트 (구글시트)
 
 ---
 

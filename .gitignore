@@ -68,3 +68,9 @@ _migration_backup/
 
 # ── 외부 참조 프로젝트 (본 프로젝트 소스 아님) ──
 engineering-discipline-main/
+
+# 잡파일
+desktop.ini
+files.zip
+files/
+codex-prompt.md
