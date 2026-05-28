@@ -52,7 +52,7 @@ function formatQty(n: number): string {
 }
 
 function channelLabel(c: string): string {
-  return c === "total" ? "토탈" : c;
+  return c === "total" ? "전체" : c;
 }
 
 export default async function Dashboard() {
