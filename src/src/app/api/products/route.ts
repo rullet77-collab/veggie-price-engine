@@ -140,10 +140,10 @@ export async function GET(request: Request) {
     const sixtyDaysAgo = new Date(priceDate);
     sixtyDaysAgo.setDate(sixtyDaysAgo.getDate() - 60);
 
-    type PurchRow = { product_code: string; price_date: string; purchase_price: number };
+    type PurchRow = { product_code: string; price_date: string; purchase_price: number; quantity: number | null };
     const purchaseHistory60 = await fetchAll<PurchRow>(
       "daily_purchase_prices",
-      "product_code,price_date,purchase_price",
+      "product_code,price_date,purchase_price,quantity",
       (q) => q.gte("price_date", sixtyDaysAgo.toISOString().slice(0, 10)).lte("price_date", priceDate).order("price_date", { ascending: true })
     );
 
@@ -152,36 +152,53 @@ export async function GET(request: Request) {
     const longHistoryMap = new Map<string, { date: string; price: number }[]>();                  // 60일 (Layer 1 장기)
     // 날짜별 코드별 가격 인덱스 (UI 7일 동향 빈 슬롯 그룹 환산용)
     const priceByDateAndCode = new Map<string, Map<string, number>>();
-    // daily 기반 today/prev 자동 도출용 — distinct date 별 마지막 매입가
+    // daily 기반 today/prev 자동 도출용 — distinct date 별 매입가
     const datePriceByCode = new Map<string, Map<string, number>>();
     const sevenDaysAgoStr = sevenDaysAgo.toISOString().slice(0, 10);
     const eightDaysAgoStr = eightDaysAgo.toISOString().slice(0, 10);
 
+    // 같은 (상품, 날짜) 에 매입가 여러 건이면 (매입처 상이 / 재고소분변경 등)
+    // 거래수량(quantity) 이 가장 많은 가격을 그날 대표 매입가로. 동량이면 더 비싼 가격.
+    const repByCodeDate = new Map<string, Map<string, { price: number; qty: number }>>();
     for (const ph of purchaseHistory60) {
-      const entry = { date: ph.price_date, price: ph.purchase_price };
-
-      if (!longHistoryMap.has(ph.product_code)) longHistoryMap.set(ph.product_code, []);
-      longHistoryMap.get(ph.product_code)!.push(entry);
-
-      if (ph.price_date >= eightDaysAgoStr) {
-        if (!shortHistoryMap.has(ph.product_code)) shortHistoryMap.set(ph.product_code, []);
-        shortHistoryMap.get(ph.product_code)!.push(entry);
+      if (!repByCodeDate.has(ph.product_code)) repByCodeDate.set(ph.product_code, new Map());
+      const dm = repByCodeDate.get(ph.product_code)!;
+      const qty = ph.quantity ?? 0;
+      const cur = dm.get(ph.price_date);
+      if (!cur || qty > cur.qty || (qty === cur.qty && ph.purchase_price > cur.price)) {
+        dm.set(ph.price_date, { price: ph.purchase_price, qty });
       }
+    }
 
-      if (ph.price_date >= sevenDaysAgoStr) {
-        if (!purchaseMap.has(ph.product_code)) purchaseMap.set(ph.product_code, { prices: [], todayPrice: null });
-        const u = purchaseMap.get(ph.product_code)!;
-        u.prices.push(ph.purchase_price);
-        if (ph.price_date === priceDate) u.todayPrice = ph.purchase_price;
+    for (const [code, dm] of repByCodeDate.entries()) {
+      const dates = [...dm.keys()].sort();
+      const dateMap = new Map<string, number>();
+      for (const date of dates) {
+        const price = dm.get(date)!.price;
+        const entry = { date, price };
 
-        // 날짜별 코드별 인덱스 (그룹 환산용)
-        if (!priceByDateAndCode.has(ph.price_date)) priceByDateAndCode.set(ph.price_date, new Map());
-        priceByDateAndCode.get(ph.price_date)!.set(ph.product_code, ph.purchase_price);
+        if (!longHistoryMap.has(code)) longHistoryMap.set(code, []);
+        longHistoryMap.get(code)!.push(entry);
+
+        if (date >= eightDaysAgoStr) {
+          if (!shortHistoryMap.has(code)) shortHistoryMap.set(code, []);
+          shortHistoryMap.get(code)!.push(entry);
+        }
+
+        if (date >= sevenDaysAgoStr) {
+          if (!purchaseMap.has(code)) purchaseMap.set(code, { prices: [], todayPrice: null });
+          const u = purchaseMap.get(code)!;
+          u.prices.push(price);
+          if (date === priceDate) u.todayPrice = price;
+
+          // 날짜별 코드별 인덱스 (그룹 환산용)
+          if (!priceByDateAndCode.has(date)) priceByDateAndCode.set(date, new Map());
+          priceByDateAndCode.get(date)!.set(code, price);
+        }
+
+        dateMap.set(date, price);
       }
-
-      // distinct date 별 마지막 매입가 (60일 윈도우 전체)
-      if (!datePriceByCode.has(ph.product_code)) datePriceByCode.set(ph.product_code, new Map());
-      datePriceByCode.get(ph.product_code)!.set(ph.price_date, ph.purchase_price);
+      datePriceByCode.set(code, dateMap);
     }
 
     // daily 기반 today / prev 자동 도출 (가장 최근 distinct date + 그 직전)

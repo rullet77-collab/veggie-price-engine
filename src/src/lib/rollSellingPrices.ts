@@ -150,27 +150,45 @@ export async function rollSellingPrices(supabase: SupabaseClient): Promise<RollR
   };
   const eightDaysAgoStr = addDays(priceDate, -8);
   const sixtyDaysAgoStr = addDays(priceDate, -60);
-  type PurchRow = { product_code: string; price_date: string; purchase_price: number };
+  type PurchRow = { product_code: string; price_date: string; purchase_price: number; quantity: number | null };
   const purchaseHistory60 = await fetchAll<PurchRow>(
     supabase, "daily_purchase_prices",
-    "product_code,price_date,purchase_price",
+    "product_code,price_date,purchase_price,quantity",
     (q) => q.gte("price_date", sixtyDaysAgoStr)
       .lte("price_date", priceDate)
       .order("price_date", { ascending: true })
   );
+  // 같은 (상품, 날짜) 에 매입가 여러 건이면 (매입처 상이 / 재고소분변경 등)
+  // 거래수량(quantity) 이 가장 많은 가격을 그날 대표 매입가로 쓴다. 동량이면 더 비싼 가격.
+  const repByCodeDate = new Map<string, Map<string, { price: number; qty: number }>>();
+  for (const ph of purchaseHistory60) {
+    if (!repByCodeDate.has(ph.product_code)) repByCodeDate.set(ph.product_code, new Map());
+    const dm = repByCodeDate.get(ph.product_code)!;
+    const qty = ph.quantity ?? 0;
+    const cur = dm.get(ph.price_date);
+    if (!cur || qty > cur.qty || (qty === cur.qty && ph.purchase_price > cur.price)) {
+      dm.set(ph.price_date, { price: ph.purchase_price, qty });
+    }
+  }
+  // 대표가로 이력 맵 구성 (날짜 오름차순, 날짜당 1건)
   const shortHistoryMap = new Map<string, { date: string; price: number }[]>();
   const longHistoryMap = new Map<string, { date: string; price: number }[]>();
   const datePriceByCode = new Map<string, Map<string, number>>();
-  for (const ph of purchaseHistory60) {
-    const e = { date: ph.price_date, price: ph.purchase_price };
-    if (!longHistoryMap.has(ph.product_code)) longHistoryMap.set(ph.product_code, []);
-    longHistoryMap.get(ph.product_code)!.push(e);
-    if (ph.price_date >= eightDaysAgoStr) {
-      if (!shortHistoryMap.has(ph.product_code)) shortHistoryMap.set(ph.product_code, []);
-      shortHistoryMap.get(ph.product_code)!.push(e);
+  for (const [code, dm] of repByCodeDate.entries()) {
+    const dateMap = new Map<string, number>();
+    const dates = [...dm.keys()].sort();
+    for (const date of dates) {
+      const price = dm.get(date)!.price;
+      const e = { date, price };
+      if (!longHistoryMap.has(code)) longHistoryMap.set(code, []);
+      longHistoryMap.get(code)!.push(e);
+      if (date >= eightDaysAgoStr) {
+        if (!shortHistoryMap.has(code)) shortHistoryMap.set(code, []);
+        shortHistoryMap.get(code)!.push(e);
+      }
+      dateMap.set(date, price);
     }
-    if (!datePriceByCode.has(ph.product_code)) datePriceByCode.set(ph.product_code, new Map());
-    datePriceByCode.get(ph.product_code)!.set(ph.price_date, ph.purchase_price);
+    datePriceByCode.set(code, dateMap);
   }
   const dailyTodayMap = new Map<string, number>();
   const dailyPrevMap = new Map<string, number>();

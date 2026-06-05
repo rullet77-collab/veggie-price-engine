@@ -38,6 +38,7 @@ type PurchRow = {
   product_code: string;
   price_date: string;
   purchase_price: number;
+  quantity: number | null;
 };
 
 type SalesRow = {
@@ -112,17 +113,28 @@ export async function GET() {
     const lookbackStr = lookback.toISOString().slice(0, 10);
     const purchRows = await fetchAll<PurchRow>(
       "daily_purchase_prices",
-      "product_code,price_date,purchase_price",
+      "product_code,price_date,purchase_price,quantity",
       (q) => q.gte("price_date", lookbackStr).lte("price_date", priceDate)
     );
 
-    // code → date → max(purchase_price)
-    const byCode = new Map<string, Map<string, number>>();
+    // code → date → 대표 매입가
+    // 같은 (상품, 날짜) 여러 건이면 거래수량 최대인 가격. 동량이면 더 비싼 가격.
+    const repByCodeDate = new Map<string, Map<string, { price: number; qty: number }>>();
     for (const r of purchRows) {
       if (!activeSet.has(r.product_code)) continue;
-      if (!byCode.has(r.product_code)) byCode.set(r.product_code, new Map());
-      const m = byCode.get(r.product_code)!;
-      m.set(r.price_date, Math.max(m.get(r.price_date) ?? 0, r.purchase_price));
+      if (!repByCodeDate.has(r.product_code)) repByCodeDate.set(r.product_code, new Map());
+      const dm = repByCodeDate.get(r.product_code)!;
+      const qty = r.quantity ?? 0;
+      const cur = dm.get(r.price_date);
+      if (!cur || qty > cur.qty || (qty === cur.qty && r.purchase_price > cur.price)) {
+        dm.set(r.price_date, { price: r.purchase_price, qty });
+      }
+    }
+    const byCode = new Map<string, Map<string, number>>();
+    for (const [code, dm] of repByCodeDate.entries()) {
+      const m = new Map<string, number>();
+      for (const [date, v] of dm.entries()) m.set(date, v.price);
+      byCode.set(code, m);
     }
 
     const volatileAll: VolatileItem[] = [];
