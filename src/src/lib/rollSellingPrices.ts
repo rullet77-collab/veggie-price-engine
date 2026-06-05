@@ -202,16 +202,28 @@ export async function rollSellingPrices(supabase: SupabaseClient): Promise<RollR
   const salesQtyMap = new Map<string, number>();
   const recentSalesMap = new Map<string, { sale_month: string; quantity: number }[]>();
   const prevSalesMap = new Map<string, { sale_month: string; quantity: number }[]>();
+  // 매출 = 식봄/신선행/온일장/배민 4채널 합산.
+  // monthly_sales_quantity 에는 "전체" source 가 없고 채널별로만 적재되므로
+  // api/products(route.ts) 와 동일하게 (code, month) 별로 4채널을 합산해 쓴다.
+  const CHANNELS = ["식봄", "신선행", "온일장", "배민"];
+  const totalByMonth = new Map<string, Map<string, number>>(); // code → month → 4채널 합
   for (const ms of monthlySales) {
-    if (ms.source && ms.source !== "전체") continue;
-    const e = { sale_month: ms.sale_month, quantity: ms.quantity || 0 };
-    if (ms.sale_month === monthStr) salesQtyMap.set(ms.product_code, ms.quantity);
-    if (ms.sale_month >= recentStartStr) {
-      if (!recentSalesMap.has(ms.product_code)) recentSalesMap.set(ms.product_code, []);
-      recentSalesMap.get(ms.product_code)!.push(e);
-    } else if (ms.sale_month >= prevStartStr && ms.sale_month < prevEndStr) {
-      if (!prevSalesMap.has(ms.product_code)) prevSalesMap.set(ms.product_code, []);
-      prevSalesMap.get(ms.product_code)!.push(e);
+    if (!ms.source || !CHANNELS.includes(ms.source)) continue;
+    if (!totalByMonth.has(ms.product_code)) totalByMonth.set(ms.product_code, new Map());
+    const mm = totalByMonth.get(ms.product_code)!;
+    mm.set(ms.sale_month, (mm.get(ms.sale_month) || 0) + (ms.quantity || 0));
+  }
+  for (const [code, monthMap] of totalByMonth.entries()) {
+    for (const [sm, qty] of monthMap.entries()) {
+      if (sm === monthStr) salesQtyMap.set(code, qty);
+      const e = { sale_month: sm, quantity: qty };
+      if (sm >= recentStartStr) {
+        if (!recentSalesMap.has(code)) recentSalesMap.set(code, []);
+        recentSalesMap.get(code)!.push(e);
+      } else if (sm >= prevStartStr && sm < prevEndStr) {
+        if (!prevSalesMap.has(code)) prevSalesMap.set(code, []);
+        prevSalesMap.get(code)!.push(e);
+      }
     }
   }
   void computePrev3MonthPct; // 사용안함 (api/products와 동일 흐름 보존용)
