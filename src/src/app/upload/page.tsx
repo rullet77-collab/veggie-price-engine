@@ -26,11 +26,19 @@ function statusLabel(s: Entry["status"]): { text: string; color: string; dot: st
 export default function UploadPage() {
   // manager 의 상태를 React 에 동기화 — manager 가 단일 source of truth.
   // (manager 는 React 컴포넌트 밖에 있어서 SPA 네비게이션·재마운트에도 살아있음)
+  // manager 는 localStorage 를 읽으므로 서버 렌더(빈 상태)와 어긋날 수 있다.
+  // → mounted 전에는 항상 빈 상태로 렌더해 hydration mismatch 를 피하고,
+  //   mount 후 effect 에서 manager 데이터를 반영한다.
+  const [mounted, setMounted] = useState(false);
   const [, force] = useState(0);
-  useEffect(() => uploadManager.subscribe(() => force((n) => n + 1)), []);
+  useEffect(() => {
+    setMounted(true);
+    const unsub = uploadManager.subscribe(() => force((n) => n + 1));
+    return unsub;
+  }, []);
 
-  const entries = uploadManager.getEntries();
-  const uploading = uploadManager.isUploading();
+  const entries = mounted ? uploadManager.getEntries() : [];
+  const uploading = mounted ? uploadManager.isUploading() : false;
 
   const [dragOver, setDragOver] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
