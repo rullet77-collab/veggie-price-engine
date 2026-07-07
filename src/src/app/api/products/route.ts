@@ -1,6 +1,7 @@
 import { supabase } from "@/lib/supabase";
 import { calculateAiRecommendation, type AiRecInput, type PackMeta, tokenizeName, gradeMatchScore, getGradeTier, getUnitConversionRatio, ceil10, boxToSubdiv, subdivToBox } from "@/lib/aiRecommendation";
 import { computePrev3MonthPct } from "@/lib/salesStats";
+import { buildRepPriceIndex, buildHistoryMaps, aggregateMonthlyByChannel } from "@/lib/purchaseHistory";
 
 // Next.js 가 GET 응답을 캐시하지 않도록 강제 dynamic
 export const dynamic = "force-dynamic";
@@ -86,9 +87,11 @@ export async function GET(request: Request) {
       price_fixed: boolean | null;
       purchase_source: string | null;
     };
+    // product_code 정렬 — 그룹 멤버 순서 고정 (anchor 동점 선택 결정성 + 페이지네이션 안정)
     const productsData = await fetchAll<ProdRow>(
       "products",
-      "product_code,product_group,is_key_item,target_margin_rate,is_event_item,product_type,price_sensitivity,pack_role,pack_meta,product_name,unit,spec,category_name,learned_tier,platform_status,price_fixed,purchase_source"
+      "product_code,product_group,is_key_item,target_margin_rate,is_event_item,product_type,price_sensitivity,pack_role,pack_meta,product_name,unit,spec,category_name,learned_tier,platform_status,price_fixed,purchase_source",
+      (q) => q.order("product_code", { ascending: true })
     );
     const productMap = new Map<string, ProdRow>();
     for (const p of productsData) productMap.set(p.product_code, p);
@@ -144,71 +147,25 @@ export async function GET(request: Request) {
     const purchaseHistory60 = await fetchAll<PurchRow>(
       "daily_purchase_prices",
       "product_code,price_date,purchase_price,quantity",
-      (q) => q.gte("price_date", sixtyDaysAgo.toISOString().slice(0, 10)).lte("price_date", priceDate).order("price_date", { ascending: true })
+      (q) => q.gte("price_date", sixtyDaysAgo.toISOString().slice(0, 10)).lte("price_date", priceDate)
+        .order("price_date", { ascending: true })
+        .order("id", { ascending: true })   // 동일 날짜 내 순서 고정 (페이지 경계 누락/중복 방지)
     );
 
-    const purchaseMap = new Map<string, { prices: number[]; todayPrice: number | null }>();     // 7일 (UI)
-    const shortHistoryMap = new Map<string, { date: string; price: number }[]>();                 // 8일 (Layer 1)
-    const longHistoryMap = new Map<string, { date: string; price: number }[]>();                  // 60일 (Layer 1 장기)
-    // 날짜별 코드별 가격 인덱스 (UI 7일 동향 빈 슬롯 그룹 환산용)
-    const priceByDateAndCode = new Map<string, Map<string, number>>();
-    // daily 기반 today/prev 자동 도출용 — distinct date 별 매입가
-    const datePriceByCode = new Map<string, Map<string, number>>();
     const sevenDaysAgoStr = sevenDaysAgo.toISOString().slice(0, 10);
     const eightDaysAgoStr = eightDaysAgo.toISOString().slice(0, 10);
 
-    // 같은 (상품, 날짜) 에 매입가 여러 건이면 (매입처 상이 / 재고소분변경 등)
-    // 거래수량(quantity) 이 가장 많은 가격을 그날 대표 매입가로. 동량이면 더 비싼 가격.
-    const repByCodeDate = new Map<string, Map<string, { price: number; qty: number }>>();
-    for (const ph of purchaseHistory60) {
-      if (!repByCodeDate.has(ph.product_code)) repByCodeDate.set(ph.product_code, new Map());
-      const dm = repByCodeDate.get(ph.product_code)!;
-      const qty = ph.quantity ?? 0;
-      const cur = dm.get(ph.price_date);
-      if (!cur || qty > cur.qty || (qty === cur.qty && ph.purchase_price > cur.price)) {
-        dm.set(ph.price_date, { price: ph.purchase_price, qty });
-      }
-    }
-
-    for (const [code, dm] of repByCodeDate.entries()) {
-      const dates = [...dm.keys()].sort();
-      const dateMap = new Map<string, number>();
-      for (const date of dates) {
-        const price = dm.get(date)!.price;
-        const entry = { date, price };
-
-        if (!longHistoryMap.has(code)) longHistoryMap.set(code, []);
-        longHistoryMap.get(code)!.push(entry);
-
-        if (date >= eightDaysAgoStr) {
-          if (!shortHistoryMap.has(code)) shortHistoryMap.set(code, []);
-          shortHistoryMap.get(code)!.push(entry);
-        }
-
-        if (date >= sevenDaysAgoStr) {
-          if (!purchaseMap.has(code)) purchaseMap.set(code, { prices: [], todayPrice: null });
-          const u = purchaseMap.get(code)!;
-          u.prices.push(price);
-          if (date === priceDate) u.todayPrice = price;
-
-          // 날짜별 코드별 인덱스 (그룹 환산용)
-          if (!priceByDateAndCode.has(date)) priceByDateAndCode.set(date, new Map());
-          priceByDateAndCode.get(date)!.set(code, price);
-        }
-
-        dateMap.set(date, price);
-      }
-      datePriceByCode.set(code, dateMap);
-    }
-
-    // daily 기반 today / prev 자동 도출 (가장 최근 distinct date + 그 직전)
-    const dailyTodayMap = new Map<string, number>();
-    const dailyPrevMap = new Map<string, number>();
-    for (const [code, dPrices] of datePriceByCode.entries()) {
-      const sortedDates = [...dPrices.keys()].sort().reverse();  // desc
-      if (sortedDates[0]) dailyTodayMap.set(code, dPrices.get(sortedDates[0])!);
-      if (sortedDates[1]) dailyPrevMap.set(code, dPrices.get(sortedDates[1])!);
-    }
+    // 대표가 산출 + 이력 맵 구성 — 공유 모듈 사용
+    // datePriceByCode = repIndex (daily 기반 today/prev 자동 도출, groupReferenceCode 산출에 사용)
+    const datePriceByCode = buildRepPriceIndex(purchaseHistory60);
+    const {
+      shortHistoryMap,       // 8일 (Layer 1)
+      longHistoryMap,        // 60일 (Layer 1 장기)
+      dailyTodayMap,
+      dailyPrevMap,
+      purchaseMap,           // 7일 (UI)
+      priceByDateAndCode,    // 날짜별 코드별 가격 인덱스 (UI 7일 동향 빈 슬롯 그룹 환산용)
+    } = buildHistoryMaps(datePriceByCode, { priceDate, eightDaysAgoStr, sevenDaysAgoStr });
 
     // 그룹별 reference 상품 산출 — 60일 distinct 매입일 수가 가장 많은 멤버
     // (조림용 같이 매입 띄엄띄엄한 상품의 변동률 추정 anchor 로 사용)
@@ -247,28 +204,8 @@ export async function GET(request: Request) {
       (q) => q.gte("sale_month", prevMonthStart.toISOString().slice(0, 10))
     );
 
-    // 채널별 데이터 인덱싱 — (code, source) → Map<sale_month, qty>
-    type ChannelMap = Map<string, Map<string, Map<string, number>>>;  // code → source → month → qty
-    const channelData: ChannelMap = new Map();
-    const totalData = new Map<string, Map<string, number>>();          // code → month → total qty (4채널 합)
-
-    const CHANNELS = ["식봄", "신선행", "온일장", "배민"] as const;
-
-    for (const ms of monthlySales) {
-      const src = ms.source;
-      if (!src) continue;
-      if (!CHANNELS.includes(src as typeof CHANNELS[number])) continue;
-      const qty = ms.quantity || 0;
-      // 채널별
-      if (!channelData.has(ms.product_code)) channelData.set(ms.product_code, new Map());
-      const sm = channelData.get(ms.product_code)!;
-      if (!sm.has(src)) sm.set(src, new Map());
-      sm.get(src)!.set(ms.sale_month, qty);
-      // total 합산
-      if (!totalData.has(ms.product_code)) totalData.set(ms.product_code, new Map());
-      const tm = totalData.get(ms.product_code)!;
-      tm.set(ms.sale_month, (tm.get(ms.sale_month) || 0) + qty);
-    }
+    // 채널별 데이터 인덱싱 — (code, source) → Map<sale_month, qty> / total = 4채널 합
+    const { totalByMonth: totalData, channelData } = aggregateMonthlyByChannel(monthlySales);
 
     // 기존 total 기반 호환용 (Phase 3 매출 판정 / UI 1/2/3월 양수)
     const salesQtyMap = new Map<string, number>();  // 이번달 total

@@ -14,6 +14,7 @@
 
 import { calculateAiRecommendation, type AiRecInput, type GroupMember } from "./aiRecommendation";
 import { computePrev3MonthPct } from "./salesStats";
+import { buildRepPriceIndex, buildHistoryMaps, aggregateMonthlyByChannel } from "./purchaseHistory";
 
 // 호출처에서 supabase 클라이언트 직접 주입 (createClient 의 generic 차이 회피)
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -115,9 +116,11 @@ export async function rollSellingPrices(supabase: SupabaseClient): Promise<RollR
     price_fixed: boolean | null;
     purchase_source: string | null;
   };
+  // product_code 정렬 — 그룹 멤버 순서 고정 (anchor 동점 선택 결정성 + 페이지네이션 안정)
   const productsData = await fetchAll<ProdRow>(
     supabase, "products",
-    "product_code,product_group,is_key_item,target_margin_rate,is_event_item,product_type,price_sensitivity,pack_role,pack_meta,product_name,unit,spec,learned_tier,price_fixed,purchase_source"
+    "product_code,product_group,is_key_item,target_margin_rate,is_event_item,product_type,price_sensitivity,pack_role,pack_meta,product_name,unit,spec,learned_tier,price_fixed,purchase_source",
+    (q) => q.order("product_code", { ascending: true })
   );
 
   // group_tier_ratios 로드 (B-3) — Map<"groupId-tierA-tierB", ratio>
@@ -157,46 +160,15 @@ export async function rollSellingPrices(supabase: SupabaseClient): Promise<RollR
     (q) => q.gte("price_date", sixtyDaysAgoStr)
       .lte("price_date", priceDate)
       .order("price_date", { ascending: true })
+      .order("id", { ascending: true })   // 동일 날짜 내 순서 고정 (페이지 경계 누락/중복 방지)
   );
-  // 같은 (상품, 날짜) 에 매입가 여러 건이면 (매입처 상이 / 재고소분변경 등)
-  // 거래수량(quantity) 이 가장 많은 가격을 그날 대표 매입가로 쓴다. 동량이면 더 비싼 가격.
-  const repByCodeDate = new Map<string, Map<string, { price: number; qty: number }>>();
-  for (const ph of purchaseHistory60) {
-    if (!repByCodeDate.has(ph.product_code)) repByCodeDate.set(ph.product_code, new Map());
-    const dm = repByCodeDate.get(ph.product_code)!;
-    const qty = ph.quantity ?? 0;
-    const cur = dm.get(ph.price_date);
-    if (!cur || qty > cur.qty || (qty === cur.qty && ph.purchase_price > cur.price)) {
-      dm.set(ph.price_date, { price: ph.purchase_price, qty });
-    }
-  }
-  // 대표가로 이력 맵 구성 (날짜 오름차순, 날짜당 1건)
-  const shortHistoryMap = new Map<string, { date: string; price: number }[]>();
-  const longHistoryMap = new Map<string, { date: string; price: number }[]>();
-  const datePriceByCode = new Map<string, Map<string, number>>();
-  for (const [code, dm] of repByCodeDate.entries()) {
-    const dateMap = new Map<string, number>();
-    const dates = [...dm.keys()].sort();
-    for (const date of dates) {
-      const price = dm.get(date)!.price;
-      const e = { date, price };
-      if (!longHistoryMap.has(code)) longHistoryMap.set(code, []);
-      longHistoryMap.get(code)!.push(e);
-      if (date >= eightDaysAgoStr) {
-        if (!shortHistoryMap.has(code)) shortHistoryMap.set(code, []);
-        shortHistoryMap.get(code)!.push(e);
-      }
-      dateMap.set(date, price);
-    }
-    datePriceByCode.set(code, dateMap);
-  }
-  const dailyTodayMap = new Map<string, number>();
-  const dailyPrevMap = new Map<string, number>();
-  for (const [code, dp] of datePriceByCode.entries()) {
-    const sd = [...dp.keys()].sort().reverse();
-    if (sd[0]) dailyTodayMap.set(code, dp.get(sd[0])!);
-    if (sd[1]) dailyPrevMap.set(code, dp.get(sd[1])!);
-  }
+  // 대표가 산출 + 이력 맵 구성 (날짜 오름차순, 날짜당 1건) — 공유 모듈 사용
+  // purchaseMap/priceByDateAndCode 는 이 파일에서 미사용 (7일 UI 전용)
+  const repIndex = buildRepPriceIndex(purchaseHistory60);
+  const { shortHistoryMap, longHistoryMap, dailyTodayMap, dailyPrevMap } = buildHistoryMaps(
+    repIndex,
+    { priceDate, eightDaysAgoStr, sevenDaysAgoStr: eightDaysAgoStr }
+  );
 
   // 월별 매출 — 월 단위 산술도 KST 안전 (priceDate.slice(0,7) 기준)
   const monthStart = (yyyymm: string, deltaMonths: number): string => {
@@ -223,14 +195,7 @@ export async function rollSellingPrices(supabase: SupabaseClient): Promise<RollR
   // 매출 = 식봄/신선행/온일장/배민 4채널 합산.
   // monthly_sales_quantity 에는 "전체" source 가 없고 채널별로만 적재되므로
   // api/products(route.ts) 와 동일하게 (code, month) 별로 4채널을 합산해 쓴다.
-  const CHANNELS = ["식봄", "신선행", "온일장", "배민"];
-  const totalByMonth = new Map<string, Map<string, number>>(); // code → month → 4채널 합
-  for (const ms of monthlySales) {
-    if (!ms.source || !CHANNELS.includes(ms.source)) continue;
-    if (!totalByMonth.has(ms.product_code)) totalByMonth.set(ms.product_code, new Map());
-    const mm = totalByMonth.get(ms.product_code)!;
-    mm.set(ms.sale_month, (mm.get(ms.sale_month) || 0) + (ms.quantity || 0));
-  }
+  const { totalByMonth } = aggregateMonthlyByChannel(monthlySales);
   for (const [code, monthMap] of totalByMonth.entries()) {
     for (const [sm, qty] of monthMap.entries()) {
       if (sm === monthStr) salesQtyMap.set(code, qty);

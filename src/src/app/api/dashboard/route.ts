@@ -2,6 +2,7 @@
 // 야채 판매중 상품만 대상. 매입 등락에는 박스소분 89개 상품을 sibling 역산값으로 포함.
 import { supabase } from "@/lib/supabase";
 import { boxToSubdiv, subdivToBox, ceil10, type PackMeta } from "@/lib/aiRecommendation";
+import { buildRepPriceIndex, SALES_CHANNELS } from "@/lib/purchaseHistory";
 
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
@@ -68,7 +69,7 @@ type SalesItem = {
   quantity: number;
 };
 
-const CHANNELS = ["식봄", "신선행", "온일장", "배민"] as const;
+const CHANNELS = SALES_CHANNELS;
 type Channel = (typeof CHANNELS)[number];
 
 export async function GET() {
@@ -93,7 +94,7 @@ export async function GET() {
     const yacai = await fetchAll<Yacai>(
       "products",
       "product_code,product_name,spec,platform_status,product_group,pack_role,pack_meta",
-      (q) => q.eq("product_type", "야채")
+      (q) => q.eq("product_type", "야채").order("product_code", { ascending: true })
     );
     const active = yacai.filter((p) => p.platform_status !== "판매중지");
     const activeSet = new Set(active.map((p) => p.product_code));
@@ -115,27 +116,13 @@ export async function GET() {
       "daily_purchase_prices",
       "product_code,price_date,purchase_price,quantity",
       (q) => q.gte("price_date", lookbackStr).lte("price_date", priceDate)
+        .order("price_date", { ascending: true })
+        .order("id", { ascending: true })   // 순서 고정 (페이지 경계 누락/중복 방지)
     );
 
     // code → date → 대표 매입가
     // 같은 (상품, 날짜) 여러 건이면 거래수량 최대인 가격. 동량이면 더 비싼 가격.
-    const repByCodeDate = new Map<string, Map<string, { price: number; qty: number }>>();
-    for (const r of purchRows) {
-      if (!activeSet.has(r.product_code)) continue;
-      if (!repByCodeDate.has(r.product_code)) repByCodeDate.set(r.product_code, new Map());
-      const dm = repByCodeDate.get(r.product_code)!;
-      const qty = r.quantity ?? 0;
-      const cur = dm.get(r.price_date);
-      if (!cur || qty > cur.qty || (qty === cur.qty && r.purchase_price > cur.price)) {
-        dm.set(r.price_date, { price: r.purchase_price, qty });
-      }
-    }
-    const byCode = new Map<string, Map<string, number>>();
-    for (const [code, dm] of repByCodeDate.entries()) {
-      const m = new Map<string, number>();
-      for (const [date, v] of dm.entries()) m.set(date, v.price);
-      byCode.set(code, m);
-    }
+    const byCode = buildRepPriceIndex(purchRows.filter((r) => activeSet.has(r.product_code)));
 
     const volatileAll: VolatileItem[] = [];
     for (const [code, m] of byCode) {
