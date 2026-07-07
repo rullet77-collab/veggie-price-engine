@@ -1,5 +1,5 @@
 // 매입 이력·매출 집계 공유 모듈 — rollSellingPrices / api/products / api/dashboard 3경로 공용
-import { boxToSubdiv, subdivToBox, type PackMeta } from "./aiRecommendation";
+import { boxToSubdiv, subdivToBox, ceil10, type PackMeta } from "./aiRecommendation";
 
 export const SALES_CHANNELS = ["식봄", "신선행", "온일장", "배민"] as const;
 
@@ -171,6 +171,189 @@ export function buildFamilyNormalizedHistory(
   }
 
   return result;
+}
+
+// ────────────────────────────────────────────────
+// 등락률 차용 (중그룹 ↔ 소그룹) — 엔진_로직_명세.md 3.2.1절 / 4단계
+//
+// relation_type='등락률공유' 상품(소그룹)은 박스소분 환산 대상이 아니고
+// 같은 calc_group 의 중그룹 가족(소분관계/수량동일)과 등락률(%)만 주고받는다.
+//
+// 방향 1 — 소그룹이 빌림: 등락률공유 상품이 오늘 실매입 없음
+//   → 같은 calc_group 가족재산출 이력(박스 기준)의 오늘 rate 를 자기 마지막 대표가에 적용.
+//   가족재산출 이력에 오늘이 없으면 차용 불발(기존 동작 유지).
+// 방향 2 — 중그룹이 빌림: 가족 전체 오늘 매입 없음(가족재산출 이력에 오늘 없음)
+//   → 같은 calc_group 등락률공유 상품 중 [90일 매입일수 최다 & 오늘 실매입 있는] 대장의
+//   등락률을 가족 마지막 박스원가에 적용해 전 멤버 재산출(boxToSubdiv). 대장 없으면 불발(기존 동작 유지).
+//
+// rate 는 감쇠·단위계수 없이 순수 %(×1.0). 차용값은 daily_purchase_prices 에 안 씀 (메모리 주입만).
+// ────────────────────────────────────────────────
+export type RateShareMember = {
+  product_code: string;
+  calc_group: number;
+};
+
+export type RateBorrowResult = {
+  code: string;               // 차용받은(재산출된) 상품 코드
+  anchorCode: string;          // 대표(anchor) 코드 — 7일동향 표시용
+  direction: "소그룹차용" | "중그룹차용";
+};
+
+/**
+ * @param rateShareMembers 등락률공유 상품 (calc_group 포함)
+ * @param familyMembersByGroup calc_group → 중그룹 가족 멤버 (pack_role/pack_meta 포함, buildFamilyNormalizedHistory 입력과 동일)
+ * @param familyNormalizedByGroup calc_group → buildFamilyNormalizedHistory 결과 (박스 기준 재산출 이력)
+ * @param repIndex buildRepPriceIndex 결과 (오늘 실매입 여부·90일 매입일수 판단)
+ * @param dailyTodayMap / dailyPrevMap 갱신 대상 (in-place 반영)
+ * @param shortHistoryMap 8일 이력 — 차용 성공 시 오늘 슬롯 추가 (in-place 반영)
+ * @param longHistoryMap 전체 윈도우 이력 — 차용 성공 시 오늘 슬롯 추가 (in-place 반영)
+ * @param priceDate 오늘 날짜
+ * @param eightDaysAgoStr 8일 윈도우 시작일 (shortHistoryMap 필터용)
+ * @param ninetyDaysAgoStr 90일 윈도우 시작일 (대장 선정 매입일수 카운트용 — repIndex 는 이 윈도우를 커버해야 함)
+ */
+export function applyRateBorrowing(
+  rateShareMembers: RateShareMember[],
+  familyMembersByGroup: Map<number, FamilyMember[]>,
+  familyNormalizedByGroup: Map<number, Map<string, { date: string; price: number }[]>>,
+  repIndex: Map<string, Map<string, number>>,
+  dailyTodayMap: Map<string, number>,
+  dailyPrevMap: Map<string, number>,
+  shortHistoryMap: Map<string, { date: string; price: number }[]>,
+  longHistoryMap: Map<string, { date: string; price: number }[]>,
+  priceDate: string,
+  eightDaysAgoStr: string,
+  ninetyDaysAgoStr: string,
+): RateBorrowResult[] {
+  const results: RateBorrowResult[] = [];
+
+  const addSlot = (map: Map<string, { date: string; price: number }[]>, code: string, price: number, minDate?: string) => {
+    const hist = map.get(code) || [];
+    const withoutToday = hist.filter((h) => h.date !== priceDate);
+    withoutToday.push({ date: priceDate, price });
+    map.set(code, minDate ? withoutToday.filter((h) => h.date >= minDate) : withoutToday);
+  };
+
+  const rateShareByGroup = new Map<number, RateShareMember[]>();
+  for (const m of rateShareMembers) {
+    if (!rateShareByGroup.has(m.calc_group)) rateShareByGroup.set(m.calc_group, []);
+    rateShareByGroup.get(m.calc_group)!.push(m);
+  }
+
+  for (const [groupId, rsMembers] of rateShareByGroup) {
+    const familyMembers = familyMembersByGroup.get(groupId);
+    const normalized = familyNormalizedByGroup.get(groupId);
+    if (!familyMembers || familyMembers.length === 0 || !normalized) continue;
+
+    // 가족재산출 이력 오늘/직전 — 가족 멤버 아무나(전원 동일 재산출가) 기준
+    let familyToday: number | null = null;
+    let familyPrev: number | null = null;
+    for (const fm of familyMembers) {
+      const hist = normalized.get(fm.product_code);
+      if (!hist || hist.length === 0) continue;
+      const sorted = [...hist].sort((a, b) => b.date.localeCompare(a.date));
+      if (sorted[0]?.date === priceDate) {
+        familyToday = sorted[0].price;
+        familyPrev = sorted[1]?.price ?? null;
+      }
+      break;
+    }
+
+    // ── 방향 1: 소그룹이 빌림 ──
+    if (familyToday != null && familyPrev != null && familyPrev > 0) {
+      const rate = (familyToday - familyPrev) / familyPrev;
+      const anchorCode = familyMembers[0].product_code;
+      for (const rm of rsMembers) {
+        const myDates = repIndex.get(rm.product_code);
+        const hasToday = myDates?.get(priceDate) != null && myDates.get(priceDate)! > 0;
+        if (hasToday) continue; // 자기 실매입 있는 날 — 재산출·차용 없음
+
+        // 자기 마지막 대표가 — repIndex(등락률공유 상품은 90일 윈도우로 조회) 상 가장 최근 실매입일 기준.
+        // dailyTodayMap(60일 윈도우 기반)은 매입이 뜸한 등락률공유 상품엔 값이 없을 수 있어 미사용.
+        if (!myDates || myDates.size === 0) continue;
+        const sortedMyDates = [...myDates.keys()].sort().reverse();
+        const lastOwn = myDates.get(sortedMyDates[0]);
+        if (lastOwn == null || lastOwn <= 0) continue;
+        const borrowed = ceil10(lastOwn * (1 + rate));
+        dailyPrevMap.set(rm.product_code, lastOwn);
+        dailyTodayMap.set(rm.product_code, borrowed);
+        addSlot(shortHistoryMap, rm.product_code, borrowed, eightDaysAgoStr);
+        addSlot(longHistoryMap, rm.product_code, borrowed);
+        results.push({ code: rm.product_code, anchorCode, direction: "소그룹차용" });
+      }
+      continue;
+    }
+    // 가족재산출 이력에 오늘이 없으면(familyToday == null) → 방향 2 시도.
+
+    // ── 방향 2: 중그룹이 빌림 ── 가족 전체 오늘 매입 없음
+    // 대장 선정: 등락률공유 상품 중 [90일 매입일수 최다 & 오늘 실매입 있음]. 동점이면 product_code 오름차순.
+    let leader: RateShareMember | null = null;
+    let leaderDays = -1;
+    for (const rm of rsMembers) {
+      const myDates = repIndex.get(rm.product_code);
+      const hasToday = myDates?.get(priceDate) != null && myDates.get(priceDate)! > 0;
+      if (!hasToday) continue;
+      let days = 0;
+      for (const d of myDates!.keys()) {
+        if (d >= ninetyDaysAgoStr && d <= priceDate) days++;
+      }
+      if (days > leaderDays || (days === leaderDays && (!leader || rm.product_code.localeCompare(leader.product_code) < 0))) {
+        leader = rm;
+        leaderDays = days;
+      }
+    }
+    if (!leader) continue; // 대장 없으면 불발 — 기존 동작 그대로.
+
+    const leaderDates = repIndex.get(leader.product_code)!;
+    const sortedLeaderDates = [...leaderDates.keys()].sort().reverse();
+    const leaderToday = leaderDates.get(sortedLeaderDates[0]);
+    const leaderPrev = sortedLeaderDates[1] != null ? leaderDates.get(sortedLeaderDates[1]) : null;
+    if (leaderToday == null || leaderPrev == null || leaderPrev <= 0) continue;
+    const rate = (leaderToday - leaderPrev) / leaderPrev;
+
+    // 가족 마지막 박스원가 — normalized 이력(가족 멤버 아무나) 중 가장 최근 값
+    let lastFamilyPrice: number | null = null;
+    for (const fm of familyMembers) {
+      const hist = normalized.get(fm.product_code);
+      if (!hist || hist.length === 0) continue;
+      const sorted = [...hist].sort((a, b) => b.date.localeCompare(a.date));
+      lastFamilyPrice = sorted[0]?.price ?? null;
+      break;
+    }
+    if (lastFamilyPrice == null || lastFamilyPrice <= 0) continue;
+
+    const newBoxCost = ceil10(lastFamilyPrice * (1 + rate));
+
+    // 박스 원가 → 가족 전 멤버 재산출 (buildFamilyNormalizedHistory 와 동일한 boxToSubdiv 흐름)
+    const boxMembers = familyMembers.filter((m) => m.pack_role === "박스" && m.pack_meta);
+    const subdivMembers = familyMembers.filter((m) => m.pack_role === "소분" && m.pack_meta);
+    const anchorBox = boxMembers[0];
+    if (!anchorBox) continue;
+    const dateObj = new Date(priceDate);
+
+    // 재산출 전 마지막 대표가를 dailyPrev 로 (자기 값 없으면 가족 마지막 박스원가 환산 기준)
+    const setPrevThenToday = (code: string, todayPrice: number) => {
+      const lastOwn = dailyTodayMap.get(code);
+      if (lastOwn != null) dailyPrevMap.set(code, lastOwn); else dailyPrevMap.delete(code);
+      dailyTodayMap.set(code, todayPrice);
+    };
+
+    for (const box of boxMembers) {
+      setPrevThenToday(box.product_code, newBoxCost);
+      addSlot(shortHistoryMap, box.product_code, newBoxCost, eightDaysAgoStr);
+      addSlot(longHistoryMap, box.product_code, newBoxCost);
+      results.push({ code: box.product_code, anchorCode: leader.product_code, direction: "중그룹차용" });
+    }
+    for (const sub of subdivMembers) {
+      const price = boxToSubdiv(newBoxCost, anchorBox.pack_meta as PackMeta, sub.pack_meta as PackMeta, dateObj);
+      if (price == null || price <= 0) continue;
+      setPrevThenToday(sub.product_code, price);
+      addSlot(shortHistoryMap, sub.product_code, price, eightDaysAgoStr);
+      addSlot(longHistoryMap, sub.product_code, price);
+      results.push({ code: sub.product_code, anchorCode: leader.product_code, direction: "중그룹차용" });
+    }
+  }
+
+  return results;
 }
 
 export type MonthlySalesRow = {

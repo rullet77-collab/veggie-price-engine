@@ -1019,14 +1019,8 @@ function estimateFromGroupMembers(
   if (members.length === 0) return null;
 
   // 박스소분 89개 매핑(pack_role+pack_meta)이 있으면 Layer 4-A 관계식이 1차.
-  // 매핑 없는 상품만 Layer 4-B(토큰 매칭 단위환산)를 1차로 사용.
+  // Layer 4-B(토큰 매칭 단위환산)는 5단계에서 제거 — 매핑 없는 상품은 Case B(변동률 교차참조)만 사용.
   const hasPackMapping = !!(myPackRole && myPackMeta);
-
-  if (!hasPackMapping) {
-    // ── Layer 4-B: 토큰 점수 매칭 + 단위환산 (xlsx 밖 상품 간 가격 유추)
-    const sameGrade = inferFromSameGradeMember(myName, myUnit, mySpec, members, myReferencePrice, myLearnedTier, myProductGroup, tierRatios, myPurchaseSource);
-    if (sameGrade) return sameGrade;
-  }
 
   // pack_role / 변동률 교차참조도 같은 매입처 풀로 한정 (다른 풀 매입가 직접 환산 방지)
   const sourceSame = members.filter((m) => (m.purchase_source ?? null) === (myPurchaseSource ?? null));

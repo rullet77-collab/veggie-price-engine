@@ -1,7 +1,7 @@
 import { supabase } from "@/lib/supabase";
-import { calculateAiRecommendation, type AiRecInput, type PackMeta, tokenizeName, gradeMatchScore, getGradeTier, getUnitConversionRatio, ceil10, boxToSubdiv, subdivToBox } from "@/lib/aiRecommendation";
+import { calculateAiRecommendation, type AiRecInput, type PackMeta, ceil10, boxToSubdiv, subdivToBox } from "@/lib/aiRecommendation";
 import { computePrev3MonthPct } from "@/lib/salesStats";
-import { buildRepPriceIndex, buildHistoryMaps, aggregateMonthlyByChannel, buildFamilyNormalizedHistory, type FamilyMember } from "@/lib/purchaseHistory";
+import { buildRepPriceIndex, buildHistoryMaps, aggregateMonthlyByChannel, buildFamilyNormalizedHistory, applyRateBorrowing, type FamilyMember, type RateShareMember } from "@/lib/purchaseHistory";
 
 // Next.js 가 GET 응답을 캐시하지 않도록 강제 dynamic
 export const dynamic = "force-dynamic";
@@ -186,6 +186,8 @@ export async function GET(request: Request) {
     // 소분 실매입이 있어도 직접 쓰지 않고, 가족 단위로 박스 원가 → 전 멤버 재산출한 이력으로 교체.
     // familyNormalizedMap: calc_group 대상 상품의 재산출 이력 (60일, 7일동향 슬롯 채우기에도 사용)
     const familyNormalizedMap = new Map<string, { date: string; price: number }[]>();
+    const familyMembersByGroup = new Map<number, FamilyMember[]>();
+    const familyNormalizedByGroup = new Map<number, Map<string, { date: string; price: number }[]>>();
     {
       const calcGroupMembersMap = new Map<number, ProdRow[]>();
       for (const p of productsData) {
@@ -194,10 +196,11 @@ export async function GET(request: Request) {
           calcGroupMembersMap.get(p.calc_group)!.push(p);
         }
       }
-      for (const [, groupProducts] of calcGroupMembersMap) {
+      for (const [groupId, groupProducts] of calcGroupMembersMap) {
         const familyMembers: FamilyMember[] = groupProducts.map((p) => ({
           product_code: p.product_code, pack_role: p.pack_role, pack_meta: p.pack_meta,
         }));
+        familyMembersByGroup.set(groupId, familyMembers);
         const dateSet = new Set<string>();
         for (const m of familyMembers) {
           const dm = datePriceByCode.get(m.product_code);
@@ -206,6 +209,7 @@ export async function GET(request: Request) {
         }
         const familyDates = [...dateSet].sort();
         const normalized = buildFamilyNormalizedHistory(familyMembers, datePriceByCode, familyDates);
+        familyNormalizedByGroup.set(groupId, normalized);
 
         for (const m of familyMembers) {
           const hist = normalized.get(m.product_code) || [];
@@ -217,6 +221,46 @@ export async function GET(request: Request) {
           if (sorted[0]) dailyTodayMap.set(m.product_code, sorted[0].price); else dailyTodayMap.delete(m.product_code);
           if (sorted[1]) dailyPrevMap.set(m.product_code, sorted[1].price); else dailyPrevMap.delete(m.product_code);
         }
+      }
+    }
+
+    // ── 등락률 차용 (중그룹 ↔ 소그룹) — 엔진_로직_명세.md 3.2.1절 / 4단계
+    // relation_type='등락률공유' 상품은 박스소분 환산 대상이 아니고 등락률(%)만 가족과 주고받는다.
+    // rateBorrowedAnchor: 차용으로 채워진 오늘 슬롯의 anchor 코드 (7일동향 표시용)
+    const rateBorrowedAnchor = new Map<string, string>();
+    {
+      const rateShareMembers: RateShareMember[] = productsData
+        .filter((p) => p.calc_group != null && p.relation_type === "등락률공유")
+        .map((p) => ({ product_code: p.product_code, calc_group: p.calc_group! }));
+      if (rateShareMembers.length > 0) {
+        const ninetyDaysAgo = new Date(priceDate);
+        ninetyDaysAgo.setDate(ninetyDaysAgo.getDate() - 90);
+        const ninetyDaysAgoStr = ninetyDaysAgo.toISOString().slice(0, 10);
+        // 대장 선정용 90일 매입일수 — 등락률공유 상품만 좁혀서 조회 (60일 초과분)
+        const rateShareCodes = rateShareMembers.map((m) => m.product_code);
+        const purchaseHistory90Extra = await fetchAll<PurchRow>(
+          "daily_purchase_prices",
+          "product_code,price_date,purchase_price,quantity",
+          (q) => q.in("product_code", rateShareCodes)
+            .gte("price_date", ninetyDaysAgoStr)
+            .lt("price_date", sixtyDaysAgo.toISOString().slice(0, 10))
+        );
+        const repIndex90 = buildRepPriceIndex([...purchaseHistory90Extra, ...purchaseHistory60.filter((r) => rateShareCodes.includes(r.product_code))]);
+
+        const borrowResults = applyRateBorrowing(
+          rateShareMembers,
+          familyMembersByGroup,
+          familyNormalizedByGroup,
+          repIndex90,
+          dailyTodayMap,
+          dailyPrevMap,
+          shortHistoryMap,
+          longHistoryMap,
+          priceDate,
+          eightDaysAgoStr,
+          ninetyDaysAgoStr,
+        );
+        for (const r of borrowResults) rateBorrowedAnchor.set(r.code, r.anchorCode);
       }
     }
 
@@ -343,85 +387,14 @@ export async function GET(request: Request) {
       const maxPrice7d = prices7d.length > 0 ? Math.max(...prices7d) : null;
       const todayPurchase = ph?.todayPrice || null;
 
-      // 7일 동향 슬롯 (8개 날짜) — 실제 매입(actual) + 토큰 매칭 단위환산(inferred) 병합
-      type GradeAnchor = {
-        code: string;
-        name: string;
-        ratio: number;
-        score: number;
-        latestPrice: number;
-        unitMatch: number;
-        keyTierDiff: number;
-        learnedTier: number | null;
-      };
-      const myTokens = tokenizeName(row.product_name);
-      const myKeyTier = getGradeTier(row.product_name);
-      const myLearnedTier = prod?.learned_tier ?? null;
-      const sameGradeAnchors: GradeAnchor[] = [];
-      const myPurchaseSource = prod?.purchase_source ?? null;
-      if (myTokens.length > 0 && prod?.product_group) {
-        const grpMembers = groupMembersMap.get(prod.product_group) || [];
-        for (const m of grpMembers) {
-          if (m.product_code === row.product_code) continue;
-          // 매입처 풀 분리 — 다른 source 멤버는 1차 anchor 제외 (변동률은 2차에서 처리)
-          if ((m.purchase_source ?? null) !== myPurchaseSource) continue;
-          const conv = getUnitConversionRatio(m.unit, m.spec, row.unit, row.spec);
-          if (!conv) continue;
-          const score = gradeMatchScore(myTokens, tokenizeName(m.product_name));
-          if (score === 0) continue;
-          const memDates = (priceByDateAndCode.size > 0)
-            ? slotDates.filter((d) => priceByDateAndCode.get(d)?.get(m.product_code) != null)
-            : [];
-          const latestDate = memDates.length > 0 ? memDates[memDates.length - 1] : null;
-          const latestPrice = latestDate ? (priceByDateAndCode.get(latestDate)?.get(m.product_code) ?? 0) : 0;
-          sameGradeAnchors.push({
-            code: m.product_code,
-            name: m.product_name || "",
-            ratio: conv.ratio,
-            score,
-            latestPrice,
-            unitMatch: m.unit === row.unit ? 0 : 1,
-            keyTierDiff: Math.abs(getGradeTier(m.product_name) - myKeyTier),
-            learnedTier: m.learned_tier ?? null,
-          });
-        }
-      }
-
-      // 정렬: 토큰 점수 ↓ → 같은 unit 우선 → 학습 tier diff ↑ → 키워드 tier diff ↑ → 가격 유사도 ↑ → product_code ↑
-      const myRefPrice = purchasePrice > 0 ? purchasePrice : prevPurchase > 0 ? prevPurchase : 0;
-      sameGradeAnchors.sort((a, b) => {
-        if (a.score !== b.score) return b.score - a.score;
-        if (a.unitMatch !== b.unitMatch) return a.unitMatch - b.unitMatch;
-        // 학습 tier diff (양쪽 다 있을 때 우선)
-        if (myLearnedTier != null && a.learnedTier != null && b.learnedTier != null) {
-          const aLD = Math.abs(a.learnedTier - myLearnedTier);
-          const bLD = Math.abs(b.learnedTier - myLearnedTier);
-          if (aLD !== bLD) return aLD - bLD;
-        }
-        // 키워드 tier diff fallback
-        if (a.keyTierDiff !== b.keyTierDiff) return a.keyTierDiff - b.keyTierDiff;
-        if (myRefPrice > 0 && a.latestPrice > 0 && b.latestPrice > 0) {
-          const aDiff = Math.abs(a.latestPrice / a.ratio - myRefPrice);
-          const bDiff = Math.abs(b.latestPrice / b.ratio - myRefPrice);
-          if (aDiff !== bDiff) return aDiff - bDiff;
-        }
-        if (a.latestPrice > 0 && b.latestPrice <= 0) return -1;
-        if (a.latestPrice <= 0 && b.latestPrice > 0) return 1;
-        return a.code.localeCompare(b.code);
-      });
-
-      // 7일동향 빈 슬롯 보강 — 2단계
-      //   1차: 동일 등급 anchor (score == myTokens.length) → 단위환산
-      //   2차: 그룹 reference 의 (인접 known date → slot date) 변동률을 내 known price 에 적용
-      //
-      // 의도: 다른 등급(1점) anchor 의 매입가를 그대로 가져오지 않음 → basePP 부풀림 방지
+      // 7일 동향 슬롯 (8개 날짜) — 실제 매입(actual) + 박스소분 관계식(inferred) + 그룹 변동률(ref_change) 병합
+      // 토큰매칭 기반 단위환산(inferred)은 5단계에서 제거 — 계산에 안 쓰이는 잘못된 추정값 대신 missing 이 정답.
       type SlotEntry = {
         date: string;
         price: number | null;
         source: "actual" | "inferred" | "ref_change" | "missing";
         anchor: string | null;
       };
-      const exactGradeAnchors = sameGradeAnchors.filter((a) => a.score === myTokens.length);
 
       // 박스소분 89개 매핑 anchor — pack_role/pack_meta 있는 상품은 관계식 우선
       type PackAnchor = { code: string; name: string; packRole: string; packMeta: PackMeta };
@@ -485,6 +458,13 @@ export async function GET(request: Request) {
         if (actual != null && actual > 0) {
           return { date, price: actual, source: "actual", anchor: null };
         }
+        // 등락률공유 상품 — 오늘 슬롯만 차용값 표시 (4단계). 과거 날짜는 backfill 안 함.
+        if (date === priceDate && rateBorrowedAnchor.has(row.product_code)) {
+          const borrowedPrice = dailyTodayMap.get(row.product_code);
+          if (borrowedPrice != null && borrowedPrice > 0) {
+            return { date, price: borrowedPrice, source: "inferred", anchor: `등락률차용(${rateBorrowedAnchor.get(row.product_code)})` };
+          }
+        }
         // 박스소분 89개 매핑 상품 — 관계식만 사용, 토큰매칭 fallback 없음
         // (관계식 불가 시 missing → 2차 reference 변동률로)
         if (myPackRole && myPackMeta) {
@@ -498,12 +478,7 @@ export async function GET(request: Request) {
           }
           return { date, price: null, source: "missing", anchor: null };
         }
-        // 박스소분 매핑 없는 상품 — 토큰 매칭 단위환산
-        for (const a of exactGradeAnchors) {
-          const ap = priceByDateAndCode.get(date)?.get(a.code);
-          if (ap == null || ap <= 0) continue;
-          return { date, price: ceil10(ap / a.ratio), source: "inferred", anchor: a.name };
-        }
+        // 박스소분 매핑 없는 상품 — 토큰매칭 제거 (5단계). missing → 2차 reference 변동률로.
         return { date, price: null, source: "missing", anchor: null };
       });
 

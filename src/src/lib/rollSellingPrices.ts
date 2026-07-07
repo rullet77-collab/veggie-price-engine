@@ -14,7 +14,7 @@
 
 import { calculateAiRecommendation, type AiRecInput, type GroupMember } from "./aiRecommendation";
 import { computePrev3MonthPct } from "./salesStats";
-import { buildRepPriceIndex, buildHistoryMaps, aggregateMonthlyByChannel, buildFamilyNormalizedHistory, type FamilyMember } from "./purchaseHistory";
+import { buildRepPriceIndex, buildHistoryMaps, aggregateMonthlyByChannel, buildFamilyNormalizedHistory, applyRateBorrowing, type FamilyMember, type RateShareMember } from "./purchaseHistory";
 
 // 호출처에서 supabase 클라이언트 직접 주입 (createClient 의 generic 차이 회피)
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -155,6 +155,7 @@ export async function rollSellingPrices(supabase: SupabaseClient): Promise<RollR
   };
   const eightDaysAgoStr = addDays(priceDate, -8);
   const sixtyDaysAgoStr = addDays(priceDate, -60);
+  const ninetyDaysAgoStr = addDays(priceDate, -90);
   type PurchRow = { product_code: string; price_date: string; purchase_price: number; quantity: number | null };
   const purchaseHistory60 = await fetchAll<PurchRow>(
     supabase, "daily_purchase_prices",
@@ -175,37 +176,73 @@ export async function rollSellingPrices(supabase: SupabaseClient): Promise<RollR
   // ── 박스경유 재산출 (calc_group 가족) — 엔진_로직_명세.md 3.2.1절
   // 소분 실매입이 있어도 직접 쓰지 않고, 가족 단위로 박스 원가 → 전 멤버 재산출한 이력으로 교체.
   // 8일/60일 이력 + 오늘/직전 daily 값 모두 재산출가로 대체 (basePP_v3 8일 완충은 유지).
-  {
-    const calcGroupMembersMap = new Map<number, ProdRow[]>();
-    for (const p of productsData) {
-      if (p.calc_group != null && (p.relation_type === "소분관계" || p.relation_type === "수량동일")) {
-        if (!calcGroupMembersMap.has(p.calc_group)) calcGroupMembersMap.set(p.calc_group, []);
-        calcGroupMembersMap.get(p.calc_group)!.push(p);
-      }
+  const calcGroupMembersMap = new Map<number, ProdRow[]>();
+  for (const p of productsData) {
+    if (p.calc_group != null && (p.relation_type === "소분관계" || p.relation_type === "수량동일")) {
+      if (!calcGroupMembersMap.has(p.calc_group)) calcGroupMembersMap.set(p.calc_group, []);
+      calcGroupMembersMap.get(p.calc_group)!.push(p);
     }
-    for (const [, groupProducts] of calcGroupMembersMap) {
-      const familyMembers: FamilyMember[] = groupProducts.map((p) => ({
-        product_code: p.product_code, pack_role: p.pack_role, pack_meta: p.pack_meta,
-      }));
-      // 60일 윈도우 내 이 가족 멤버들의 distinct 매입 날짜 합집합 (오름차순)
-      const dateSet = new Set<string>();
-      for (const m of familyMembers) {
-        const dm = repIndex.get(m.product_code);
-        if (!dm) continue;
-        for (const d of dm.keys()) dateSet.add(d);
-      }
-      const familyDates = [...dateSet].sort();
-      const normalized = buildFamilyNormalizedHistory(familyMembers, repIndex, familyDates);
+  }
+  const familyMembersByGroup = new Map<number, FamilyMember[]>();
+  const familyNormalizedByGroup = new Map<number, Map<string, { date: string; price: number }[]>>();
+  for (const [groupId, groupProducts] of calcGroupMembersMap) {
+    const familyMembers: FamilyMember[] = groupProducts.map((p) => ({
+      product_code: p.product_code, pack_role: p.pack_role, pack_meta: p.pack_meta,
+    }));
+    familyMembersByGroup.set(groupId, familyMembers);
+    // 60일 윈도우 내 이 가족 멤버들의 distinct 매입 날짜 합집합 (오름차순)
+    const dateSet = new Set<string>();
+    for (const m of familyMembers) {
+      const dm = repIndex.get(m.product_code);
+      if (!dm) continue;
+      for (const d of dm.keys()) dateSet.add(d);
+    }
+    const familyDates = [...dateSet].sort();
+    const normalized = buildFamilyNormalizedHistory(familyMembers, repIndex, familyDates);
+    familyNormalizedByGroup.set(groupId, normalized);
 
-      for (const m of familyMembers) {
-        const hist = normalized.get(m.product_code) || [];
-        const shortHist = hist.filter((h) => h.date >= eightDaysAgoStr);
-        shortHistoryMap.set(m.product_code, shortHist);
-        longHistoryMap.set(m.product_code, hist);
-        const sorted = [...hist].sort((a, b) => b.date.localeCompare(a.date));
-        if (sorted[0]) dailyTodayMap.set(m.product_code, sorted[0].price); else dailyTodayMap.delete(m.product_code);
-        if (sorted[1]) dailyPrevMap.set(m.product_code, sorted[1].price); else dailyPrevMap.delete(m.product_code);
-      }
+    for (const m of familyMembers) {
+      const hist = normalized.get(m.product_code) || [];
+      const shortHist = hist.filter((h) => h.date >= eightDaysAgoStr);
+      shortHistoryMap.set(m.product_code, shortHist);
+      longHistoryMap.set(m.product_code, hist);
+      const sorted = [...hist].sort((a, b) => b.date.localeCompare(a.date));
+      if (sorted[0]) dailyTodayMap.set(m.product_code, sorted[0].price); else dailyTodayMap.delete(m.product_code);
+      if (sorted[1]) dailyPrevMap.set(m.product_code, sorted[1].price); else dailyPrevMap.delete(m.product_code);
+    }
+  }
+
+  // ── 등락률 차용 (중그룹 ↔ 소그룹) — 엔진_로직_명세.md 3.2.1절 / 4단계
+  // relation_type='등락률공유' 상품은 박스소분 환산 대상이 아니고 등락률(%)만 가족과 주고받는다.
+  {
+    const rateShareMembers: RateShareMember[] = productsData
+      .filter((p) => p.calc_group != null && p.relation_type === "등락률공유")
+      .map((p) => ({ product_code: p.product_code, calc_group: p.calc_group! }));
+    if (rateShareMembers.length > 0) {
+      // 대장 선정용 90일 매입일수 — 등락률공유 상품만 좁혀서 조회 (60일 초과분)
+      const rateShareCodes = rateShareMembers.map((m) => m.product_code);
+      const purchaseHistory90Extra = await fetchAll<{ product_code: string; price_date: string; purchase_price: number; quantity: number | null }>(
+        supabase, "daily_purchase_prices",
+        "product_code,price_date,purchase_price,quantity",
+        (q) => q.in("product_code", rateShareCodes)
+          .gte("price_date", ninetyDaysAgoStr)
+          .lt("price_date", sixtyDaysAgoStr)
+      );
+      const repIndex90 = buildRepPriceIndex([...purchaseHistory90Extra, ...purchaseHistory60.filter((r) => rateShareCodes.includes(r.product_code))]);
+
+      applyRateBorrowing(
+        rateShareMembers,
+        familyMembersByGroup,
+        familyNormalizedByGroup,
+        repIndex90,
+        dailyTodayMap,
+        dailyPrevMap,
+        shortHistoryMap,
+        longHistoryMap,
+        priceDate,
+        eightDaysAgoStr,
+        ninetyDaysAgoStr,
+      );
     }
   }
 
