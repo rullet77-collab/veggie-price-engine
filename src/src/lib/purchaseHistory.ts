@@ -1,4 +1,6 @@
 // 매입 이력·매출 집계 공유 모듈 — rollSellingPrices / api/products / api/dashboard 3경로 공용
+import { boxToSubdiv, subdivToBox, type PackMeta } from "./aiRecommendation";
+
 export const SALES_CHANNELS = ["식봄", "신선행", "온일장", "배민"] as const;
 
 export type PurchaseRow = {
@@ -92,6 +94,83 @@ export function buildHistoryMaps(
     purchaseMap,
     priceByDateAndCode,
   };
+}
+
+// ────────────────────────────────────────────────
+// 박스경유 재산출 (calc_group 가족 정규화 이력) — 엔진_로직_명세.md 3.2.1절
+//
+// 소분 실매입이 있어도 직접 쓰지 않는다. 매일 가족 단위로:
+//  ① 박스 멤버 실매입(대표가) 있으면 그 값을 박스 원가로
+//  ② 없으면 소분 멤버 중 실매입 있는 것 중 product_code 오름차순 첫 번째를
+//     subdivToBox 로 환산해 박스 원가로 (결정성 확보)
+//  ③ 둘 다 없으면 그 날짜는 skip
+// 이후 박스 원가로 전 멤버 가격을 재산출 (박스=그대로, 소분=boxToSubdiv).
+// ────────────────────────────────────────────────
+export type FamilyMember = {
+  product_code: string;
+  pack_role: string | null;        // 박스/소분
+  pack_meta: unknown;              // PackMeta
+};
+
+export function buildFamilyNormalizedHistory(
+  members: FamilyMember[],
+  repIndex: Map<string, Map<string, number>>,  // buildRepPriceIndex 결과
+  dates: string[],                              // 소급할 날짜들 (오름차순)
+): Map<string, { date: string; price: number }[]> {
+  const result = new Map<string, { date: string; price: number }[]>();
+  for (const m of members) result.set(m.product_code, []);
+
+  const boxMembers = members.filter((m) => m.pack_role === "박스" && m.pack_meta);
+  const subdivMembers = [...members.filter((m) => m.pack_role === "소분" && m.pack_meta)]
+    .sort((a, b) => a.product_code.localeCompare(b.product_code));
+
+  for (const date of dates) {
+    const dateObj = new Date(date);
+
+    // ① 박스 원가 결정 — 박스 멤버 실매입 우선
+    let boxCost: number | null = null;
+    for (const box of boxMembers) {
+      const price = repIndex.get(box.product_code)?.get(date);
+      if (price != null && price > 0) {
+        boxCost = price;
+        break;
+      }
+    }
+
+    // ② 없으면 소분 실매입 중 product_code 오름차순 첫 번째를 박스 원가로 환산
+    if (boxCost == null) {
+      const anchorBox = boxMembers[0];
+      if (anchorBox) {
+        for (const sub of subdivMembers) {
+          const price = repIndex.get(sub.product_code)?.get(date);
+          if (price == null || price <= 0) continue;
+          const converted = subdivToBox(price, sub.pack_meta as PackMeta, anchorBox.pack_meta as PackMeta, dateObj);
+          if (converted != null && converted > 0) {
+            boxCost = converted;
+            break;
+          }
+        }
+      }
+    }
+
+    // ③ 둘 다 없으면 skip
+    if (boxCost == null) continue;
+
+    // 멤버별 재산출가
+    for (const box of boxMembers) {
+      result.get(box.product_code)!.push({ date, price: boxCost });
+    }
+    for (const sub of subdivMembers) {
+      const anchorBox = boxMembers[0];
+      if (!anchorBox) continue;
+      const price = boxToSubdiv(boxCost, anchorBox.pack_meta as PackMeta, sub.pack_meta as PackMeta, dateObj);
+      if (price != null && price > 0) {
+        result.get(sub.product_code)!.push({ date, price });
+      }
+    }
+  }
+
+  return result;
 }
 
 export type MonthlySalesRow = {

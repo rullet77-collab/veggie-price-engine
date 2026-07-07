@@ -2,7 +2,7 @@
 // 야채 판매중 상품만 대상. 매입 등락에는 박스소분 89개 상품을 sibling 역산값으로 포함.
 import { supabase } from "@/lib/supabase";
 import { boxToSubdiv, subdivToBox, ceil10, type PackMeta } from "@/lib/aiRecommendation";
-import { buildRepPriceIndex, SALES_CHANNELS } from "@/lib/purchaseHistory";
+import { buildRepPriceIndex, SALES_CHANNELS, buildFamilyNormalizedHistory, type FamilyMember } from "@/lib/purchaseHistory";
 
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
@@ -33,6 +33,8 @@ type Yacai = {
   product_group: number | null;
   pack_role: string | null;
   pack_meta: unknown;
+  calc_group: number | null;
+  relation_type: string | null;
 };
 
 type PurchRow = {
@@ -93,7 +95,7 @@ export async function GET() {
     // 2) 야채 판매중 상품
     const yacai = await fetchAll<Yacai>(
       "products",
-      "product_code,product_name,spec,platform_status,product_group,pack_role,pack_meta",
+      "product_code,product_name,spec,platform_status,product_group,pack_role,pack_meta,calc_group,relation_type",
       (q) => q.eq("product_type", "야채").order("product_code", { ascending: true })
     );
     const active = yacai.filter((p) => p.platform_status !== "판매중지");
@@ -124,8 +126,23 @@ export async function GET() {
     // 같은 (상품, 날짜) 여러 건이면 거래수량 최대인 가격. 동량이면 더 비싼 가격.
     const byCode = buildRepPriceIndex(purchRows.filter((r) => activeSet.has(r.product_code)));
 
+    // calc_group 가족 인덱스 — 태깅 상품은 실매입 등락이 아닌 가족재산출 등락으로 표시
+    // (엔진 매입가(pp)가 재산출가이므로 화면 등락도 같은 기준이어야 숫자가 일치)
+    const calcGroupMembersMap = new Map<number, Yacai[]>();
+    for (const p of active) {
+      if (p.calc_group != null && (p.relation_type === "소분관계" || p.relation_type === "수량동일")) {
+        if (!calcGroupMembersMap.has(p.calc_group)) calcGroupMembersMap.set(p.calc_group, []);
+        calcGroupMembersMap.get(p.calc_group)!.push(p);
+      }
+    }
+    const calcGroupCodeSet = new Set<string>();
+    for (const members of calcGroupMembersMap.values()) {
+      for (const m of members) calcGroupCodeSet.add(m.product_code);
+    }
+
     const volatileAll: VolatileItem[] = [];
     for (const [code, m] of byCode) {
+      if (calcGroupCodeSet.has(code)) continue; // 가족재산출 경로에서 처리
       const dates = [...m.keys()].sort();
       if (dates.length < 2) continue;
       const todayDate = dates[dates.length - 1];
@@ -172,13 +189,53 @@ export async function GET() {
     };
 
     const inVolatile = new Set(volatileAll.map((v) => v.product_code));
+
+    // calc_group 태깅 상품 — 가족 재산출 이력(buildFamilyNormalizedHistory)으로 오늘/직전 등락 계산
+    for (const [, groupProducts] of calcGroupMembersMap) {
+      const boxMember = groupProducts.find((p) => p.pack_role === "박스");
+      const familyMembers: FamilyMember[] = groupProducts.map((p) => ({
+        product_code: p.product_code, pack_role: p.pack_role, pack_meta: p.pack_meta,
+      }));
+      const dateSet = new Set<string>();
+      for (const m of familyMembers) {
+        const dm = byCode.get(m.product_code);
+        if (!dm) continue;
+        for (const d of dm.keys()) dateSet.add(d);
+      }
+      const familyDates = [...dateSet].sort();
+      const normalized = buildFamilyNormalizedHistory(familyMembers, byCode, familyDates);
+
+      for (const me of groupProducts) {
+        if (inVolatile.has(me.product_code)) continue;
+        const hist = normalized.get(me.product_code) || [];
+        if (hist.length < 2) continue;
+        const todayEntry = hist[hist.length - 1];
+        if (todayEntry.date !== priceDate) continue; // 오늘 재산출 없는 상품 제외
+        const prevEntry = hist[hist.length - 2];
+        if (todayEntry.price <= 0 || prevEntry.price <= 0 || todayEntry.price === prevEntry.price) continue;
+        const rate = (todayEntry.price - prevEntry.price) / prevEntry.price;
+        volatileAll.push({
+          product_code: me.product_code,
+          product_name: me.product_name || "",
+          spec: me.spec,
+          today_price: todayEntry.price,
+          prev_price: prevEntry.price,
+          prev_date: prevEntry.date,
+          change_rate: rate,
+          change_amount: todayEntry.price - prevEntry.price,
+          derived: true,
+          anchor_name: `가족재산출(${boxMember?.product_code ?? me.product_code})`,
+        });
+      }
+    }
+
     const packProducts = active.filter(
-      (p) => p.pack_role && p.pack_meta && p.product_group != null
+      (p) => p.pack_role && p.pack_meta && p.product_group != null && !calcGroupCodeSet.has(p.product_code)
     );
     for (const me of packProducts) {
       if (inVolatile.has(me.product_code)) continue;
       const sibs = (groupMembers.get(me.product_group!) || []).filter(
-        (s) => s.product_code !== me.product_code && s.pack_role && s.pack_meta
+        (s) => s.product_code !== me.product_code && s.pack_role && s.pack_meta && !calcGroupCodeSet.has(s.product_code)
       );
       let best: { sib: Yacai; today: number; prev: number; prevDate: string; cnt: number } | null = null;
       for (const sib of sibs) {

@@ -1,7 +1,7 @@
 import { supabase } from "@/lib/supabase";
 import { calculateAiRecommendation, type AiRecInput, type PackMeta, tokenizeName, gradeMatchScore, getGradeTier, getUnitConversionRatio, ceil10, boxToSubdiv, subdivToBox } from "@/lib/aiRecommendation";
 import { computePrev3MonthPct } from "@/lib/salesStats";
-import { buildRepPriceIndex, buildHistoryMaps, aggregateMonthlyByChannel } from "@/lib/purchaseHistory";
+import { buildRepPriceIndex, buildHistoryMaps, aggregateMonthlyByChannel, buildFamilyNormalizedHistory, type FamilyMember } from "@/lib/purchaseHistory";
 
 // Next.js 가 GET 응답을 캐시하지 않도록 강제 dynamic
 export const dynamic = "force-dynamic";
@@ -86,11 +86,13 @@ export async function GET(request: Request) {
       platform_status: string | null;
       price_fixed: boolean | null;
       purchase_source: string | null;
+      calc_group: number | null;
+      relation_type: string | null;
     };
     // product_code 정렬 — 그룹 멤버 순서 고정 (anchor 동점 선택 결정성 + 페이지네이션 안정)
     const productsData = await fetchAll<ProdRow>(
       "products",
-      "product_code,product_group,is_key_item,target_margin_rate,is_event_item,product_type,price_sensitivity,pack_role,pack_meta,product_name,unit,spec,category_name,learned_tier,platform_status,price_fixed,purchase_source",
+      "product_code,product_group,is_key_item,target_margin_rate,is_event_item,product_type,price_sensitivity,pack_role,pack_meta,product_name,unit,spec,category_name,learned_tier,platform_status,price_fixed,purchase_source,calc_group,relation_type",
       (q) => q.order("product_code", { ascending: true })
     );
     const productMap = new Map<string, ProdRow>();
@@ -178,6 +180,44 @@ export async function GET(request: Request) {
         if (!cur || dates.size > cur.cnt) byGroup.set(p.product_group, { code, cnt: dates.size });
       }
       for (const [groupId, info] of byGroup) groupReferenceCode.set(groupId, info.code);
+    }
+
+    // ── 박스경유 재산출 (calc_group 가족) — 엔진_로직_명세.md 3.2.1절
+    // 소분 실매입이 있어도 직접 쓰지 않고, 가족 단위로 박스 원가 → 전 멤버 재산출한 이력으로 교체.
+    // familyNormalizedMap: calc_group 대상 상품의 재산출 이력 (60일, 7일동향 슬롯 채우기에도 사용)
+    const familyNormalizedMap = new Map<string, { date: string; price: number }[]>();
+    {
+      const calcGroupMembersMap = new Map<number, ProdRow[]>();
+      for (const p of productsData) {
+        if (p.calc_group != null && (p.relation_type === "소분관계" || p.relation_type === "수량동일")) {
+          if (!calcGroupMembersMap.has(p.calc_group)) calcGroupMembersMap.set(p.calc_group, []);
+          calcGroupMembersMap.get(p.calc_group)!.push(p);
+        }
+      }
+      for (const [, groupProducts] of calcGroupMembersMap) {
+        const familyMembers: FamilyMember[] = groupProducts.map((p) => ({
+          product_code: p.product_code, pack_role: p.pack_role, pack_meta: p.pack_meta,
+        }));
+        const dateSet = new Set<string>();
+        for (const m of familyMembers) {
+          const dm = datePriceByCode.get(m.product_code);
+          if (!dm) continue;
+          for (const d of dm.keys()) dateSet.add(d);
+        }
+        const familyDates = [...dateSet].sort();
+        const normalized = buildFamilyNormalizedHistory(familyMembers, datePriceByCode, familyDates);
+
+        for (const m of familyMembers) {
+          const hist = normalized.get(m.product_code) || [];
+          familyNormalizedMap.set(m.product_code, hist);
+          const shortHist = hist.filter((h) => h.date >= eightDaysAgoStr);
+          shortHistoryMap.set(m.product_code, shortHist);
+          longHistoryMap.set(m.product_code, hist);
+          const sorted = [...hist].sort((a, b) => b.date.localeCompare(a.date));
+          if (sorted[0]) dailyTodayMap.set(m.product_code, sorted[0].price); else dailyTodayMap.delete(m.product_code);
+          if (sorted[1]) dailyPrevMap.set(m.product_code, sorted[1].price); else dailyPrevMap.delete(m.product_code);
+        }
+      }
     }
 
     // 7일 동향 슬롯 날짜 배열 (sevenDaysAgo ~ priceDate, 8일 inclusive)
@@ -422,8 +462,25 @@ export async function GET(request: Request) {
         return null;
       };
 
+      // calc_group 태깅 상품 — 7일동향 슬롯은 packAnchors/토큰매칭 대신 가족 재산출 이력을 사용
+      const isFamilyNormalized = prod?.calc_group != null &&
+        (prod?.relation_type === "소분관계" || prod?.relation_type === "수량동일");
+      const familyHist = isFamilyNormalized ? (familyNormalizedMap.get(row.product_code) || []) : null;
+      const familyPriceByDate = new Map<string, number>();
+      if (familyHist) for (const h of familyHist) familyPriceByDate.set(h.date, h.price);
+
       // 1차 패스 — actual → 박스소분 관계식 → 동일 등급 토큰 anchor
       const slots: SlotEntry[] = slotDates.map((date) => {
+        // calc_group 태깅 상품 — 가족 재산출 이력으로 채움 (packAnchors/토큰매칭 경로 제외)
+        if (familyHist) {
+          const famPrice = familyPriceByDate.get(date);
+          if (famPrice == null || famPrice <= 0) return { date, price: null, source: "missing", anchor: null };
+          const actualSelf = priceByDateAndCode.get(date)?.get(row.product_code);
+          if (actualSelf != null && actualSelf > 0) {
+            return { date, price: famPrice, source: "actual", anchor: null };
+          }
+          return { date, price: famPrice, source: "inferred", anchor: "가족재산출" };
+        }
         const actual = priceByDateAndCode.get(date)?.get(row.product_code);
         if (actual != null && actual > 0) {
           return { date, price: actual, source: "actual", anchor: null };

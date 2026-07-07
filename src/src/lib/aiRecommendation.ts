@@ -16,7 +16,7 @@ export type PriceSensitivity = "예민" | "고정" | "일반";
 // Phase 5-A: 박스-소분 관계식 메타
 export type PackRole = "박스" | "소분";
 export type PackMeta =
-  | { formula_divisor: number; unit_kind: string; seasonal?: { winter_months: number[]; winter_divisor: number; summer_divisor: number; note?: string } }
+  | { formula_divisor: number; actual_weight?: number; unit_kind: string; seasonal?: { winter_months: number[]; winter_divisor: number; summer_divisor: number; winter_actual?: number; summer_actual?: number; note?: string } }
   | { quantity: number; unit_kind: string; half_box?: boolean };
 
 // Phase 5-A: 같은 그룹 멤버 정보
@@ -611,6 +611,20 @@ export function getActiveDivisor(meta: PackMeta | null | undefined, date: Date):
   return meta.formula_divisor;
 }
 
+// 박스 실제무게 (소분→박스 환산용, 마진 미반영). seasonal 있으면 winter_actual/summer_actual,
+// 없으면 actual_weight, 그것도 없으면 formula_divisor 폴백 (하위호환).
+export function getActiveActual(meta: PackMeta | null | undefined, date: Date): number | null {
+  if (!meta || !("formula_divisor" in meta)) return null;
+  if (meta.seasonal) {
+    const m = date.getMonth() + 1;
+    const isWinter = meta.seasonal.winter_months.includes(m);
+    const actual = isWinter ? meta.seasonal.winter_actual : meta.seasonal.summer_actual;
+    if (actual != null) return actual;
+  }
+  if (meta.actual_weight != null) return meta.actual_weight;
+  return getActiveDivisor(meta, date);
+}
+
 // 10원 단위 올림
 export function ceil10(v: number): number {
   return Math.ceil(v / 10) * 10;
@@ -630,17 +644,17 @@ export function boxToSubdiv(boxPrice: number, boxMeta: PackMeta, subdivMeta: Pac
   return ceil10(boxPrice * subdivMeta.quantity / divisor);
 }
 
-// 소분 매입가 → 같은 분류 박스 매입가 역산
+// 소분 매입가 → 같은 분류 박스 매입가 역산 (실제무게 기준 — 마진 제거)
 export function subdivToBox(subdivPrice: number, subdivMeta: PackMeta, boxMeta: PackMeta, date: Date): number | null {
   if (!("quantity" in subdivMeta)) return null;
   if (!("formula_divisor" in boxMeta)) return null;
-  const divisor = getActiveDivisor(boxMeta, date);
-  if (!divisor) return null;
+  const actual = getActiveActual(boxMeta, date);
+  if (!actual) return null;
   if (subdivMeta.half_box) {
     return subdivPrice * 2;
   }
-  // 소분가 ÷ 수량 × 공식수 = 박스가 (10원 단위 올림 — 박스↔소분 일관성)
-  return ceil10(subdivPrice / subdivMeta.quantity * divisor);
+  // 소분가 ÷ 수량 × 실제무게 = 박스가 (10원 단위 올림 — 박스↔소분 일관성)
+  return ceil10(subdivPrice / subdivMeta.quantity * actual);
 }
 
 // 단위 민감도 계수 (다른 단위 간 변동률 전파 시)
@@ -1042,7 +1056,8 @@ function estimateFromGroupMembers(
         estimatedPrice = subdivToBox(latest.price, m.pack_meta!, myPackMeta, date);
         via = "소분→박스 관계식";
       } else if (m.pack_role === "소분" && myPackRole === "소분") {
-        // 소분 → 박스 → 내 소분
+        // 소분 → 박스 → 내 소분 (calc_group 미태깅 상품 전용 폴백 — calc_group 태깅 상품은
+        // buildFamilyNormalizedHistory 의 가족 재산출 경로를 대신 사용)
         const box = subdivToBox(latest.price, m.pack_meta!, myPackMeta, date);
         if (box) {
           estimatedPrice = boxToSubdiv(box, myPackMeta, myPackMeta, date);
