@@ -1,7 +1,12 @@
 "use client";
 
-import { useState, useRef, useCallback, useEffect, DragEvent, ChangeEvent } from "react";
+import { useState, useRef, useCallback, useSyncExternalStore, DragEvent, ChangeEvent } from "react";
 import { uploadManager, type Entry } from "@/lib/uploadManager";
+
+// SSR/hydration 안전한 빈 스냅샷 (서버·클라 첫 렌더 공통, 참조 고정)
+const EMPTY_ENTRIES: readonly Entry[] = [];
+const getServerEntries = () => EMPTY_ENTRIES;
+const getServerUploading = () => false;
 
 function isExcelFile(file: File): boolean {
   return (
@@ -24,21 +29,15 @@ function statusLabel(s: Entry["status"]): { text: string; color: string; dot: st
 }
 
 export default function UploadPage() {
-  // manager 의 상태를 React 에 동기화 — manager 가 단일 source of truth.
-  // (manager 는 React 컴포넌트 밖에 있어서 SPA 네비게이션·재마운트에도 살아있음)
-  // manager 는 localStorage 를 읽으므로 서버 렌더(빈 상태)와 어긋날 수 있다.
-  // → mounted 전에는 항상 빈 상태로 렌더해 hydration mismatch 를 피하고,
-  //   mount 후 effect 에서 manager 데이터를 반영한다.
-  const [mounted, setMounted] = useState(false);
-  const [, force] = useState(0);
-  useEffect(() => {
-    setMounted(true);
-    const unsub = uploadManager.subscribe(() => force((n) => n + 1));
-    return unsub;
-  }, []);
-
-  const entries = mounted ? uploadManager.getEntries() : [];
-  const uploading = mounted ? uploadManager.isUploading() : false;
+  // manager 는 React 컴포넌트 밖의 external store (SPA 네비게이션·재마운트에도 살아있음).
+  // useSyncExternalStore 로 구독 — getServerSnapshot 이 빈 상태를 돌려주므로
+  // 서버 렌더·클라 첫 렌더가 항상 빈 상태로 일치 → hydration mismatch 없음.
+  const entries = useSyncExternalStore(
+    uploadManager.subscribe, uploadManager.getEntries, getServerEntries
+  ) as Entry[];
+  const uploading = useSyncExternalStore(
+    uploadManager.subscribe, uploadManager.isUploading, getServerUploading
+  );
 
   const [dragOver, setDragOver] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);

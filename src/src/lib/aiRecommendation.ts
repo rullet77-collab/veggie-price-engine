@@ -330,8 +330,7 @@ function calcBasePP_v3(sp: number[]): V3Result {
   const today = sp[0];
   const yesterday = sp.length > 1 ? sp[1] : sp[0];
   const trend = v3GetTrend(sp);
-  let { modePrice, maxFreq: _mf, note: modeNote } = v3GetMode(sp, trend);
-  void _mf;
+  let { modePrice, note: modeNote } = v3GetMode(sp, trend);
   const wavg = v3GetWavg(sp);
   const recentMed = v3GetRecentMedian(sp);
   const dayChg = yesterday > 0 ? (today - yesterday) / yesterday : 0;
